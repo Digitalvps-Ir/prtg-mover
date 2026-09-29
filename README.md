@@ -182,7 +182,10 @@ Administrator rights are not needed. The installer
 | `-TrustedHosts 10.0.0.10,10.0.0.20` | Also prepare the manager for servers that are reached over plain WinRM (HTTP). Windows asks for administrator rights for this step. |
 | `-Port 8080` | Port of the dashboard. |
 | `-NoShortcut`, `-NoStart` | Create no shortcut, do not start the dashboard. |
-| `-Uninstall` | Remove the shortcuts and the program files. |
+| `-Autostart` | Start the dashboard when you log on to Windows (minimized, without opening the browser). An update keeps it; `-NoAutostart` switches it off again. |
+| `-Uninstall` | Remove the shortcuts and the program files of this installation. |
+
+**Opening the dashboard:** use the shortcut. When the dashboard is already running, the shortcut opens it in the browser and does not start a second one.
 
 **Update or repair:** get the new files and run the installer again. Close the dashboard window first.
 
