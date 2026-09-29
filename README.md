@@ -43,6 +43,25 @@ PRTG Mover moves a PRTG core server to one or more new Windows servers without m
 
 Everything runs in **plain Windows PowerShell 5.1**. You don't need to install anything on the servers except enabling WinRM.
 
+## Options at a glance
+
+| Option | Default | Effect |
+|---|---|---|
+| **Don't touch the source** | off | PRTG keeps running on the source, and nothing there is stopped, changed or deleted. The data folder is copied from a **VSS snapshot** so the copy is consistent. On a workstation OS without VSS it falls back to a live copy with a warning. |
+| **Source after backup** | Keep stopped (migrate) / Restart (backup) | *Keep stopped*, *Stop & disable*, or **Restart & verify fully up**. With the last one the job waits until core and probe are Running, the web UI answers, and everything is still stable 45 s later, and it fails otherwise. |
+| **Copy source license** | on | Copies the license (registry values and license files) to the target. When it's off, the target keeps its own license. |
+| Historic monitoring data | on | Leave it off for a much smaller, faster package that holds configuration only. |
+| Start PRTG and verify | on | Same full health check on every target: services, web interface and stability. Stopped services are restarted automatically. |
+| Open firewall | on | Adds an inbound rule on the target for the PRTG web ports and remote probes (TCP 23560). |
+| Allow downgrade | off | Allows restoring onto an older PRTG version (not recommended). |
+
+**Pre-flight checks** run before anything is changed. They cover WinRM reachability, administrator rights, free disk space on the source (2× data) and targets (2.5× data), PRTG versions, and whether an installer is selected. If any check fails, nothing is touched on any server.
+
+**Integrity checks**:
+- The package's SHA-256 is checked on the manager and again on every target.
+- The SHA-256 of `PRTG Configuration.dat` is compared between source and target.
+- A backup without `PRTG Configuration.dat` is rejected.
+
 ## What gets migrated
 
 | Area | Details |
@@ -138,7 +157,7 @@ A **backup only** run is the same, just without ticking any target. The source i
 | Page | Purpose |
 |---|---|
 | **Overview** | Counters, recent jobs and a short summary of the process. |
-| **Servers** | Inventory, per-server connectivity test (OS, admin rights, PRTG version and data size, VPNs, disks) and credentials. |
+| **Servers** | Inventory with **RDP port** (default 3389, editable) and WinRM port, live **RDP / WinRM reachability** badges (**Check ports**), an **RDP** button that opens Remote Desktop from the manager, a connectivity test (OS, admin rights, PRTG version and data size, VPNs, disks, the server's real RDP port) and credentials. |
 | **Backup & Migrate** | One source → any number of targets. Choose what to include, what happens to the source afterwards, the installer and the health-check timeout. |
 | **Backups** | Every package on the manager: **download**, restore to any target(s), delete, or **upload** a package (for example from another manager). |
 | **Jobs** | Live progress bar, step and colour-coded log for every job, per-target result, cancel, and full log download. |
@@ -163,7 +182,15 @@ The same engine is available for scripts and scheduled tasks:
 .\cli\Invoke-PrtgMover.ps1 -Action Restore -BackupName PRTG_OLDSRV_20260928-221500.zip -Target PRTG-NEW1 -InstallerFile PRTG_Installer.exe
 ```
 
-Other switches: `-NoPrtg -NoHistory -NoVpn -NoDesktop -ExtraPaths -NoStart -HealthTimeoutMinutes -ConnectVpn -AllowDowngrade`.
+```powershell
+# Hot backup: the source is not touched at all (VSS snapshot)
+.\cli\Invoke-PrtgMover.ps1 -Action Backup -Source PRTG-OLD -NoTouch
+
+# Migrate without copying the license (the target keeps its own)
+.\cli\Invoke-PrtgMover.ps1 -Action Migrate -Source PRTG-OLD -Target PRTG-NEW -NoLicense
+```
+
+Other switches: `-NoPrtg -NoHistory -NoVpn -NoDesktop -ExtraPaths -NoStart -HealthTimeoutMinutes -ConnectVpn -AllowDowngrade -NoTouch -NoLicense -NoFirewall -SkipPreflight`.
 Exit codes: `0` success, `1` failure, `2` finished with errors on a target.
 
 ## Backup package format

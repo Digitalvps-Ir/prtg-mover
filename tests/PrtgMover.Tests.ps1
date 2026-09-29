@@ -81,6 +81,13 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         Test-Path $res.ZipPath | Should -BeFalse
     }
 
+    It 'rejects a package whose checksum does not match' {
+        $wr = Join-Path $Work 'wr-bad'
+        $out = @(Invoke-PmRemoteBackup -JobId 'rt4' -WorkRoot $wr -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false)
+        $zip = ($out | Where-Object PmType -eq 'result').ZipPath
+        { Invoke-PmRemoteRestore -JobId 'rt5' -ZipPath $zip -WorkRoot $wr -ExpectedSha256 'BAD' } | Should -Throw '*checksum mismatch*'
+    }
+
     It 'emits only log / progress / result records' {
         $out = @(Invoke-PmRemoteBackup -JobId 'rt3' -WorkRoot (Join-Path $Work 'wr3') -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false)
         @($out | Where-Object { $_.PmType -notin 'log', 'progress', 'result' }).Count | Should -Be 0
@@ -114,6 +121,19 @@ Describe 'Manager module' {
         (Get-PmCredential -ServerId $s.id).GetNetworkCredential().Password | Should -Be 'p@ss'
         Remove-PmServer -Id $s.id
         Test-PmCredential -ServerId $s.id | Should -BeFalse
+    }
+
+    It 'stores the RDP port (default 3389) and resolves WinRM ports' {
+        $a = Set-PmServer -Name 'RDP-DEFAULT' -HostName '10.0.0.30'
+        Get-PmRdpPort (Get-PmServer -Id $a.id) | Should -Be 3389
+        $b = Set-PmServer -Name 'RDP-CUSTOM' -HostName '10.0.0.31' -RdpPort 33890 -UseSsl $true
+        Get-PmRdpPort (Get-PmServer -Id $b.id) | Should -Be 33890
+        Get-PmWinRmPort (Get-PmServer -Id $b.id) | Should -Be 5986
+        Get-PmWinRmPort ([pscustomobject]@{ port = 0; useSsl = $false }) | Should -Be 5985
+    }
+
+    It 'reports a closed TCP port as unreachable' {
+        Test-PmTcpPort -HostName '127.0.0.1' -Port 1 -TimeoutMs 1000 | Should -BeFalse
     }
 
     It 'rejects path traversal in backup names' {
