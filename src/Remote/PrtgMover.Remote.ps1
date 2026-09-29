@@ -284,6 +284,39 @@ function Invoke-PmHealthCheck {
     }
 }
 
+# ---------------------------------------------------------------- configuration statistics
+
+function Get-PmPrtgConfigStats {
+    <#
+        Streams PRTG Configuration.dat (XML) and counts the main object types. Used to show
+        what is being moved (devices, sensors, notification templates, triggers, users,
+        schedules, maps, reports, libraries) and to compare source and target.
+        Read-only, opened with FileShare.ReadWrite so a running PRTG is not disturbed.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $names = [ordered]@{ probenode = 'probes'; group = 'groups'; device = 'devices'; sensor = 'sensors'; notification = 'notifications'; trigger = 'triggers'
+        user = 'users'; usergroup = 'user groups'; schedule = 'schedules'; map = 'maps'; report = 'reports'; library = 'libraries'; dependency = 'dependencies' }
+    $count = @{}
+    foreach ($k in $names.Keys) { $count[$k] = 0 }
+    $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        $settings = New-Object Xml.XmlReaderSettings
+        $settings.DtdProcessing = [Xml.DtdProcessing]::Ignore
+        $settings.IgnoreComments = $true; $settings.IgnoreWhitespace = $true
+        $reader = [Xml.XmlReader]::Create($fs, $settings)
+        try {
+            while ($reader.Read()) {
+                if ($reader.NodeType -ne [Xml.XmlNodeType]::Element) { continue }
+                $n = $reader.LocalName.ToLowerInvariant()
+                if ($count.ContainsKey($n)) { $count[$n]++ }
+                elseif ($n -like '*trigger' -and $n -ne 'triggers') { $count['trigger']++ }
+            }
+        } finally { $reader.Dispose() }
+    } catch { return "unreadable ($($_.Exception.Message))" } finally { $fs.Dispose() }
+    return (($names.Keys | Where-Object { $count[$_] -gt 0 } | ForEach-Object { "$($names[$_])=$($count[$_])" }) -join ', ')
+}
+
 # ---------------------------------------------------------------- VSS snapshots (no-touch backups)
 
 function New-PmShadowCopy {
@@ -352,8 +385,11 @@ function Get-PmSystemInfo {
     $vpn = @()
     try { $vpn = @(Get-VpnConnection -AllUserConnection -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Server = $_.ServerAddress; Type = [string]$_.TunnelType; Status = [string]$_.ConnectionStatus } }) } catch { }
     $prtg = Get-PmPrtgInfo
-    $dataSize = 0
-    if ($prtg.Installed) { $dataSize = Get-PmDirectorySize -Path $prtg.DataPath }
+    $dataSize = 0; $stats = $null
+    if ($prtg.Installed) {
+        $dataSize = Get-PmDirectorySize -Path $prtg.DataPath
+        $stats = Get-PmPrtgConfigStats -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat')
+    }
     $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
             [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
 
@@ -365,6 +401,7 @@ function Get-PmSystemInfo {
         User         = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         Prtg         = $prtg
         PrtgDataGB   = [math]::Round($dataSize / 1GB, 2)
+        PrtgConfigStats = $stats
         VpnAllUsers  = $vpn
         Profiles     = @(Get-PmUserProfiles | Select-Object -ExpandProperty Name)
         Disks        = $disks
@@ -448,6 +485,8 @@ function Invoke-PmRemoteBackup {
                 if (-not (Test-Path -LiteralPath $cfg)) { throw "'PRTG Configuration.dat' is missing from the copied data folder - aborting (backup would be unusable)." }
                 $cfgInfo = Get-Item -LiteralPath $cfg
                 $cfgHash = (Get-FileHash -LiteralPath $cfg -Algorithm SHA256).Hash
+                $cfgStats = Get-PmPrtgConfigStats -Path $cfg
+                Write-PmLog "Configuration content (all rules, notifications, triggers, users... are inside this file): $cfgStats" 'OK'
                 Write-PmLog ("Data folder copied ({0:N2} GB). PRTG Configuration.dat: {1:N1} MB, saved {2}." -f ((Get-PmDirectorySize (Join-Path $stage 'prtg\data')) / 1GB), ($cfgInfo.Length / 1MB), $cfgInfo.LastWriteTime) 'OK'
 
                 Write-PmProgress 35 'PRTG: copying customisations'
@@ -479,7 +518,7 @@ function Invoke-PmRemoteBackup {
                 $manifest.prtg = [ordered]@{
                     included = $true; version = $prtg.Version; dataPath = $prtg.DataPath; programPath = $prtg.ProgramPath
                     includeHistory = $IncludeHistory; programFolders = $copiedFolders; registryFiles = $regFiles
-                    listenPorts = $prtg.ListenPorts; configSha256 = $cfgHash; configSize = $cfgInfo.Length
+                    listenPorts = $prtg.ListenPorts; configSha256 = $cfgHash; configSize = $cfgInfo.Length; configStats = $cfgStats
                     licenseValueNames = $licNames; licenseFiles = $licFiles
                     consistency = $(if ($NoTouch) { if ($shadow) { 'vss-snapshot' } else { 'live-copy' } } else { 'services-stopped' })
                 }
@@ -733,6 +772,10 @@ function Invoke-PmRemoteRestore {
                 $h = (Get-FileHash -LiteralPath (Join-Path $dataPath 'PRTG Configuration.dat') -Algorithm SHA256).Hash
                 if ($h -ne $manifest.prtg.configSha256) { throw 'PRTG Configuration.dat on target does not match the source (checksum) - aborting.' }
                 Write-PmLog 'PRTG Configuration.dat verified (SHA-256 identical to source).' 'OK'
+                if ($manifest.prtg.configStats) {
+                    $tStats = Get-PmPrtgConfigStats -Path (Join-Path $dataPath 'PRTG Configuration.dat')
+                    Write-PmLog "Configuration on target: $tStats" $(if ($tStats -eq $manifest.prtg.configStats) { 'OK' } else { 'WARN' })
+                }
             }
             Write-PmLog "Data folder restored to $dataPath" 'OK'
 
@@ -883,6 +926,13 @@ function Invoke-PmRemoteRestore {
 function Remove-PmRemoteFile {
     param([Parameter(Mandatory)][string]$Path)
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    # Leave no trace: remove the (now empty) PrtgMover work folders again.
+    $dir = Split-Path $Path -Parent
+    while ($dir -and (Split-Path $dir -Leaf) -in 'out', 'staging', 'PrtgMover' -and (Test-Path -LiteralPath $dir)) {
+        if (Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin 'staging', 'out' -or (Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue) }) { break }
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        $dir = Split-Path $dir -Parent
+    }
     New-PmResult @{ Removed = $Path }
 }
 
