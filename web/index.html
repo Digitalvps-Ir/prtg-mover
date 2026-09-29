@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PRTG Mover</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <img src="favicon.svg" alt="" width="28" height="28">
+      <div><strong>PRTG Mover</strong><span id="version">…</span></div>
+    </div>
+    <nav>
+      <a href="#overview" data-view="overview" class="active">Overview</a>
+      <a href="#servers" data-view="servers">Servers</a>
+      <a href="#migrate" data-view="migrate">Backup &amp; Migrate</a>
+      <a href="#backups" data-view="backups">Backups</a>
+      <a href="#jobs" data-view="jobs">Jobs <span class="pill" id="runningPill" hidden>0</span></a>
+      <a href="#logs" data-view="logs">Logs &amp; Audit</a>
+    </nav>
+    <div class="side-agents" id="sideAgents"></div>
+    <div class="sidebar-foot" id="managerInfo"></div>
+  </aside>
+
+  <main>
+    <!-- ======================= OVERVIEW -->
+    <section id="view-overview" class="view active">
+      <header class="page-head">
+        <div><h1>Overview</h1><p class="muted">Move PRTG, Windows VPN connections and desktop files between Windows servers.</p></div>
+        <div class="actions"><button class="btn primary" data-goto="migrate">New migration</button></div>
+      </header>
+      <div class="stats">
+        <div class="stat"><span>Servers</span><strong id="statServers">–</strong></div>
+        <div class="stat"><span>Backups on manager</span><strong id="statBackups">–</strong></div>
+        <div class="stat"><span>Running jobs</span><strong id="statRunning">–</strong></div>
+        <div class="stat"><span>Last job</span><strong id="statLast">–</strong></div>
+      </div>
+      <div class="grid2">
+        <div class="card">
+          <h2>How it works</h2>
+          <ol class="steps">
+            <li><b>Servers</b> — add the source PRTG server and the target(s). Choose the connection method: <span class="badge info">RDP</span> (nothing to configure on the server) or <span class="badge info">WinRM</span>.</li>
+            <li><b>Test</b> — <i>Test RDP</i> / <i>Test WinRM</i>. A server is <span class="badge ok">PASS</span> when at least one method works.</li>
+            <li><b>Agent</b> (RDP method) — press <i>RDP</i>, log in, run the copied command in an elevated PowerShell. Keep the RDP window open or minimized — <b>do not close it</b> while a job runs.</li>
+            <li><b>Migrate</b> — pre-flight checks → copy PRTG from a snapshot straight to this manager (source untouched) → package → restore on each target → start PRTG and verify it is fully up.</li>
+            <li><b>Backups / Jobs / Logs</b> — download the package, follow every step live, resume failed jobs, download diagnostics.</li>
+          </ol>
+        </div>
+        <div class="card">
+          <h2>Recent jobs</h2>
+          <div id="recentJobs" class="list"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= SERVERS -->
+    <section id="view-servers" class="view">
+      <header class="page-head">
+        <div><h1>Servers</h1><p class="muted">Inventory of source and target servers. Passwords are stored DPAPI-encrypted for the current Windows user only.</p></div>
+        <div class="actions">
+          <button class="btn" id="checkPortsBtn">Check ports</button>
+          <button class="btn" id="testAllBtn">Test all</button>
+          <button class="btn primary" id="addServerBtn">Add server</button>
+        </div>
+      </header>
+      <div class="card flush"><div class="table-wrap"><table class="table" id="serversTable">
+        <thead><tr><th>Name</th><th>Host</th><th>Role</th><th>Ports</th><th>Credential</th><th>Last test</th><th>PRTG</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div></div>
+    </section>
+
+    <!-- ======================= MIGRATE -->
+    <section id="view-migrate" class="view">
+      <header class="page-head">
+        <div><h1>Backup &amp; Migrate</h1><p class="muted">One source, any number of targets. The package is always kept on the manager and can be downloaded.</p></div>
+      </header>
+      <form id="migrateForm" class="grid2">
+        <div class="card">
+          <h2>1 · Source</h2>
+          <label class="field"><span>Source server</span><select name="sourceId" required></select></label>
+          <h2 class="mt">2 · Targets</h2>
+          <div id="targetList" class="checklist"></div>
+          <p class="hint">Leave all targets unchecked to create a backup only.</p>
+          <h2 class="mt">3 · What to include</h2>
+          <div class="group">
+            <label class="check"><input type="checkbox" name="IncludePrtg" checked> <span><b>PRTG</b> — configuration (all sensors, notifications, triggers, users, maps, reports…), registry, SSL certificate, custom sensors, lookups, MIBs</span></label>
+            <label class="check sub"><input type="checkbox" name="IncludeProgram" checked> Clone the <b>PRTG program</b> (program files + services) — no installer needed on the target</label>
+            <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source <b>license</b></label>
+            <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> <b>Historic monitoring data</b> (graphs &amp; tables of the past)</label>
+            <label class="check sub"><input type="checkbox" name="IncludeLogs"> PRTG log files <span class="muted">(not needed — usually large)</span></label>
+            <label class="check sub"><input type="checkbox" name="IncludeAutoBackups"> Old automatic configuration copies <span class="muted">(not needed)</span></label>
+          </div>
+          <div class="group">
+            <label class="check"><input type="checkbox" name="IncludeVpn" checked> <span><b>Windows VPN connections</b> (all-user + per-user)</span></label>
+            <label class="check"><input type="checkbox" name="IncludeDesktop" checked> <span><b>Desktop files</b> of every user + Public desktop (.bat, VPN files, notes…)</span></label>
+          </div>
+          <label class="field"><span>Extra paths on the source (one per line, optional)</span><textarea name="ExtraPaths" rows="3" placeholder="D:\Scripts&#10;C:\Tools\prtg-helper.ps1"></textarea></label>
+        </div>
+        <div class="card">
+          <h2>4 · Source server</h2>
+          <label class="check notouch"><input type="checkbox" name="NoTouch" checked> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
+          <div id="sourceAfterBox" class="disabled">
+            <div class="segmented" id="sourceAfter">
+              <label><input type="radio" name="SourceAfter" value="KeepStopped" checked><span>Keep stopped</span></label>
+              <label><input type="radio" name="SourceAfter" value="Disable"><span>Stop &amp; disable</span></label>
+              <label><input type="radio" name="SourceAfter" value="Restart"><span>Restart &amp; verify fully up</span></label>
+            </div>
+            <p class="hint"><b>Restart &amp; verify</b> starts core + probe and waits until both services run, the web interface answers and everything is still stable after 45 s — otherwise the job fails. For a real migration keep the old server stopped (two cores with the same license would alert twice).</p>
+          </div>
+
+          <h2 class="mt">5 · Target options</h2>
+          <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify it is fully up (services + web + stability)</label>
+          <label class="check"><input type="checkbox" name="OpenFirewall" checked> Open the Windows firewall for the PRTG web ports and remote probes (23560)</label>
+          <label class="field inline"><span>Health-check timeout (minutes)</span><input type="number" name="HealthTimeoutMinutes" value="15" min="1" max="120"></label>
+          <label class="field inline"><span>Parallel transfer streams (WinRM)</span><input type="number" name="TransferStreams" value="4" min="1" max="8"></label>
+          <label class="check"><input type="checkbox" name="ConnectVpn"> Dial the VPN connections after restore</label>
+          <label class="check"><input type="checkbox" name="AllowDowngrade"> Allow restoring onto an older PRTG version (not recommended)</label>
+          <label class="field"><span>PRTG installer (optional — only if you prefer a fresh install over the clone)</span><select name="InstallerFile"><option value="">— none (use the clone) —</option></select></label>
+          <label class="field"><span>Installer arguments</span><input name="InstallerArgs" value="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"></label>
+          <div class="upload-row">
+            <label class="btn small">Upload installer<input type="file" id="installerUpload" accept=".exe,.zip" hidden></label>
+            <span class="hint" id="installerUploadStatus"></span>
+          </div>
+          <div class="summary" id="migrateSummary"></div>
+          <div class="form-actions">
+            <button type="submit" class="btn primary" id="runMigrate">Start</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <!-- ======================= BACKUPS -->
+    <section id="view-backups" class="view">
+      <header class="page-head">
+        <div><h1>Backups</h1><p class="muted" id="backupsPath">Packages stored on the manager.</p></div>
+        <div class="actions">
+          <label class="btn">Upload backup<input type="file" id="backupUpload" accept=".zip" hidden></label>
+        </div>
+      </header>
+      <div class="upload-progress" id="uploadProgress" hidden><div class="bar"><i></i></div><span></span></div>
+      <div class="card flush"><div class="table-wrap"><table class="table" id="backupsTable">
+        <thead><tr><th>Package</th><th>Source</th><th>Contents</th><th>Size</th><th>Created</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div></div>
+    </section>
+
+    <!-- ======================= JOBS -->
+    <section id="view-jobs" class="view">
+      <header class="page-head"><div><h1>Jobs</h1><p class="muted">Live progress and full logs of every operation. Failed jobs can be resumed.</p></div>
+        <div class="actions"><button class="btn" id="diagBtn" title="Zip with manager/audit/robocopy/agent logs, job records, test results and an environment report (no passwords)">Download diagnostics</button></div>
+      </header>
+      <div class="jobs-layout">
+        <div class="card flush"><div id="jobsList" class="list jobs"></div></div>
+        <div class="card" id="jobDetail"><p class="muted">Select a job to see its progress and log.</p></div>
+      </div>
+    </section>
+    <!-- ======================= LOGS & AUDIT -->
+    <section id="view-logs" class="view">
+      <header class="page-head">
+        <div><h1>Logs &amp; Audit</h1><p class="muted">Everything the manager did and every change made through the dashboard. Use <b>Download diagnostics</b> to send all logs at once.</p></div>
+        <div class="actions">
+          <button class="btn" id="refreshLogs">Refresh</button>
+          <button class="btn primary" id="diagBtn2">Download diagnostics</button>
+        </div>
+      </header>
+      <div class="card">
+        <h2>Where things are logged</h2>
+        <div class="kv">
+          <dt>Job logs</dt><dd>Jobs page (tick <i>Show debug</i> for exact error line, stack, timings) · <code>data\jobs\&lt;id&gt;.log</code></dd>
+          <dt>Manager / API</dt><dd><code>data\logs\manager-yyyyMMdd.log</code> (below)</dd>
+          <dt>Audit trail</dt><dd><code>data\logs\audit.log</code> (below)</dd>
+          <dt>File copies</dt><dd><code>data\logs\robocopy\robocopy-&lt;job&gt;-&lt;server&gt;.log</code></dd>
+          <dt>Agents (RDP)</dt><dd><code>data\agent\&lt;server-id&gt;\agent.log</code></dd>
+        </div>
+      </div>
+      <div class="card flush mt16"><div class="table-wrap"><table class="table" id="auditTable">
+        <thead><tr><th>Time</th><th>Action</th><th>Details</th><th>User</th></tr></thead><tbody></tbody>
+      </table></div></div>
+      <div class="card mt16">
+        <h2>Manager log (today, last 300 lines)</h2>
+        <div class="log" id="managerLog" style="height:360px"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- ======================= DIALOGS -->
+<dialog id="serverDialog">
+  <form method="dialog" id="serverForm">
+    <h2 id="serverDialogTitle">Add server</h2>
+    <input type="hidden" name="id">
+    <div class="grid2 tight">
+      <label class="field"><span>Display name</span><input name="name" required placeholder="PRTG-OLD"></label>
+      <label class="field"><span>Host / IP</span><input name="host" required placeholder="10.0.0.10"></label>
+      <label class="field"><span>Role</span><select name="role"><option value="both">Source &amp; target</option><option value="source">Source</option><option value="target">Target</option></select></label>
+      <label class="field"><span>Connection method for the script</span><select name="transport">
+        <option value="rdp">RDP (agent in a Remote Desktop session — nothing to configure on the server)</option>
+        <option value="winrm">WinRM (PowerShell remoting — fully automatic, needs WinRM enabled)</option>
+      </select></label>
+      <label class="field"><span>RDP port</span><input type="number" name="rdpPort" value="3389" min="1" max="65535" required></label>
+      <label class="field"><span>WinRM port (0 = default 5985 / 5986)</span><input type="number" name="port" value="0" min="0" max="65535"></label>
+      <label class="field"><span>Authentication</span><select name="authentication"><option>Default</option><option>Negotiate</option><option>Kerberos</option><option>CredSSP</option><option>Basic</option></select></label>
+      <div class="field"><span>Transport</span>
+        <label class="check"><input type="checkbox" name="useSsl"> HTTPS (5986)</label>
+        <label class="check"><input type="checkbox" name="skipCaCheck"> Skip certificate checks</label>
+      </div>
+    </div>
+    <fieldset>
+      <legend>Administrator credential <span class="muted">(optional — leave empty to keep the saved one / use your Windows identity)</span></legend>
+      <div class="grid2 tight">
+        <label class="field"><span>User</span><input name="username" autocomplete="off" placeholder="HOST\Administrator"></label>
+        <label class="field"><span>Password</span><input name="password" type="password" autocomplete="new-password"></label>
+      </div>
+    </fieldset>
+    <label class="field"><span>Notes</span><input name="notes"></label>
+    <div class="form-actions">
+      <button value="cancel" class="btn" formnovalidate>Cancel</button>
+      <button value="save" class="btn primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="restoreDialog">
+  <form method="dialog" id="restoreForm">
+    <h2>Restore package</h2>
+    <p class="muted" id="restoreName"></p>
+    <div id="restoreTargets" class="checklist"></div>
+    <label class="check"><input type="checkbox" name="RestorePrtg" checked> PRTG</label>
+    <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source license</label>
+    <label class="check sub"><input type="checkbox" name="OpenFirewall" checked> Open firewall for PRTG ports</label>
+    <label class="check"><input type="checkbox" name="RestoreVpn" checked> VPN connections</label>
+    <label class="check"><input type="checkbox" name="RestoreDesktop" checked> Desktop files</label>
+    <label class="check"><input type="checkbox" name="RestoreExtra" checked> Extra paths</label>
+    <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify web interface</label>
+    <label class="field"><span>PRTG installer (if missing on target)</span><select name="InstallerFile"><option value="">— none —</option></select></label>
+    <div class="form-actions">
+      <button value="cancel" class="btn" formnovalidate>Cancel</button>
+      <button value="go" class="btn primary">Restore</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="agentDialog">
+  <form method="dialog">
+    <h2>Start the agent on <span id="agentServer"></span></h2>
+    <ol class="steps">
+      <li>A Remote Desktop window opens (with this manager's drive redirected). Log in with the server's administrator account. If Windows asks about <i>drive access</i>, allow it.</li>
+      <li>On the server, right-click <b>Start → Windows PowerShell → Run as administrator</b>.</li>
+      <li>Paste this command (it's already in the clipboard) and press Enter:</li>
+    </ol>
+    <pre class="cmd" id="agentCmd"></pre>
+    <p class="hint">The agent window shows <b>connected</b>; the server's badge here turns green. Keep the window open while jobs run. It changes nothing on the server — no WinRM, no firewall, no installation.</p>
+    <div class="form-actions">
+      <button type="button" class="btn" id="copyAgentCmd">Copy again</button>
+      <button value="close" class="btn primary">Done</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="tokenDialog">
+  <form method="dialog" id="tokenForm">
+    <h2>Access token required</h2>
+    <p class="muted">Open the link printed in the PRTG Mover console, or paste the token from <code>data\token.txt</code>.</p>
+    <label class="field"><span>Token</span><input name="token" required autocomplete="off"></label>
+    <div class="form-actions"><button class="btn primary">Continue</button></div>
+  </form>
+</dialog>
+
+<div id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
