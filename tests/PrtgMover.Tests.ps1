@@ -72,6 +72,34 @@ Describe 'PRTG web server binding after a migration' {
     }
 }
 
+Describe 'PRTG license state from the core log' {
+    It 'recognises a license that needs activation on a new system' {
+        $s = ConvertTo-PmLicenseState -PausedByLicense '386' -LogLines @(
+            'Core.log: 2026-09-29 09:31:26.219031 INFO TId    3956 Core> PRTG No License (System Changed) licensed for "name" (<key>) Edt=-100 MaxS=0',
+            'CoreWebServer.log: 2026-09-29 09:38:24.052464 INFO TId    2520 CoreWebServer> System has changed. New activation required. (Verify Error, EIdHTTPProtocolException: HTTP/1.1 403 Forbidden)')
+        $s.Known | Should -BeTrue
+        $s.NeedsActivation | Should -BeTrue
+        $s.Edition | Should -Be 'No License (System Changed)'
+        $s.MaxSensors | Should -Be 0
+        $s.LastError | Should -BeLike '*403 Forbidden*'
+        $s.PausedByLicense | Should -Be '386'
+    }
+    It 'recognises an active license and uses the latest entry' {
+        $s = ConvertTo-PmLicenseState -LogLines @(
+            'Core.log: 2026 INFO TId 1 Core> PRTG No License (System Changed) licensed for "name" (<key>) Edt=-100 MaxS=0',
+            'CoreActivationLog.log: 2026-09-29 06:34:47.205268 INFO TId    1660 CoreActivationLog> PRTG  (Site License) licensed for "name" (<key>) Edt=70 MaxS=99999')
+        $s.NeedsActivation | Should -BeFalse
+        $s.Edition | Should -Be 'Site License'
+        $s.MaxSensors | Should -Be 99999
+    }
+    It 'reports an unknown state when the log has no license line' {
+        (ConvertTo-PmLicenseState -LogLines @('Core.log: nothing relevant')).Known | Should -BeFalse
+    }
+    It 'never returns a license value, only a fingerprint' {
+        Get-PmShortHash 'SECRET-LICENSE-KEY' | Should -Match '^[0-9a-f]{10}$'
+    }
+}
+
 Describe 'Backup / restore round trip (local, no PRTG)' {
     It 'packages extra paths and restores them to the original location' {
         $extra = Join-Path $Work 'extra-data'

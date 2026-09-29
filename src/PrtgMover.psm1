@@ -811,6 +811,23 @@ function Invoke-PmTestFlow {
                 $(if ($r.Prtg.Installed) { 'yes' } else { 'no' }), $r.Prtg.Version, $r.PrtgDataGB, $r.Prtg.CoreStatus, @($r.VpnAllUsers).Count, $r.RdpPort) -Computer $r.Computer
         foreach ($d in @($r.Disks)) { Add-PmJobLog -Job $Job -Message ("Disk {0} {1} GB free of {2} GB" -f $d.Drive, $d.FreeGB, $d.SizeGB) -Computer $r.Computer }
         if ($r.Prtg.Installed -and $r.PrtgConfigStats) { Add-PmJobLog -Job $Job -Message "PRTG configuration: $($r.PrtgConfigStats)" -Computer $r.Computer }
+        if ($r.Prtg.Installed -and $r.PrtgLicense) {
+            $lic = $r.PrtgLicense
+            if ($lic.Error) { Add-PmJobLog -Job $Job -Level WARN -Message "License report failed: $($lic.Error)" -Computer $r.Computer }
+            else {
+                $ls = $r.PrtgLicenseState
+                if ($ls -and $ls.Known -and $ls.NeedsActivation) {
+                    Add-PmJobLog -Job $Job -Level WARN -Computer $r.Computer -Message "PRTG license: '$($ls.Edition)' - the license must be activated for this server (PRTG > Setup > License Information). Sensors paused by the license: $($ls.PausedByLicense)."
+                    if ($ls.LastError) { Add-PmJobLog -Job $Job -Level WARN -Computer $r.Computer -Message "PRTG license: last activation attempt: $($ls.LastError)" }
+                } elseif ($ls -and $ls.Known) {
+                    Add-PmJobLog -Job $Job -Level OK -Computer $r.Computer -Message "PRTG license: $($ls.Edition), $($ls.MaxSensors) sensors, active. Sensors paused by the license: $($ls.PausedByLicense)."
+                } else {
+                    Add-PmJobLog -Job $Job -Computer $r.Computer -Message 'PRTG license: no license lines in the core log of the last days (the core was not restarted recently).'
+                }
+                Add-PmJobLog -Job $Job -Level DEBUG -Message "License (fingerprints only): $(@($lic.Values) -join '; ') | system id $($lic.SystemId) | auto activation $($lic.AutoActivation)" -Computer $r.Computer
+                foreach ($l in @($lic.LogLines)) { Add-PmJobLog -Job $Job -Level DEBUG -Message "License log: $l" -Computer $r.Computer }
+            }
+        }
         if ($r.Prtg.Installed) { Add-PmJobLog -Job $Job -Message "PRTG listens on: $(if (@($r.Prtg.ListenEndpoints).Count) { @($r.Prtg.ListenEndpoints) -join ', ' } else { 'nothing (core not running)' }) | server addresses: $(@($r.Prtg.LocalAddresses) -join ', ')" -Computer $r.Computer }
         if (-not $r.IsAdmin) { Add-PmJobLog -Job $Job -Level WARN -Message 'Session is NOT elevated - an administrator is required.' }
         if ($r.RdpPort -and [int]$r.RdpPort -ne (Get-PmRdpPort $Server)) { Add-PmJobLog -Job $Job -Level WARN -Message "The server's RDP service listens on port $($r.RdpPort) but the inventory says $(Get-PmRdpPort $Server) - edit the server." }

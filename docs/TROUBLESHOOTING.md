@@ -50,7 +50,8 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 
 | Symptom | Cause / fix |
 |---|---|
-| PRTG answers on the server itself but not from the network | The web server is bound to the old server's address. Press **Fix PRTG IP** on the Servers page (or `-Action FixBinding` on the command line). New migrations adjust the binding automatically. Also check firewalls in front of the server. |
+| PRTG shows *No License (System Changed)*, sensors are paused | Expected after a move to new hardware: PRTG binds a license to the system it was activated on. Activate the license on the new server in PRTG (*Setup → License Information*). If the activation fails (for example `HTTP 403`), the server can't use Paessler's activation service: contact Paessler or your reseller for an activation. The license on the old server is not changed by a migration. |
+| PRTG answers on the server itself but not from the network | The web server is bound to the old server's address. Run **Test WinRM** and press **Make PRTG reachable** on the Servers page (or `-Action FixBinding` on the command line). New migrations adjust the binding automatically. Also check firewalls in front of the server. |
 | `Target PRTG x is OLDER than source y` | Install the source's version (or newer) on the target first, or remove PRTG from the target so that the clone is used. |
 | PRTG started but `web interface did not answer` | Check `<datapath>\Logs\core\Core.log` on the target. The first start with a large data folder takes time: raise *Health-check timeout*. Also check that the web server port isn't used by IIS or another service. |
 | PRTG does not start after a clone | The target may lack the .NET Framework version of the source (the log shows a warning). Install it and press **Resume**. |

@@ -8,6 +8,16 @@
 - **IPIP** (protocol 4) does the same on its own network, `10.66.67.0/24`, using Wintun. IP protocol 4 must be allowed between the two public addresses. It does not replace the default route.
 - **WinRM on the tunnel.** After the tunnel is up, the source opens WinRM to the target's tunnel address (`10.66.66.x:5985` or `10.66.67.x:5985`) and sends the files there. A 32 MB probe reports MB/s first, the same point-to-point shape as a bandwidth test. TCP 5985 is allowed only from the tunnel network, not from the public address.
 
+## 1.5.3 — 2026-09-29
+
+### Added
+- **License state.** The server test and the restore read the license state from the PRTG core log (read-only) and show it: edition, sensor limit, sensors paused by the license, and the last activation error. License values are never shown, only fingerprints at debug level.
+- Servers page: badges *license ok* / *license: activation needed* and *not reachable from network*.
+
+### Changed
+- A restore no longer reports the license as fine just because the key was copied. PRTG binds a license to the system it was activated on, so the target reports *activation needed* until the license is activated there.
+- **Make PRTG reachable** (formerly *Fix PRTG IP*) is only shown for a server whose PRTG answers on `127.0.0.1` only. New migrations adjust the web server binding automatically.
+
 ## 1.5.2 — 2026-09-29
 
 ### Added
