@@ -202,3 +202,48 @@ Describe 'Server preparation script for WinRM' {
         $EnableText | Should -Match '-NotBefore \(Get-Date\)\.AddDays\(-2\)'
     }
 }
+
+Describe 'Setup-All: one file for PRTG Mover and VPN Watch' -Skip:($env:OS -ne 'Windows_NT') {
+    BeforeAll {
+        # a stand-in for the VPN Watch repository (it is a separate, private repository)
+        $script:FakeVw = Join-Path $Work 'vpn-watch-source'
+        New-Item -ItemType Directory -Force -Path (Join-Path $FakeVw 'tools'), (Join-Path $FakeVw 'data') | Out-Null
+        [IO.File]::WriteAllText((Join-Path $FakeVw 'VERSION'), '9.9.9')
+        [IO.File]::WriteAllText((Join-Path $FakeVw 'Start-VpnWatch.ps1'), 'param([int]$Port) "stand-in"')
+        [IO.File]::WriteAllText((Join-Path $FakeVw 'data\token.txt'), 'must never be packed')
+        $script:SetupFile = Join-Path $Work 'Setup-All.cmd'
+        $script:Build = Start-Process powershell -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            "`"$(Join-Path $Root 'tools\Build-SetupAll.ps1')`"", '-VpnWatchSource', "`"$FakeVw`"", '-Output', "`"$SetupFile`""
+    }
+
+    It 'builds one plain ASCII file that starts as a batch file' {
+        $Build.ExitCode | Should -Be 0
+        $bytes = [IO.File]::ReadAllBytes($SetupFile)
+        $bytes.Length | Should -BeGreaterThan 100000
+        @($bytes | Where-Object { $_ -gt 127 }).Count | Should -Be 0
+        [Text.Encoding]::ASCII.GetString($bytes, 0, 4) | Should -Be '<# :'
+    }
+
+    It 'installs PRTG Mover from that file, also into a folder with a space' {
+        $target = Join-Path $Work 'from one file\Prtg Mover'
+        $old = $env:SETUPALL_NOPAUSE; $env:SETUPALL_NOPAUSE = '1'
+        try {
+            $out = & cmd.exe /c "`"$SetupFile`" -SkipVpnWatch -PrtgMoverPath `"$target`" -NoShortcut -NoStart -NoAutostart -StartupFolder `"$Startup`"" 2>&1 | ForEach-Object { "$_" }
+            $LASTEXITCODE | Should -Be 0 -Because ($out -join "`n")
+        } finally { $env:SETUPALL_NOPAUSE = $old }
+        ($out -join "`n") | Should -Match 'DONE'
+        Test-Path -LiteralPath (Join-Path $target 'Start-PrtgMover.ps1') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $target 'config\servers.json') | Should -BeFalse
+    }
+
+    It 'reports a failed installation with an exit code' {
+        $old = $env:SETUPALL_NOPAUSE; $env:SETUPALL_NOPAUSE = '1'
+        try {
+            # the stand-in is no dashboard, so the test of VPN Watch has to fail
+            $out = & cmd.exe /c "`"$SetupFile`" -SkipPrtgMover -VpnWatchPath `"$(Join-Path $Work 'vw target')`" -NoShortcut -NoStart" 2>&1 | ForEach-Object { "$_" }
+            $LASTEXITCODE | Should -Be 1
+        } finally { $env:SETUPALL_NOPAUSE = $old }
+        ($out -join "`n") | Should -Match 'SETUP FAILED'
+        Test-Path -LiteralPath (Join-Path $Work 'vw target\data\token.txt') | Should -BeFalse
+    }
+}
