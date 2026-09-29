@@ -89,6 +89,37 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         { Invoke-PmRemoteRestore -JobId 'rt5' -ZipPath $zip -WorkRoot $wr -ExpectedSha256 'BAD' } | Should -Throw '*checksum mismatch*'
     }
 
+    It 'pull mode stages only small items on the source and lists the big folders for the manager' {
+        $wr = Join-Path $Work 'wr-pull'
+        $x = Join-Path $Work 'pull-extra'
+        New-Item -ItemType Directory -Force -Path (Join-Path $x 'Logs'), (Join-Path $x 'keep') | Out-Null
+        'a' | Set-Content (Join-Path $x 'keep\a.txt'); 'b' | Set-Content (Join-Path $x 'Logs\b.log'); 'c' | Set-Content (Join-Path $x 'cache.tmp')
+        $out = @(Invoke-PmRemoteBackup -JobId 'pull1' -WorkRoot $wr -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false -PullMode $true)
+        $res = $out | Where-Object PmType -eq 'result'
+        Test-Path (Join-Path $res.StageDir 'manifest.json') | Should -BeTrue
+        $res.ZipPath | Should -BeNullOrEmpty
+        # the file list honours excluded folders and file patterns
+        $lst = (Get-PmPullList -Source $x -ExcludeDirs @((Join-Path $x 'Logs')) -ExcludeFiles @('*.tmp') | Where-Object PmType -eq 'result')
+        @($lst.Files | ForEach-Object { $_.Rel }) | Should -Be @('keep\a.txt')
+        # cleanup leaves nothing behind
+        [void](Complete-PmRemotePull -StageDir $res.StageDir)
+        Test-Path $res.StageDir | Should -BeFalse
+    }
+
+    It 'restores from a local stage by moving folders (no second copy) and removes the stage' {
+        $wr = Join-Path $Work 'wr-move'
+        $x = Join-Path $Work 'move-extra'
+        New-Item -ItemType Directory -Force -Path $x | Out-Null
+        'moved' | Set-Content (Join-Path $x 'm.txt')
+        $out = @(Invoke-PmRemoteBackup -JobId 'mv1' -WorkRoot $wr -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false -ExtraPaths @($x) -PullMode $true)
+        $stage = ($out | Where-Object PmType -eq 'result').StageDir
+        Remove-Item $x -Recurse -Force
+        $r = @(Invoke-PmRemoteRestore -JobId 'mv2' -StageDir $stage -WorkRoot $wr -RestorePrtg $false -RestoreVpn $false -RestoreDesktop $false -MoveFromStage $true -CleanupStage $true) | Where-Object PmType -eq 'result'
+        $r.Report.Extra | Should -Be 'ok'
+        Get-Content (Join-Path $x 'm.txt') | Should -Be 'moved'
+        Test-Path $stage | Should -BeFalse
+    }
+
     It 'emits only log / progress / result records' {
         $out = @(Invoke-PmRemoteBackup -JobId 'rt3' -WorkRoot (Join-Path $Work 'wr3') -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false)
         @($out | Where-Object { $_.PmType -notin 'log', 'progress', 'result' }).Count | Should -Be 0

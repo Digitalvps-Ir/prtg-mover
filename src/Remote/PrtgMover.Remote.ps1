@@ -467,10 +467,13 @@ function Invoke-PmRemoteBackup {
         [bool]$IncludeAutoBackups = $false,
         # Stage directly into this folder (e.g. the manager's disk via \\tsclient) and skip zipping on the source.
         [string]$StageDir,
-        [string]$LogDir
+        [string]$LogDir,
+        # WinRM pull mode: big folders are NOT copied here - the manager pulls them straight from the snapshot.
+        [bool]$PullMode = $false
     )
     $ErrorActionPreference = 'Stop'
     $sourceHealth = $null
+    $pullItems = @()
     if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
     $direct = [bool]$StageDir
     $stage = if ($direct) { $StageDir } else { Join-Path $WorkRoot "staging\$JobId" }
@@ -520,6 +523,14 @@ function Invoke-PmRemoteBackup {
                 Write-PmLog 'Stopping PRTG services (the core flushes its configuration to disk)...' 'STEP'
                 Stop-PmPrtgServices
                 Write-PmLog 'PRTG services stopped.' 'OK'
+                if ($PullMode) {
+                    # Freeze the stopped state so the services can be restarted before the manager has pulled everything.
+                    try {
+                        $shadow = New-PmShadowCopy -Path $prtg.DataPath
+                        $dataSource = Join-Path $shadow.Link $prtg.DataPath.Substring($shadow.Volume.Length)
+                        Write-PmLog 'VSS snapshot of the stopped state created.' 'OK'
+                    } catch { Write-PmLog "VSS snapshot not available ($($_.Exception.Message)) - PRTG must stay stopped until the pull is finished." 'WARN'; $SourceAfter = 'KeepStopped' }
+                }
             }
 
             try {
@@ -535,15 +546,21 @@ function Invoke-PmRemoteBackup {
                     if (Test-Path -LiteralPath $x) { $skipped += ('{0} ({1:N2} GB)' -f (Split-Path $x -Leaf), ((Get-PmDirectorySize $x) / 1GB)) }
                 }
                 Write-PmLog "Copying only what PRTG needs. Skipped: $(if ($skipped) { $skipped -join ', ' } else { 'nothing' }) + temp/cache files ($($excludeFiles -join ', '))." 'INFO'
-                $code = Invoke-PmRobocopy -Source $dataSource -Destination (Join-Path $stage 'prtg\data') -ExcludeDirs $exclude -ExcludeFiles $excludeFiles -Mirror
-                if (-not (Test-PmRobocopyOk $code)) { throw "robocopy of PRTG data failed with exit code $code. $(Get-PmRobocopyErrors)" }
-                $cfg = Join-Path $stage 'prtg\data\PRTG Configuration.dat'
+                if ($PullMode) {
+                    $pullItems += [pscustomobject]@{ Source = $dataSource; Target = 'prtg\data'; ExcludeDirs = @($exclude); ExcludeFiles = @($excludeFiles) }
+                    $cfg = Join-Path $dataSource 'PRTG Configuration.dat'
+                } else {
+                    $code = Invoke-PmRobocopy -Source $dataSource -Destination (Join-Path $stage 'prtg\data') -ExcludeDirs $exclude -ExcludeFiles $excludeFiles -Mirror
+                    if (-not (Test-PmRobocopyOk $code)) { throw "robocopy of PRTG data failed with exit code $code. $(Get-PmRobocopyErrors)" }
+                    $cfg = Join-Path $stage 'prtg\data\PRTG Configuration.dat'
+                }
                 if (-not (Test-Path -LiteralPath $cfg)) { throw "'PRTG Configuration.dat' is missing from the copied data folder - aborting (backup would be unusable)." }
                 $cfgInfo = Get-Item -LiteralPath $cfg
                 $cfgHash = (Get-FileHash -LiteralPath $cfg -Algorithm SHA256).Hash
                 $cfgStats = Get-PmPrtgConfigStats -Path $cfg
                 Write-PmLog "Configuration content (all rules, notifications, triggers, users... are inside this file): $cfgStats" 'OK'
-                Write-PmLog ("Data folder copied ({0:N2} GB). PRTG Configuration.dat: {1:N1} MB, saved {2}." -f ((Get-PmDirectorySize (Join-Path $stage 'prtg\data')) / 1GB), ($cfgInfo.Length / 1MB), $cfgInfo.LastWriteTime) 'OK'
+                if ($PullMode) { Write-PmLog ("Data folder prepared for pulling by the manager. PRTG Configuration.dat: {0:N1} MB, saved {1}." -f ($cfgInfo.Length / 1MB), $cfgInfo.LastWriteTime) 'OK' }
+                else { Write-PmLog ("Data folder copied ({0:N2} GB). PRTG Configuration.dat: {1:N1} MB, saved {2}." -f ((Get-PmDirectorySize (Join-Path $stage 'prtg\data')) / 1GB), ($cfgInfo.Length / 1MB), $cfgInfo.LastWriteTime) 'OK' }
 
                 Write-PmProgress 35 'PRTG: copying customisations'
                 $copiedFolders = @()
@@ -564,8 +581,11 @@ function Invoke-PmRemoteBackup {
                     if ($shadow -and $prtg.ProgramPath.StartsWith($shadow.Volume, [StringComparison]::OrdinalIgnoreCase)) {
                         $progSource = Join-Path $shadow.Link $prtg.ProgramPath.Substring($shadow.Volume.Length)
                     }
-                    $code = Invoke-PmRobocopy -Source $progSource -Destination (Join-Path $stage 'prtg\programfull')
-                    if (Test-PmRobocopyOk $code) {
+                    if ($PullMode) {
+                        $pullItems += [pscustomobject]@{ Source = $progSource; Target = 'prtg\programfull'; ExcludeDirs = @(); ExcludeFiles = @() }
+                        $programCloned = $true
+                        Write-PmLog ("Complete PRTG program folder ({0:N0} MB) prepared for pulling - the target needs no installer." -f ((Get-PmDirectorySize $progSource) / 1MB)) 'OK'
+                    } elseif (Test-PmRobocopyOk ($code = Invoke-PmRobocopy -Source $progSource -Destination (Join-Path $stage 'prtg\programfull'))) {
                         $programCloned = $true
                         Write-PmLog ("Complete PRTG program folder cloned ({0:N0} MB) - the target needs no installer." -f ((Get-PmDirectorySize (Join-Path $stage 'prtg\programfull')) / 1MB)) 'OK'
                     } else { Write-PmLog "Program folder clone failed (robocopy $code) - the target will need the PRTG installer." 'WARN' }
@@ -605,7 +625,8 @@ function Invoke-PmRemoteBackup {
                     consistency = $(if ($NoTouch) { if ($shadow) { 'vss-snapshot' } else { 'live-copy' } } else { 'services-stopped' })
                 }
             } finally {
-                if ($shadow) { Remove-PmShadowCopy -Shadow $shadow; Write-PmLog 'VSS snapshot removed.' }
+                if ($shadow -and $PullMode) { Write-PmLog 'VSS snapshot kept until the manager has pulled the data (removed afterwards).' 'DEBUG' }
+                elseif ($shadow) { Remove-PmShadowCopy -Shadow $shadow; Write-PmLog 'VSS snapshot removed.' }
                 if ($NoTouch) {
                     Write-PmLog 'Source untouched - PRTG kept running the whole time.' 'OK'
                 } else {
@@ -712,7 +733,13 @@ function Invoke-PmRemoteBackup {
     # ---- Manifest + archive
     Write-PmProgress 70 'Packaging: writing manifest'
     $manifest.stagingBytes = Get-PmDirectorySize $stage
+    foreach ($pi in $pullItems) { $manifest.stagingBytes += [int64](@((Get-PmPullList -Source $pi.Source -ExcludeDirs $pi.ExcludeDirs -ExcludeFiles $pi.ExcludeFiles -Raw) | Measure-Object -Property Size -Sum).Sum) }
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $stage 'manifest.json') -Encoding UTF8
+    if ($PullMode) {
+        Write-PmLog ("Ready for the manager to pull {0:N2} GB (small items staged locally: {1:N1} MB)." -f ($manifest.stagingBytes / 1GB), ((Get-PmDirectorySize $stage) / 1MB)) 'OK'
+        Write-PmProgress 80 'Ready to pull'
+        return (New-PmResult @{ StageDir = $stage; PullItems = @($pullItems); ShadowId = $(if ($shadow) { $shadow.Id }); ShadowLink = $(if ($shadow) { $shadow.Link }); Manifest = ($manifest | ConvertTo-Json -Depth 8); SourceHealth = $sourceHealth })
+    }
     if ($direct) {
         Write-PmLog ("Staging complete on the manager ({0:N2} GB). The manager builds the package." -f ($manifest.stagingBytes / 1GB)) 'OK'
         Write-PmProgress 80 'Staging done'
@@ -758,7 +785,10 @@ function Invoke-PmRemoteRestore {
         [string]$ExpectedSha256,
         # Read the extracted package directly from this folder (e.g. the manager via \\tsclient) instead of a zip.
         [string]$StageDir,
-        [string]$LogDir
+        [string]$LogDir,
+        # The staged package is local on this server: move folders into place instead of copying (saves disk space).
+        [bool]$MoveFromStage = $false,
+        [bool]$CleanupStage = $false
     )
     $ErrorActionPreference = 'Stop'
     if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
@@ -776,9 +806,10 @@ function Invoke-PmRemoteRestore {
         $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
         $need = [int64]$manifest.stagingBytes
         $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
-        $required = [int64]($need * 1.1 + 1GB)
+        # Local stage + move: the data already occupies the disk, only a margin is needed.
+        $required = if ($MoveFromStage) { [int64]1GB } else { [int64]($need * 1.1 + 1GB) }
         if ($drive -and $drive.FreeSpace -lt $required) { throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB)) }
-        Write-PmLog ("Reading the package directly from the manager ({0}). Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK'
+        Write-PmLog ("Reading the staged package from {0}. Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK'
     }
     if (-not $direct -and $ExpectedSha256) {
         Write-PmProgress 2 'Verifying package checksum'
@@ -818,7 +849,11 @@ function Invoke-PmRemoteRestore {
                 $q = Split-Path $progPath -Qualifier -ErrorAction SilentlyContinue
                 if (-not $q -or -not (Test-Path "$q\")) { $progPath = Join-Path ${env:ProgramFiles(x86)} 'PRTG Network Monitor' }
                 Write-PmLog "PRTG is not installed here - installing the CLONED program files from the source to $progPath (no installer needed)..." 'STEP'
-                $code = Invoke-PmRobocopy -Source $cloneDir -Destination $progPath
+                if ($MoveFromStage -and -not (Test-Path -LiteralPath $progPath) -and ((Split-Path $cloneDir -Qualifier) -eq (Split-Path $progPath -Qualifier))) {
+                    New-Item -ItemType Directory -Force -Path (Split-Path $progPath -Parent) | Out-Null
+                    Move-Item -LiteralPath $cloneDir -Destination $progPath
+                    $code = 0
+                } else { $code = Invoke-PmRobocopy -Source $cloneDir -Destination $progPath }
                 if (-not (Test-PmRobocopyOk $code)) { throw "Copying the PRTG program files failed (robocopy $code)." }
                 $srcNet = [int]$manifest.prtg.netFrameworkRelease
                 $dstNet = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
@@ -903,7 +938,16 @@ function Invoke-PmRemoteRestore {
             Write-PmLog "Rollback copy of registry: $regBackup" 'OK'
 
             Write-PmProgress 45 'PRTG: restoring data folder'
-            $code = Invoke-PmRobocopy -Source (Join-Path $stage 'prtg\data') -Destination $dataPath -Mirror
+            $srcData = Join-Path $stage 'prtg\data'
+            if ($MoveFromStage -and -not (Test-Path -LiteralPath $dataPath) -and ((Split-Path $srcData -Qualifier) -eq (Split-Path $dataPath -Qualifier))) {
+                # Same volume: move instead of copy - no second copy of the data on the target disk.
+                New-Item -ItemType Directory -Force -Path (Split-Path $dataPath -Parent) | Out-Null
+                Move-Item -LiteralPath $srcData -Destination $dataPath
+                $code = 0
+                Write-PmLog 'Data folder moved into place (no extra disk space used).' 'OK'
+            } else {
+                $code = Invoke-PmRobocopy -Source $srcData -Destination $dataPath -Mirror
+            }
             if (-not (Test-PmRobocopyOk $code)) { throw "robocopy restore of data failed ($code)" }
             if ($manifest.prtg.configSha256) {
                 $h = (Get-FileHash -LiteralPath (Join-Path $dataPath 'PRTG Configuration.dat') -Algorithm SHA256).Hash
@@ -1053,11 +1097,53 @@ function Invoke-PmRemoteRestore {
         } catch { $report.Extra = 'failed'; $report.Errors += "Extra: $_"; Write-PmLog "Extra restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'Extra restore' }
     }
 
-    if (-not $direct) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not $direct -or $CleanupStage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
     if ($RemovePackage -and $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue }
     Write-PmProgress 100 'Restore finished'
     Write-PmLog "Restore finished on $env:COMPUTERNAME" 'STEP'
     New-PmResult @{ Report = [pscustomobject]$report }
+}
+
+function Get-PmPullList {
+    <#
+        Files below $Source (relative path, size, last write) without the excluded folders /
+        file patterns. Used by the manager to pull or push file by file and to resume: only
+        missing or changed files are transferred again.
+    #>
+    param([Parameter(Mandatory)][string]$Source, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @(), [switch]$Raw)
+    $list = New-Object System.Collections.ArrayList
+    if (Test-Path -LiteralPath $Source) {
+        $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
+        $xd = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' })
+        foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+            $full = $f.FullName
+            if (@($xd | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
+            if (@($ExcludeFiles | Where-Object { $f.Name -like $_ }).Count) { continue }
+            [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($root.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
+        }
+    }
+    if ($Raw) { return $list }
+    New-PmResult @{ Root = $Source; Files = @($list); Count = $list.Count; Bytes = [int64](($list | Measure-Object -Property Size -Sum).Sum) }
+}
+
+function New-PmRemoteDirectories {
+    param([Parameter(Mandatory)][string]$Root, [string[]]$Relative = @())
+    New-Item -ItemType Directory -Force -Path $Root | Out-Null
+    foreach ($r in $Relative) { if ($r) { New-Item -ItemType Directory -Force -Path (Join-Path $Root $r) | Out-Null } }
+    New-PmResult @{ Created = $Relative.Count }
+}
+
+function Complete-PmRemotePull {
+    <# Source cleanup after the manager pulled everything: remove the VSS snapshot and the small local staging folder. #>
+    param([string]$StageDir, [string]$ShadowId, [string]$ShadowLink)
+    if ($ShadowId) { Remove-PmShadowCopy -Shadow ([pscustomobject]@{ Id = $ShadowId; Link = $ShadowLink }); Write-PmLog 'VSS snapshot removed.' 'OK' }
+    if ($StageDir -and (Test-Path -LiteralPath $StageDir)) { Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction SilentlyContinue }
+    $root = Join-Path $env:SystemDrive 'PrtgMover'
+    foreach ($d in (Join-Path $root 'staging'), (Join-Path $root 'out'), $root) {
+        if ((Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue }
+    }
+    Write-PmLog 'Temporary files removed from the source - nothing left behind.' 'OK'
+    New-PmResult @{ Done = $true }
 }
 
 function Remove-PmRemoteFile {

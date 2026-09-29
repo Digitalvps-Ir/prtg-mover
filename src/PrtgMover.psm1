@@ -14,7 +14,7 @@ $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
 $script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram', 'IncludeLogs', 'IncludeAutoBackups'
-$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall'
+$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage'
 
 # ======================================================================= paths
 
@@ -777,8 +777,8 @@ function Invoke-PmPreflight {
             $srcVersion = $src.Prtg.Version
             if ((Get-PmTransport $Source) -eq 'rdp') {
                 Add-PmJobLog -Job $Job -Level OK -Message ("{0}: RDP mode stages directly on the manager - no free space needed on the source (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
-            } elseif ($data -gt 0 -and $src.FreeBytes -lt ($data * 2)) {
-                $problems += ("{0}: needs ~{1:N1} GB free for staging + package, has {2:N1} GB. Switch the server to the RDP connection method (stages on the manager) or free space." -f $Source.name, ($data * 2 / 1GB), ($src.FreeBytes / 1GB))
+            } else {
+                Add-PmJobLog -Job $Job -Level OK -Message ("{0}: WinRM mode - the manager pulls the files from a snapshot, no free space needed on the source (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
             }
         }
         # manager: staging copy + zip
@@ -789,7 +789,7 @@ function Invoke-PmPreflight {
     }
     foreach ($t in $Targets) {
         $ti = $info[$t.id]; if (-not $ti) { continue }
-        $factor = if ((Get-PmTransport $t) -eq 'rdp') { 1.2 } else { 2.5 }
+        $factor = 1.2   # both methods: staged package + move (no second copy)
         if ($data -gt 0 -and $ti.FreeBytes -lt ($data * $factor)) { $problems += ("{0}: needs ~{1:N1} GB free, has {2:N1} GB." -f $t.name, ($data * $factor / 1GB), ($ti.FreeBytes / 1GB)) }
         if ($ti.Prtg.Installed -and $srcVersion) {
             $sv = [version]($srcVersion -replace '[^\d\.]', ''); $tv = [version]($ti.Prtg.Version -replace '[^\d\.]', '')
@@ -870,11 +870,92 @@ function Use-PmCompletedStage {
     return [pscustomobject]@{ Zip = $zip; StageDir = $dest }
 }
 
+function Get-PmLocalFileList {
+    <# Local counterpart of Get-PmPullList: files below $Root with relative path, size, last write. #>
+    param([Parameter(Mandatory)][string]$Root)
+    $out = @{}
+    if (-not (Test-Path -LiteralPath $Root)) { return $out }
+    $r = (Get-Item -LiteralPath $Root).FullName.TrimEnd('\')
+    foreach ($f in (Get-ChildItem -LiteralPath $r -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        $out[$f.FullName.Substring($r.Length + 1).ToLowerInvariant()] = $f
+    }
+    return $out
+}
+
+function Invoke-PmTransferFiles {
+    <#
+        Resumable file-by-file transfer over a WinRM session.
+          -Direction Pull : RemoteRoot -> LocalRoot (files: remote list)
+          -Direction Push : LocalRoot  -> RemoteRoot (files: local list)
+        Files that already exist with the same size (and, for pull, the same timestamp) are skipped,
+        so an interrupted transfer continues where it stopped.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session, [Parameter(Mandatory)][ValidateSet('Pull', 'Push')][string]$Direction,
+        [Parameter(Mandatory)][string]$RemoteRoot, [Parameter(Mandatory)][string]$LocalRoot,
+        [object[]]$Files = @(), $Job, [string]$Label = 'files', [int]$ProgressBase = 0, [double]$ProgressSpan = 0
+    )
+    $existing = @{}
+    if ($Direction -eq 'Pull') {
+        $existing = Get-PmLocalFileList -Root $LocalRoot
+    } else {
+        $rl = Invoke-PmRemote -Session $Session -Function 'Get-PmPullList' -Parameters @{ Source = $RemoteRoot } -Job $Job
+        foreach ($f in @($rl.Files)) { $existing[([string]$f.Rel).ToLowerInvariant()] = $f }
+        $dirs = @($Files | ForEach-Object { Split-Path ([string]$_.Rel) -Parent } | Where-Object { $_ } | Sort-Object -Unique)
+        [void](Invoke-PmRemote -Session $Session -Function 'New-PmRemoteDirectories' -Parameters @{ Root = $RemoteRoot; Relative = [string[]]$dirs } -Job $Job)
+    }
+    $total = [int64](($Files | Measure-Object -Property Size -Sum).Sum)
+    $todo = @($Files | Where-Object {
+            $e = $existing[([string]$_.Rel).ToLowerInvariant()]
+            if (-not $e) { return $true }
+            $eSize = if ($e.PSObject.Properties['Length']) { $e.Length } else { $e.Size }
+            if ([int64]$eSize -ne [int64]$_.Size) { return $true }
+            if ($Direction -eq 'Pull' -and $e.LastWriteTimeUtc.Ticks -ne [int64]$_.Time) { return $true }
+            return $false
+        })
+    $todoBytes = [int64](($todo | Measure-Object -Property Size -Sum).Sum)
+    Add-PmJobLog -Job $Job -Level STEP -Message ("{0} {1}: {2} file(s), {3:N2} GB in total - {4} file(s), {5:N2} GB still to transfer{6}." -f $Direction, $Label, @($Files).Count, ($total / 1GB), $todo.Count, ($todoBytes / 1GB), $(if ($todo.Count -lt @($Files).Count) { ' (resuming - the rest is already there)' } else { '' }))
+    $done = [int64]0; $sw = [Diagnostics.Stopwatch]::StartNew(); $lastLog = [Diagnostics.Stopwatch]::StartNew(); $n = 0
+    foreach ($f in $todo) {
+        $rel = [string]$f.Rel
+        $remote = Join-Path $RemoteRoot $rel
+        $local = Join-Path $LocalRoot $rel
+        for ($try = 1; $try -le 3; $try++) {
+            try {
+                if ($Direction -eq 'Pull') {
+                    $ld = Split-Path $local -Parent
+                    if (-not (Test-Path -LiteralPath $ld)) { New-Item -ItemType Directory -Force -Path $ld | Out-Null }
+                    Copy-Item -FromSession $Session -Path $remote -Destination $local -Force -ErrorAction Stop
+                    (Get-Item -LiteralPath $local).LastWriteTimeUtc = [datetime]::new([int64]$f.Time, [DateTimeKind]::Utc)
+                } else {
+                    Copy-Item -ToSession $Session -Path $local -Destination $remote -Force -ErrorAction Stop
+                }
+                break
+            } catch {
+                if ($try -eq 3) { throw "Transfer of '$rel' failed 3 times: $($_.Exception.Message)" }
+                Add-PmJobLog -Job $Job -Level WARN -Message "Transfer of '$rel' failed ($($_.Exception.Message)) - retry $($try + 1)/3"
+                Start-Sleep -Seconds (5 * $try)
+            }
+        }
+        $done += [int64]$f.Size; $n++
+        if ($lastLog.Elapsed.TotalSeconds -ge 20 -or $n -eq $todo.Count) {
+            $pct = if ($todoBytes) { [int](100 * $done / $todoBytes) } else { 100 }
+            $rate = ($done / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)
+            $eta = if ($rate -gt 0) { [TimeSpan]::FromSeconds((($todoBytes - $done) / 1MB) / $rate) } else { [TimeSpan]::Zero }
+            Add-PmJobLog -Job $Job -Message ("{0} {1}: {2}% ({3:N2} / {4:N2} GB, {5} files) - {6:N1} MB/s, about {7:hh\:mm\:ss} left" -f $Direction, $Label, $pct, ($done / 1GB), ($todoBytes / 1GB), $n, $rate, $eta)
+            if ($ProgressSpan -gt 0) { Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * $pct / 100)) -Step ("{0} {1}: {2}%" -f $Direction, $Label, $pct) }
+            $lastLog.Restart()
+        }
+    }
+    Add-PmJobLog -Job $Job -Level OK -Message ("{0} {1} complete ({2:N2} GB transferred in {3:hh\:mm\:ss})." -f $Direction, $Label, ($done / 1GB), $sw.Elapsed)
+}
+
 function Invoke-PmBackupFlow {
     <#
-        Returns [pscustomobject]@{ Zip = <package on the manager>; StageDir = <extracted copy on the manager or $null> }.
-        RDP (agent) sources copy straight into the manager's disk (no space used on the source);
-        the manager then builds the zip. WinRM sources build the zip themselves.
+        Returns [pscustomobject]@{ Zip = <package on the manager>; StageDir = <extracted copy on the manager> }.
+          RDP (agent) : the server copies straight onto the manager's disk via \\tsclient.
+          WinRM       : the manager pulls the files from the VSS snapshot over WinRM, file by file (resumable).
+        In both cases the source needs no free disk space and the manager builds the zip.
     #>
     param(
         [Parameter(Mandatory)]$Server, [pscredential]$Credential, [hashtable]$Options = @{}, $Job,
@@ -887,51 +968,54 @@ function Invoke-PmBackupFlow {
         $params = ConvertTo-PmHashtable -InputObject $Options -Keys $script:PmBackupKeys
         $params.JobId = $jobId
         $agent = [bool]$s.PSObject.Properties['PmAgent']
-        $stageLocal = $null
+        $stageLocal = Join-Path (Get-PmPath Data) "staging\$jobId"
+        # Resume: continue the partial copy of an interrupted run instead of starting from zero.
+        $prev = Find-PmResumeStage -Job $Job
+        if ($prev -and -not (Test-Path -LiteralPath $stageLocal)) {
+            Move-Item -LiteralPath $prev.Path -Destination $stageLocal
+            Add-PmJobLog -Job $Job -Level OK -Message ("Reusing the partial copy of {0} ({1:N2} GB already transferred) - only the rest is copied." -f $prev.JobId, ((Get-ChildItem -LiteralPath $stageLocal -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB))
+        }
+        New-Item -ItemType Directory -Force -Path $stageLocal | Out-Null
         if ($agent) {
-            $stageLocal = Join-Path (Get-PmPath Data) "staging\$jobId"
-            # Resume: continue the partial copy of the interrupted run instead of starting from zero
-            # (robocopy then only transfers what is missing or changed).
-            $prev = Find-PmResumeStage -Job $Job
-            if ($prev -and -not (Test-Path -LiteralPath $stageLocal)) {
-                Move-Item -LiteralPath $prev.Path -Destination $stageLocal
-                Add-PmJobLog -Job $Job -Level OK -Message ("Reusing the partial staging copy of {0} ({1:N2} GB already transferred) - only the rest is copied." -f $prev.JobId, ((Get-ChildItem -LiteralPath $stageLocal -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB))
-            }
-            New-Item -ItemType Directory -Force -Path $stageLocal | Out-Null
             $params.StageDir = ConvertTo-PmTsClientPath $stageLocal
             $params.LogDir = ConvertTo-PmTsClientPath (Join-Path (Get-PmPath Data) 'logs\robocopy')
             Add-PmJobLog -Job $Job -Level DEBUG -Message "Direct staging: server writes to $($params.StageDir) (= $stageLocal on the manager)"
+        } else {
+            $params.PullMode = $true
+            Add-PmJobLog -Job $Job -Level DEBUG -Message "Pull mode: the manager pulls the files over WinRM into $stageLocal"
         }
         $sw = [Diagnostics.Stopwatch]::StartNew()
-        $r = Invoke-PmRemote -Session $s -Function 'Invoke-PmRemoteBackup' -Parameters $params -Job $Job -ProgressBase $ProgressBase -ProgressSpan ($ProgressSpan * 0.7)
+        $r = Invoke-PmRemote -Session $s -Function 'Invoke-PmRemoteBackup' -Parameters $params -Job $Job -ProgressBase $ProgressBase -ProgressSpan ($ProgressSpan * 0.1)
         if (-not $r) { throw 'Remote backup returned no result.' }
         Add-PmJobLog -Job $Job -Level DEBUG -Message ("Remote backup phase took {0:N0} s" -f $sw.Elapsed.TotalSeconds)
         $manifest = $r.Manifest | ConvertFrom-Json
 
-        if ($agent) {
-            Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.75)) -Step 'Building the package on the manager'
-            $zipName = 'PRTG_{0}_{1}.zip' -f $manifest.source.computer, (Get-Date -Format 'yyyyMMdd-HHmmss')
-            $local = Join-Path (Get-PmPath Backups) $zipName
-            Add-PmJobLog -Job $Job -Level STEP -Message ("Compressing the staged copy ({0:N2} GB) into {1} on the manager..." -f ($manifest.stagingBytes / 1GB), $zipName)
-            $sw.Restart()
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            [IO.Compression.ZipFile]::CreateFromDirectory($stageLocal, $local, [IO.Compression.CompressionLevel]::Optimal, $false)
-            $hash = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash
-            Add-PmJobLog -Job $Job -Level OK -Message ("Package ready: {0} ({1:N1} MB, SHA-256 {2}, {3:N0} s)" -f $zipName, ((Get-Item -LiteralPath $local).Length / 1MB), $hash, $sw.Elapsed.TotalSeconds)
-        } else {
-            Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.75)) -Step 'Downloading package to manager'
-            Add-PmJobLog -Job $Job -Level STEP -Message ("Downloading {0} ({1:N1} MB) to the manager..." -f $r.ZipName, ($r.Size / 1MB))
-            $local = Join-Path (Get-PmPath Backups) $r.ZipName
-            $sw.Restart()
-            Copy-PmFromServer -Session $s -RemotePath $r.ZipPath -LocalPath $local -Job $Job
-            $hash = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash
-            if ($hash -ne $r.Sha256) { throw "Checksum mismatch after download (remote $($r.Sha256), local $hash)." }
-            Add-PmJobLog -Job $Job -Level OK -Message ("Backup stored on manager: {0} (SHA-256 verified, {1:N1} MB/s)" -f $local, (($r.Size / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)))
-            [void](Invoke-PmRemote -Session $s -Function 'Remove-PmRemoteFile' -Parameters @{ Path = $r.ZipPath } -Job $Job)
+        if (-not $agent) {
+            try {
+                # small items staged on the source (registry, services, VPN, desktops, extra, manifest)
+                $small = Invoke-PmRemote -Session $s -Function 'Get-PmPullList' -Parameters @{ Source = $r.StageDir } -Job $Job
+                Invoke-PmTransferFiles -Session $s -Direction Pull -RemoteRoot $r.StageDir -LocalRoot $stageLocal -Files @($small.Files) -Job $Job -Label 'registry/VPN/desktop/manifest'
+                $span = $ProgressSpan * 0.6; $i = 0; $items = @($r.PullItems)
+                foreach ($pi in $items) {
+                    $lst = Invoke-PmRemote -Session $s -Function 'Get-PmPullList' -Parameters @{ Source = $pi.Source; ExcludeDirs = [string[]]@($pi.ExcludeDirs); ExcludeFiles = [string[]]@($pi.ExcludeFiles) } -Job $Job
+                    Invoke-PmTransferFiles -Session $s -Direction Pull -RemoteRoot $pi.Source -LocalRoot (Join-Path $stageLocal $pi.Target) -Files @($lst.Files) -Job $Job -Label $pi.Target `
+                        -ProgressBase ($ProgressBase + [int]($ProgressSpan * 0.1) + [int]($span * $i / [math]::Max(1, $items.Count))) -ProgressSpan ($span / [math]::Max(1, $items.Count))
+                    $i++
+                }
+            } finally {
+                try { [void](Invoke-PmRemote -Session $s -Function 'Complete-PmRemotePull' -Parameters @{ StageDir = $r.StageDir; ShadowId = [string]$r.ShadowId; ShadowLink = [string]$r.ShadowLink } -Job $Job) }
+                catch { Add-PmJobError -Job $Job -ErrorRecord $_ -Context 'Source cleanup: ' }
+            }
+            # the pulled configuration must be byte-identical to the one read on the source
+            if ($manifest.prtg.configSha256) {
+                $h = (Get-FileHash -LiteralPath (Join-Path $stageLocal 'prtg\data\PRTG Configuration.dat') -Algorithm SHA256).Hash
+                if ($h -ne $manifest.prtg.configSha256) { throw 'PRTG Configuration.dat pulled to the manager does not match the source (checksum) - run Resume.' }
+                Add-PmJobLog -Job $Job -Level OK -Message 'PRTG Configuration.dat verified on the manager (SHA-256 identical to the source).'
+            }
         }
-        [pscustomobject]@{ source = $Server.name; sha256 = $hash; manifest = $manifest } |
-            ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$local.meta.json" -Encoding UTF8
-        Write-PmAudit -Action 'backup.created' -Data @{ job = $jobId; server = $Server.name; package = (Split-Path $local -Leaf); sha256 = $hash }
+
+        Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.75)) -Step 'Building the package on the manager'
+        $local = New-PmPackageFromStage -StageDir $stageLocal -Job $Job -SourceName $Server.name
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]$ProgressSpan) -Step 'Backup complete'
         $result = [pscustomobject]@{ Zip = $local; StageDir = $stageLocal }
         if ($r.SourceHealth -and -not $r.SourceHealth.Healthy) {
@@ -942,19 +1026,24 @@ function Invoke-PmBackupFlow {
 }
 
 function Get-PmExtractedStage {
-    <# Local extracted copy of a package (used by RDP-agent targets, which read it via \\tsclient). #>
+    <# Local extracted copy of a package (read by RDP targets via \\tsclient, pushed to WinRM targets). #>
     param([Parameter(Mandatory)][string]$ZipPath, [string]$StageDir, $Job)
     if ($StageDir -and (Test-Path -LiteralPath (Join-Path $StageDir 'manifest.json'))) { return $StageDir }
     $dir = Join-Path (Get-PmPath Data) ("staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($ZipPath))
     if (Test-Path -LiteralPath (Join-Path $dir 'manifest.json')) { return $dir }
     if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
-    Add-PmJobLog -Job $Job -Level STEP -Message "Extracting $(Split-Path $ZipPath -Leaf) on the manager for direct reading by the target..."
+    Add-PmJobLog -Job $Job -Level STEP -Message "Extracting $(Split-Path $ZipPath -Leaf) on the manager..."
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $dir)
     return $dir
 }
 
 function Invoke-PmRestoreFlow {
+    <#
+          RDP (agent) : the target reads the staged package straight from the manager (\\tsclient).
+          WinRM       : the manager pushes the staged files to the target file by file (resumable),
+                        and the target MOVES them into place - it needs no second copy of the data.
+    #>
     param(
         [Parameter(Mandatory)]$Server, [pscredential]$Credential, [Parameter(Mandatory)][string]$BackupPath,
         [hashtable]$Options = @{}, $Job, [int]$ProgressBase = 0, [double]$ProgressSpan = 100, [string]$StageDir
@@ -977,33 +1066,28 @@ function Invoke-PmRestoreFlow {
             $params.InstallerPath = $remoteInst
         }
 
+        $stageLocal = Get-PmExtractedStage -ZipPath $BackupPath -StageDir $StageDir -Job $Job
         if ($agent) {
-            # The target reads the extracted package straight from the manager - no zip copy, no extraction on the target.
-            $stageLocal = Get-PmExtractedStage -ZipPath $BackupPath -StageDir $StageDir -Job $Job
             $params.StageDir = ConvertTo-PmTsClientPath $stageLocal
             $params.LogDir = ConvertTo-PmTsClientPath (Join-Path (Get-PmPath Data) 'logs\robocopy')
             Add-PmJobLog -Job $Job -Level DEBUG -Message "Direct restore: target reads $($params.StageDir)"
         } else {
-            $size = (Get-Item -LiteralPath $BackupPath).Length
-            if ($init.FreeBytes -and $init.FreeBytes -lt ($size * 3)) {
-                throw ("Not enough free space on target: {0:N1} GB free, ~{1:N1} GB needed." -f ($init.FreeBytes / 1GB), ($size * 3 / 1GB))
+            # Stable folder name per package, so Resume continues the push instead of starting again.
+            $remoteStage = Join-Path $init.WorkRoot ('restore\' + [IO.Path]::GetFileNameWithoutExtension($BackupPath))
+            $files = @((Get-PmLocalFileList -Root $stageLocal).GetEnumerator() | ForEach-Object { [pscustomobject]@{ Rel = $_.Value.FullName.Substring($stageLocal.TrimEnd('\').Length + 1); Size = $_.Value.Length; Time = $_.Value.LastWriteTimeUtc.Ticks } })
+            $bytes = [int64](($files | Measure-Object -Property Size -Sum).Sum)
+            if ($init.FreeBytes -and $init.FreeBytes -lt ($bytes + 2GB)) {
+                throw ("Not enough free space on the target: {0:N1} GB free, {1:N1} GB needed." -f ($init.FreeBytes / 1GB), (($bytes + 2GB) / 1GB))
             }
-            $sha = $null
-            $meta = "$BackupPath.meta.json"
-            if (Test-Path -LiteralPath $meta) { try { $sha = (Get-Content -LiteralPath $meta -Raw -Encoding UTF8 | ConvertFrom-Json).sha256 } catch { } }
-            if (-not $sha) { $sha = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash }
-            $params.ExpectedSha256 = $sha
-            Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.05)) -Step "$($Server.name): uploading package"
-            Add-PmJobLog -Job $Job -Level STEP -Message ("Uploading package to target ({0:N1} MB)..." -f ($size / 1MB))
-            $remoteZip = Join-Path $init.Inbox (Split-Path $BackupPath -Leaf)
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            Copy-PmToServer -Session $s -LocalPath $BackupPath -RemotePath $remoteZip -Job $Job
-            Add-PmJobLog -Job $Job -Level OK -Message ("Package uploaded ({0:N1} MB/s)." -f (($size / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)))
-            $params.ZipPath = $remoteZip
+            Invoke-PmTransferFiles -Session $s -Direction Push -RemoteRoot $remoteStage -LocalRoot $stageLocal -Files $files -Job $Job -Label 'package to target' `
+                -ProgressBase ($ProgressBase + [int]($ProgressSpan * 0.02)) -ProgressSpan ($ProgressSpan * 0.6)
+            $params.StageDir = $remoteStage
+            $params.MoveFromStage = $true
+            $params.CleanupStage = $true
         }
 
         $r = Invoke-PmRemote -Session $s -Function 'Invoke-PmRemoteRestore' -Parameters $params -Job $Job `
-            -ProgressBase ($ProgressBase + [int]($ProgressSpan * 0.2)) -ProgressSpan ($ProgressSpan * 0.8)
+            -ProgressBase ($ProgressBase + [int]($ProgressSpan * 0.62)) -ProgressSpan ($ProgressSpan * 0.38)
         if (-not $r) { throw 'Remote restore returned no result.' }
         Write-PmAudit -Action 'restore.finished' -Data @{ job = $jobId; server = $Server.name; package = (Split-Path $BackupPath -Leaf); prtg = $r.Report.Prtg; errors = @($r.Report.Errors).Count }
         return $r.Report
