@@ -651,22 +651,6 @@ function Get-PmConnectHint {
     return $null
 }
 
-# ======================================================================= dashboard access
-
-function Test-PmDashboardRequest {
-    <#
-        The dashboard uses no access token. One check remains: a request that comes from
-        another web site (its Origin differs from the dashboard's own address) is refused,
-        so a page that is open in the browser cannot start jobs. Pure function.
-        Returns Allowed, Status and Reason.
-    #>
-    param([string]$Method, [string]$Path, [string]$Origin, [string]$RequestOrigin)
-    if ($Origin -and $Origin -ne $RequestOrigin) {
-        return [pscustomobject]@{ Allowed = $false; Status = 403; Reason = 'Request from another web site refused.' }
-    }
-    return [pscustomobject]@{ Allowed = $true; Status = 200; Reason = $null }
-}
-
 # ======================================================================= diagnostics / audit logging
 
 function Write-PmManagerLog {

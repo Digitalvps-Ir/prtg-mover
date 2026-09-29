@@ -494,20 +494,6 @@ Describe 'Removing the PRTG license from a migrated server' -Skip:($env:OS -ne '
     }
 }
 
-Describe 'Dashboard access' {
-    It 'serves requests of the dashboard page itself without any token' {
-        (Test-PmDashboardRequest -Method GET -Path '/api/info').Allowed | Should -BeTrue
-        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -Origin 'http://localhost:8765' -RequestOrigin 'http://localhost:8765').Allowed | Should -BeTrue
-    }
-
-    It 'refuses requests that come from another web site' {
-        $r = Test-PmDashboardRequest -Method POST -Path '/api/jobs' -Origin 'http://evil.example' -RequestOrigin 'http://localhost:8765'
-        $r.Allowed | Should -BeFalse
-        $r.Status | Should -Be 403
-        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -Origin 'null' -RequestOrigin 'http://localhost:8765').Status | Should -Be 403
-    }
-}
-
 Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT') {
     BeforeAll {
         $script:DashData = Join-Path $Work 'dash-data'
@@ -542,14 +528,8 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         & $StatusOf GET "$Dash/api/servers" | Should -Be 200
     }
 
-    It 'refuses a request from another web site and starts no job for it' {
-        & $StatusOf POST "$Dash/api/jobs" @{ 'Content-Type' = 'text/plain'; 'Origin' = 'http://evil.example' } '{"type":"test","serverIds":["x"]}' | Should -Be 403
-        & $StatusOf DELETE "$Dash/api/servers/x" @{ 'Origin' = 'http://evil.example' } | Should -Be 403
-        @(Get-ChildItem (Join-Path $DashData 'data\jobs') -Filter '*.json' -ErrorAction SilentlyContinue).Count | Should -Be 0
-    }
-
-    It 'serves the same request when it comes from the dashboard page' {
-        & $StatusOf POST "$Dash/api/servers" @{ 'Content-Type' = 'application/json'; 'Origin' = $Dash } '{"name":"T1","host":"192.0.2.10","role":"target"}' | Should -Be 200
+    It 'serves API requests without any check' {
+        & $StatusOf POST "$Dash/api/servers" @{ 'Content-Type' = 'application/json'; 'Origin' = 'http://other.example' } '{"name":"T1","host":"192.0.2.10","role":"target"}' | Should -Be 200
     }
 }
 

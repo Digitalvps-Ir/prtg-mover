@@ -7,9 +7,9 @@
     manage servers, run connectivity tests, back up / migrate / restore PRTG servers,
     and download or upload backup packages.
 
-    The dashboard listens on localhost and uses no access token. Requests that come from
-    other web sites are refused. With -ListenAll everyone who can reach the port can use
-    the dashboard.
+    The dashboard listens on localhost and has no access protection: no token and no
+    check of where a request comes from. With -ListenAll everyone who can reach the port
+    can use the dashboard.
 
 .PARAMETER Port
     TCP port of the dashboard. Default 8765.
@@ -84,14 +84,6 @@ function Read-PmBody {
     try { $txt = $reader.ReadToEnd() } finally { $reader.Dispose() }
     if ([string]::IsNullOrWhiteSpace($txt)) { return [pscustomobject]@{} }
     return $txt | ConvertFrom-Json
-}
-
-function Test-PmAuth {
-    <# Returns the decision of Test-PmDashboardRequest for this request. #>
-    param($Ctx)
-    $req = $Ctx.Request
-    Test-PmDashboardRequest -Method $req.HttpMethod -Path $req.Url.AbsolutePath.TrimEnd('/') `
-        -Origin $req.Headers['Origin'] -RequestOrigin $req.Url.GetLeftPart([UriPartial]::Authority)
 }
 
 function Get-PmServerView {
@@ -198,12 +190,6 @@ function Invoke-PmRoute {
         return
     }
 
-    $auth = Test-PmAuth $Ctx
-    if (-not $auth.Allowed) {
-        Write-PmManagerLog -Level WARN -Message ("API {0} {1} refused ({2}): {3} | from {4} origin '{5}'" -f $method, $path, $auth.Status, $auth.Reason, $req.RemoteEndPoint, $req.Headers['Origin']) -Source 'api'
-        Send-PmJson $Ctx @{ error = $auth.Reason } $auth.Status
-        return
-    }
 
     $seg = @($path.Substring(1).Split('/') | ForEach-Object { [uri]::UnescapeDataString($_) })   # api, resource, id, action
 

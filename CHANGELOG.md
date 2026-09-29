@@ -4,8 +4,7 @@
 
 ### Changed
 - **The dashboard uses no access token.** A token file left by an older version is removed when the dashboard starts.
-- **Requests from other web sites are refused.** A page that is open in the browser of the manager cannot call the dashboard and start jobs. This check needs nothing from the user.
-- Every program that runs on the manager can use the dashboard. With `-ListenAll`, everyone who can reach the port can use it, and the console says so.
+- **No access protection at all**, as the owner wants: no token and no check of where a request comes from. Every program on the manager, every web page that is open in a browser on the manager and, with `-ListenAll`, everyone who can reach the port can use the dashboard.
 
 ### Added
 - `Start-PrtgMover.ps1 -DataRoot <folder>` keeps `config\`, `data\`, `backups\` and `installers\` outside the program folder.
