@@ -177,6 +177,33 @@ function Get-PmTransport {
     return 'rdp'
 }
 
+function Copy-PmServerTransport {
+    <# One job can force RDP or WinRM without changing the saved server. #>
+    param($Server, [string]$Transport)
+    if (-not $Server -or $Transport -notin 'rdp', 'winrm', 'local') { return $Server }
+    $h = [ordered]@{}
+    foreach ($p in $Server.PSObject.Properties) { $h[$p.Name] = $p.Value }
+    $h['transport'] = $Transport
+    return [pscustomobject]$h
+}
+
+function Get-PmJobServer {
+    param($Server, [hashtable]$Options)
+    $t = ''
+    if ($Options -and $Options.ContainsKey('Transfer') -and $Options.Transfer) { $t = [string]$Options.Transfer }
+    if ($t -in 'rdp', 'winrm') { return Copy-PmServerTransport -Server $Server -Transport $t }
+    return $Server
+}
+
+function Assert-PmTransferSelection {
+    param([string]$Transfer, [string]$JobType, [int]$TargetCount)
+    if ([string]::IsNullOrWhiteSpace($Transfer)) { return }
+    if ($Transfer -notin 'rdp', 'winrm', 'wireguard', 'ipip') { throw "Unknown transfer '$Transfer'. Use rdp, winrm, wireguard, or ipip." }
+    if ($Transfer -in 'wireguard', 'ipip' -and ($JobType -ne 'migrate' -or $TargetCount -lt 1)) {
+        throw 'A tunnel copies directly between two Windows servers. Choose a source and a target. RDP and WinRM are what copy through this computer.'
+    }
+}
+
 function Test-PmServerPorts {
     <# Quick TCP reachability of WinRM and RDP from the manager. #>
     param([Parameter(Mandatory)]$Server)
@@ -801,16 +828,22 @@ function Invoke-PmPreflight {
             if ($includePrtg -and -not $src.Prtg.Installed) { $problems += "$($Source.name): PRTG is not installed on the source." }
             $data = [int64]$src.PrtgDataBytes
             $srcVersion = $src.Prtg.Version
-            if ((Get-PmTransport $Source) -eq 'rdp') {
+            $viaTunnel = [string]$Options.Transfer -in 'wireguard', 'ipip'
+            if ($viaTunnel) {
+                Add-PmJobLog -Job $Job -Level OK -Message ("{0}: tunnel mode - the source copies straight to the target. This computer is not in the data path (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
+            } elseif ((Get-PmTransport $Source) -eq 'rdp') {
                 Add-PmJobLog -Job $Job -Level OK -Message ("{0}: RDP mode stages directly on the manager - no free space needed on the source (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
             } else {
                 Add-PmJobLog -Job $Job -Level OK -Message ("{0}: WinRM mode - the manager pulls the files from a snapshot, no free space needed on the source (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
             }
         }
-        # manager: staging copy + zip
-        $mgrDrive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path (Get-PmPath Root) -Qualifier))
-        if ($data -gt 0 -and $mgrDrive -and $mgrDrive.FreeSpace -lt ($data * 2.2)) {
-            $problems += ("Manager: needs ~{0:N1} GB free on {1} for staging + package, has {2:N1} GB." -f ($data * 2.2 / 1GB), $mgrDrive.DeviceID, ($mgrDrive.FreeSpace / 1GB))
+        # manager: staging copy + zip. A tunnel never stores the package here.
+        $viaTunnel = [string]$Options.Transfer -in 'wireguard', 'ipip'
+        if (-not $viaTunnel) {
+            $mgrDrive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path (Get-PmPath Root) -Qualifier))
+            if ($data -gt 0 -and $mgrDrive -and $mgrDrive.FreeSpace -lt ($data * 2.2)) {
+                $problems += ("Manager: needs ~{0:N1} GB free on {1} for staging + package, has {2:N1} GB." -f ($data * 2.2 / 1GB), $mgrDrive.DeviceID, ($mgrDrive.FreeSpace / 1GB))
+            }
         }
     }
     foreach ($t in $Targets) {
@@ -1386,6 +1419,135 @@ function Set-PmCheckpoint {
     Save-PmJobRecord -Job $Job
 }
 
+function Invoke-PmDirectTunnelMigrate {
+    <#
+        Copies source -> target over a tunnel. This computer opens the command channel
+        (the server's saved RDP or WinRM method) and does not receive the files.
+    #>
+    param(
+        [Parameter(Mandatory)]$Source,
+        [Parameter(Mandatory)][object[]]$Targets,
+        [hashtable]$Options = @{},
+        [hashtable]$Credentials,
+        $Job
+    )
+    $kind = [string]$Options.Transfer
+    if ($kind -notin 'wireguard', 'ipip') { throw "Tunnel '$kind' is not available." }
+    if (@($Targets).Count -lt 1) { throw 'A tunnel needs a target server.' }
+    $plan = Get-PmTunnelAddresses -TargetCount @($Targets).Count -Kind $kind
+    $label = if ($kind -eq 'ipip') { 'IPIP' } else { 'WireGuard' }
+    Add-PmJobLog -Job $Job -Level STEP -Message ("{0}: {1} ({2}) will copy straight to {3}. This computer only sends commands and does not store the backup." -f $label, $Source.name, $plan.Source, (($plan.Targets) -join ', '))
+    $srcCred = Resolve-PmCredential $Source $Credentials
+    $srcSession = $null
+    $opened = @()
+    $reports = @()
+    try {
+        Add-PmJobLog -Job $Job -Level STEP -Message "Command channel to $($Source.name) via $((Get-PmTransport $Source).ToUpper()) (not the file path)..."
+        $srcSession = New-PmSession -Server $Source -Credential $srcCred -Job $Job
+        $ipipCode = $null
+        if ($kind -eq 'ipip') { $ipipCode = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'Remote\IpipTunnel.cs')) }
+        $srcKey = $null
+        if ($kind -eq 'wireguard') {
+            $srcKey = Invoke-PmRemote -Session $srcSession -Function 'Install-PmWireGuard' -Job $Job
+            if (-not $srcKey.PublicKey) { throw "WireGuard on $($Source.name) did not return a public key." }
+        } else {
+            [void](Invoke-PmRemote -Session $srcSession -Function 'Install-PmIpip' -Parameters @{ Code = $ipipCode } -Job $Job)
+        }
+        $tips = @($plan.Targets)
+        $i = 0
+        foreach ($t in @($Targets)) {
+            $tip = [string]$tips[$i]
+            $i++
+            $tCred = Resolve-PmCredential $t $Credentials
+            if (-not $tCred) { throw "$($t.name) needs a saved administrator password so $($Source.name) can sign in over the tunnel." }
+            Add-PmJobLog -Job $Job -Level STEP -Message "Command channel to $($t.name) via $((Get-PmTransport $t).ToUpper())..."
+            $sess = New-PmSession -Server $t -Credential $tCred -Job $Job
+            $pub = $null
+            if ($kind -eq 'wireguard') {
+                $key = Invoke-PmRemote -Session $sess -Function 'Install-PmWireGuard' -Job $Job
+                if (-not $key.PublicKey) { throw "WireGuard on $($t.name) did not return a public key." }
+                $pub = [string]$key.PublicKey
+            } else {
+                [void](Invoke-PmRemote -Session $sess -Function 'Install-PmIpip' -Parameters @{ Code = $ipipCode } -Job $Job)
+            }
+            $opened += [pscustomobject]@{ Server = $t; Session = $sess; Credential = $tCred; TunnelIp = $tip; PublicKey = $pub }
+        }
+        if ($kind -eq 'wireguard') {
+            $srcPeers = @($opened | ForEach-Object { [pscustomobject]@{ PublicKey = $_.PublicKey; TunnelIp = $_.TunnelIp; PublicIp = [string]$_.Server.host } })
+            [void](Invoke-PmRemote -Session $srcSession -Function 'Enable-PmWireGuardEndpoint' -Parameters @{ Address = "$($plan.Source)/24"; ListenPort = $plan.Port; Peers = $srcPeers } -Job $Job)
+            foreach ($row in $opened) {
+                $peers = @([pscustomobject]@{ PublicKey = [string]$srcKey.PublicKey; TunnelIp = $plan.Source; PublicIp = [string]$Source.host })
+                [void](Invoke-PmRemote -Session $row.Session -Function 'Enable-PmWireGuardEndpoint' -Parameters @{ Address = "$($row.TunnelIp)/24"; ListenPort = $plan.Port; Peers = $peers } -Job $Job)
+            }
+            Add-PmJobLog -Job $Job -Level STEP -Message 'Waiting for the WireGuard handshake...'
+            Start-Sleep -Seconds 8
+        } else {
+            $srcPeers = @($opened | ForEach-Object { [pscustomobject]@{ TunnelIp = $_.TunnelIp; PublicIp = [string]$_.Server.host } })
+            [void](Invoke-PmRemote -Session $srcSession -Function 'Enable-PmIpipEndpoint' -Parameters @{ LocalTunnel = $plan.Source; Peers = $srcPeers } -Job $Job)
+            foreach ($row in $opened) {
+                $peers = @([pscustomobject]@{ TunnelIp = $plan.Source; PublicIp = [string]$Source.host })
+                [void](Invoke-PmRemote -Session $row.Session -Function 'Enable-PmIpipEndpoint' -Parameters @{ LocalTunnel = $row.TunnelIp; Peers = $peers } -Job $Job)
+            }
+            Add-PmJobLog -Job $Job -Level STEP -Message 'Waiting for the IPIP tunnel...'
+            Start-Sleep -Seconds 3
+        }
+        foreach ($row in $opened) {
+            $probe = if ($kind -eq 'wireguard') { 'Test-PmWireGuardLink' } else { 'Test-PmTunnelPing' }
+            $fromSrc = Invoke-PmRemote -Session $srcSession -Function $probe -Parameters @{ PeerTunnelIp = $row.TunnelIp } -Job $Job
+            $fromTgt = Invoke-PmRemote -Session $row.Session -Function $probe -Parameters @{ PeerTunnelIp = $plan.Source } -Job $Job
+            if (-not $fromSrc.PingOk -or -not $fromTgt.PingOk) {
+                $need = if ($kind -eq 'wireguard') { "UDP $($plan.Port)" } else { 'IP protocol 4' }
+                throw "$label between $($Source.name) ($($plan.Source)) and $($row.Server.name) ($($row.TunnelIp)) is not passing traffic. $need must be open between their public addresses."
+            }
+            Add-PmJobLog -Job $Job -Level OK -Message "Tunnel $($plan.Source) ↔ $($row.TunnelIp) is up. The file copy will not touch this computer."
+        }
+        Set-PmJobProgress -Job $Job -Percent 15 -Step "$label tunnel is up"
+        $n = 0
+        foreach ($row in $opened) {
+            $n++
+            $share = "\\$($row.TunnelIp)\C$"
+            $localStage = Join-Path (Join-Path 'C:\PrtgMover\tunnel' $Job.id) $row.Server.id
+            $uncStage = '\\{0}\C$\PrtgMover\tunnel\{1}\{2}' -f $row.TunnelIp, $Job.id, $row.Server.id
+            [void](Invoke-PmRemote -Session $row.Session -Function 'New-PmRemoteDirectories' -Parameters @{ Root = $localStage } -Job $Job)
+            $smbUser = [string]$row.Credential.UserName
+            if ($smbUser -notmatch '\\') { $smbUser = ".\$smbUser" }
+            [void](Invoke-PmRemote -Session $srcSession -Function 'Connect-PmUncShare' -Parameters @{
+                    RemoteName = $share; UserName = $smbUser; Password = $row.Credential.GetNetworkCredential().Password
+                } -Job $Job)
+            try {
+                $params = ConvertTo-PmHashtable -InputObject $Options -Keys $script:PmBackupKeys
+                $params.JobId = [string]$Job.id
+                $params.StageDir = $uncStage
+                $params.TunnelCopy = $true
+                $params.PullMode = $false
+                Add-PmJobLog -Job $Job -Level STEP -Message "Copying $($Source.name) → $($row.Server.name) over $uncStage"
+                $copied = Invoke-PmRemote -Session $srcSession -Function 'Invoke-PmRemoteBackup' -Parameters $params -Job $Job -ProgressBase 15 -ProgressSpan 25
+                if (-not $copied) { throw "Tunnel copy to $($row.Server.name) returned no result." }
+                if ($copied.SourceHealth -and -not $copied.SourceHealth.Healthy) { throw "PRTG on $($Source.name) did not come back up ($($copied.SourceHealth.Message))." }
+                $restore = ConvertTo-PmHashtable -InputObject $Options -Keys $script:PmRestoreKeys
+                $restore.JobId = [string]$Job.id
+                $restore.StageDir = $localStage
+                $restore.MoveFromStage = $true
+                $restore.CleanupStage = $true
+                Add-PmJobLog -Job $Job -Level STEP -Message "Restoring on $($row.Server.name) from the tunnel copy (local disk, not this computer)."
+                $rep = Invoke-PmRemote -Session $row.Session -Function 'Invoke-PmRemoteRestore' -Parameters $restore -Job $Job -ProgressBase (40 + ($n - 1) * 20) -ProgressSpan 20
+                if (-not $rep) { throw "Restore on $($row.Server.name) returned no result." }
+                $ok = (@($rep.Report.Errors).Count -eq 0)
+                $reports += [pscustomobject]@{ target = $row.Server.name; ok = $ok; report = $rep.Report; tunnelIp = $row.TunnelIp }
+                if ($ok) { Set-PmCheckpoint -Job $Job -TargetDone $row.Server.id }
+                else { throw "$($row.Server.name) reported errors after the tunnel restore." }
+            } finally {
+                try { [void](Invoke-PmRemote -Session $srcSession -Function 'Disconnect-PmUncShare' -Parameters @{ RemoteName = $share } -Job $Job) } catch { }
+            }
+        }
+        Add-PmJobLog -Job $Job -Level OK -Message "The two servers stay connected on $($plan.Network). This computer did not keep a copy of the backup."
+        return [pscustomobject]@{ transfer = $kind; backup = $null; targets = $reports; sourceTunnel = $plan.Source }
+    } finally {
+        if ($srcSession) { Close-PmSession $srcSession }
+        foreach ($row in $opened) { if ($row.Session) { Close-PmSession $row.Session } }
+    }
+}
+
 function Invoke-PmJob {
     <#
         Executes a job synchronously. $Params:
@@ -1422,7 +1584,7 @@ function Invoke-PmJob {
                 if (@($results | Where-Object { -not $_.ok }).Count -gt 0) { throw 'One or more servers failed the test (see the lines above).' }
             }
             'backup' {
-                $srv = Get-PmServer -Id $Params.SourceId
+                $srv = Get-PmJobServer -Server (Get-PmServer -Id $Params.SourceId) -Options $options
                 if (-not $options.ContainsKey('SourceAfter')) { $options.SourceAfter = 'Restart' }
                 [void](Invoke-PmPreflight -Source $srv -Credentials $creds -Options $options -Job $Job)
                 $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name
@@ -1441,7 +1603,7 @@ function Invoke-PmJob {
                 if (-not $options.ContainsKey('SourceAfter')) { $options.SourceAfter = 'KeepStopped' }
                 $done = @(); if ($resume) { $done = @($resume.targetsDone) }
                 $targetIds = @($Params.TargetIds | Where-Object { $done -notcontains $_ })
-                $targets = @($targetIds | ForEach-Object { Get-PmServer -Id $_ })
+                $targets = @($targetIds | ForEach-Object { Get-PmJobServer -Server (Get-PmServer -Id $_) -Options $options })
                 $file = $null; $stage = $null
                 if ($resume -and $resume.backup -and (Test-Path -LiteralPath (Join-Path (Get-PmPath Backups) $resume.backup))) {
                     $file = Join-Path (Get-PmPath Backups) $resume.backup
@@ -1452,17 +1614,24 @@ function Invoke-PmJob {
                     foreach ($d in $done) { Set-PmCheckpoint -Job $Job -TargetDone $d }
                     [void](Invoke-PmPreflight -Source $null -Targets $targets -Credentials $creds -Options $options -Job $Job -DataBytes ([int64]$man.stagingBytes) -SourceVersion $man.prtg.version)
                 } else {
-                    $srv = Get-PmServer -Id $Params.SourceId
+                    $srv = Get-PmJobServer -Server (Get-PmServer -Id $Params.SourceId) -Options $options
                     [void](Invoke-PmPreflight -Source $srv -Targets $targets -Credentials $creds -Options $options -Job $Job)
                     if ($options.NoTouch) { Add-PmJobLog -Job $Job -Level WARN -Message 'No-touch mode: the source keeps running. Two PRTG cores with the same configuration will monitor (and alert) in parallel until you shut the old one down.' }
-                    $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name
-                    if (-not $b) { $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job -ProgressBase 0 -ProgressSpan 40 }
-                    $file = $b.Zip; $stage = $b.StageDir
-                    Set-PmCheckpoint -Job $Job -Backup (Split-Path $file -Leaf) -StageDir $stage
+                    if ([string]$options.Transfer -in 'wireguard', 'ipip') {
+                        $Job.result = Invoke-PmDirectTunnelMigrate -Source $srv -Targets $targets -Options $options -Credentials $creds -Job $Job
+                        $file = $null
+                    } else {
+                        $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name
+                        if (-not $b) { $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job -ProgressBase 0 -ProgressSpan 40 }
+                        $file = $b.Zip; $stage = $b.StageDir
+                        Set-PmCheckpoint -Job $Job -Backup (Split-Path $file -Leaf) -StageDir $stage
+                    }
                 }
-                $reports = Invoke-PmMultiRestore -File $file -StageDir $stage -TargetIds $targetIds -Options $options -Credentials $creds -Job $Job -Base 40 -Span 60
-                $Job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf); targets = $reports }
-                if ($stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue; Add-PmJobLog -Job $Job -Level DEBUG -Message "Staging copy removed: $stage" }
+                if ([string]$options.Transfer -notin 'wireguard', 'ipip') {
+                    $reports = Invoke-PmMultiRestore -File $file -StageDir $stage -TargetIds $targetIds -Options $options -Credentials $creds -Job $Job -Base 40 -Span 60
+                    $Job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf); targets = $reports }
+                    if ($stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue; Add-PmJobLog -Job $Job -Level DEBUG -Message "Staging copy removed: $stage" }
+                }
             }
             default { throw "Unknown job type '$Type'." }
         }
@@ -1485,7 +1654,7 @@ function Invoke-PmMultiRestore {
     $reports = @(); $i = 0; $failed = 0
     $slice = $Span / [math]::Max(1, $TargetIds.Count)
     foreach ($id in $TargetIds) {
-        $srv = Get-PmServer -Id $id
+        $srv = Get-PmJobServer -Server (Get-PmServer -Id $id) -Options $Options
         try {
             $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Resolve-PmCredential $srv $Credentials) -BackupPath $File -StageDir $StageDir -Options $Options -Job $Job `
                 -ProgressBase ($Base + [int]($i * $slice)) -ProgressSpan $slice
@@ -1620,5 +1789,8 @@ function Get-PmInstallers {
     Get-ChildItem -LiteralPath (Get-PmPath Installers) -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.exe', '.zip' } |
         ForEach-Object { [pscustomobject]@{ name = $_.Name; size = $_.Length; created = $_.LastWriteTime.ToString('o') } }
 }
+
+# Pure tunnel helpers live in the remote script and are also used on the manager to plan addresses.
+. (Join-Path $PSScriptRoot 'Remote\PrtgMover.Remote.ps1')
 
 Export-ModuleMember -Function *-Pm*

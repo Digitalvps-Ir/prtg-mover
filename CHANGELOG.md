@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.0 — 2026-09-29
+
+### Added
+- **Transfer path** on Backup & Migrate, before the job starts: keep each server's saved method, force **RDP**, force **WinRM**, or **WireGuard**.
+- **WireGuard** copies straight from the source Windows server to the target Windows server on `10.66.66.0/24`. This computer only sends commands (over the saved RDP or WinRM method) and does not store the backup. The tunnel is split: it does not replace the servers' default route. UDP 51820 and SMB are limited to the peer.
+- **IPIP** (protocol 4) does the same on its own network, `10.66.67.0/24`, using Wintun. IP protocol 4 must be allowed between the two public addresses. It does not replace the default route.
+
 ## 1.5.0 — 2026-09-29
 
 ### Added
