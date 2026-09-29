@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.5.3 — 2026-09-29
+
+### Added
+- **License state.** The server test and the restore read the license state from the PRTG core log (read-only) and show it: edition, sensor limit, sensors paused by the license, and the last activation error. License values are never shown, only fingerprints at debug level.
+- Servers page: badges *license ok* / *license: activation needed* and *not reachable from network*.
+
+### Changed
+- A restore no longer reports the license as fine just because the key was copied. PRTG binds a license to the system it was activated on, so the target reports *activation needed* until the license is activated there.
+- **Make PRTG reachable** (formerly *Fix PRTG IP*) is only shown for a server whose PRTG answers on `127.0.0.1` only. New migrations adjust the web server binding automatically.
+
+## 1.5.2 — 2026-09-29
+
+### Added
+- Command line: `-Action FixBinding -Target <server>` binds the web server of a migrated PRTG to the server's own address.
+
+### Changed
+- README (English and Persian), architecture and troubleshooting guides rewritten for the current behaviour: connection methods, source untouched by default, program clone, compressed parallel transfer, resume, logs and audit.
+- The addresses of a server are read without Windows-only cmdlets when those are missing, so the test suite keeps working under PowerShell 7.
+
+## 1.5.1 — 2026-09-29
+
+### Fixed
+- After a migration PRTG only answered on `127.0.0.1`, because the web server was still bound to the source's IP address. Restore now binds it to the target's own address.
+- **Fix PRTG IP** (job type `rebind`) repairs a server that was already migrated. The binding is changed while PRTG is stopped, because the core writes its settings back when it stops.
+- The connectivity test shows the addresses PRTG listens on, and restore warns when PRTG is only reachable locally.
+- A 32-bit overflow in the progress line stopped a transfer after 2 GB on the wire. Progress reporting can no longer stop a transfer.
+
 ## 1.5.0 — 2026-09-29
 
 ### Added

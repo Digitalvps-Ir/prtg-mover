@@ -89,7 +89,7 @@
           <div class="group">
             <label class="check"><input type="checkbox" name="IncludePrtg" checked> <span><b>PRTG</b> — configuration (all sensors, notifications, triggers, users, maps, reports…), registry, SSL certificate, custom sensors, lookups, MIBs</span></label>
             <label class="check sub"><input type="checkbox" name="IncludeProgram" checked> Clone the <b>PRTG program</b> (program files + services) — no installer needed on the target</label>
-            <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source <b>license</b></label>
+            <label class="check sub"><input type="checkbox" name="CopyLicense" checked> <span>Copy the source <b>license</b> <span class="muted">(PRTG binds a license to the server it was activated on: on the new server it has to be activated again in PRTG → Setup → License Information)</span></span></label>
             <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> <b>Historic monitoring data</b> (graphs &amp; tables of the past)</label>
             <label class="check sub"><input type="checkbox" name="IncludeLogs"> PRTG log files <span class="muted">(not needed — usually large)</span></label>
             <label class="check sub"><input type="checkbox" name="IncludeAutoBackups"> Old automatic configuration copies <span class="muted">(not needed)</span></label>

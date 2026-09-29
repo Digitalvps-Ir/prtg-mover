@@ -23,10 +23,14 @@
 .EXAMPLE
     # Restore an existing package
     .\cli\Invoke-PrtgMover.ps1 -Action Restore -BackupName PRTG_OLDSRV_20260928-221500.zip -Target PRTG-NEW1
+
+.EXAMPLE
+    # A migrated PRTG only answers on 127.0.0.1: bind its web server to the server's own address
+    .\cli\Invoke-PrtgMover.ps1 -Action FixBinding -Target PRTG-NEW1
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('Test', 'Backup', 'Restore', 'Migrate')][string]$Action,
+    [Parameter(Mandatory)][ValidateSet('Test', 'Backup', 'Restore', 'Migrate', 'FixBinding')][string]$Action,
     [string]$Source,
     [string[]]$Target = @(),
     [string]$BackupName,
@@ -113,6 +117,10 @@ try {
                 $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -BackupPath $file -Options $options -Job $job
                 if (@($rep.Errors).Count) { $exit = 2 }
             }
+        }
+        'FixBinding' {
+            if (-not $Target) { throw '-Target is required.' }
+            $job.result = @(foreach ($ref in $Target) { $srv = Resolve-CliServer $ref; Invoke-PmRebindFlow -Server $srv -Credential (Get-CliCredential $srv) -Job $job })
         }
         'Migrate' {
             if (-not $Source -or -not $Target) { throw '-Source and -Target are required.' }

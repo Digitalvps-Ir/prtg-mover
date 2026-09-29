@@ -179,7 +179,22 @@
           <div class="ports" style="margin-top:4px">${methodResult('RDP', m.rdp)}${methodResult('WinRM', m.winrm)}</div>`;
       }
       let prtg = '–';
-      if (info) prtg = info.Prtg && info.Prtg.Installed ? `${esc(info.Prtg.Version)}<span class="sub-text">${esc(info.PrtgDataGB)} GB data · ${esc(info.Prtg.CoreStatus)}</span>` : '<span class="badge warn">not installed</span>';
+      // PRTG answers only on the server itself (127.0.0.1): the web server is still bound to another server's address.
+      const endpoints = arr(info && info.Prtg && info.Prtg.ListenEndpoints);
+      const localOnly = endpoints.length > 0 && endpoints.every((e) => /^(127\.0\.0\.1|::1):/.test(e));
+      if (info) {
+        if (info.Prtg && info.Prtg.Installed) {
+          const ls = info.PrtgLicenseState;
+          let lic = '';
+          if (ls && ls.Known) {
+            lic = ls.NeedsActivation
+              ? `<span class="badge err" title="${esc(ls.Edition)}${ls.LastError ? ` · ${esc(ls.LastError)}` : ''} · A PRTG license is bound to the server it was activated on. Activate it for this server in PRTG: Setup → License Information.">license: activation needed</span>`
+              : `<span class="badge ok" title="${esc(ls.Edition)} · ${esc(ls.MaxSensors)} sensors">license ok</span>`;
+          }
+          const net = localOnly ? '<span class="badge err" title="PRTG only answers on 127.0.0.1">not reachable from network</span>' : '';
+          prtg = `${esc(info.Prtg.Version)}<span class="sub-text">${esc(info.PrtgDataGB)} GB data · ${esc(info.Prtg.CoreStatus)}</span><div class="ports" style="margin-top:4px">${lic}${net}</div>`;
+        } else { prtg = '<span class="badge warn">not installed</span>'; }
+      }
       const cred = s.hasCredential ? '<span class="badge ok">saved</span>' : '<span class="badge" title="The current Windows identity of the manager is used">Windows identity</span>';
       const method = (s.transport === 'winrm') ? '<span class="badge info">WinRM</span>' : '<span class="badge info">RDP</span>';
       const ag = s.agent && s.agent.connected
@@ -193,6 +208,7 @@
           <button class="btn small" data-act="rdp" data-id="${esc(s.id)}" title="Open Remote Desktop to ${esc(s.host)}:${esc(s.rdpPort || 3389)} and start the agent">RDP</button>
           <button class="btn small" data-act="test-rdp" data-id="${esc(s.id)}">Test RDP</button>
           <button class="btn small" data-act="test-winrm" data-id="${esc(s.id)}">Test WinRM</button>
+          ${localOnly && s.role !== 'source' && s.transport === 'winrm' ? `<button class="btn small primary" data-act="rebind" data-id="${esc(s.id)}" title="PRTG on this server only answers on 127.0.0.1 because its web server is still bound to the old server's address. This binds it to this server's address and restarts PRTG. New migrations do this automatically.">Make PRTG reachable</button>` : ''}
           <button class="btn small" data-act="edit" data-id="${esc(s.id)}">Edit</button>
           <button class="btn small danger" data-act="del" data-id="${esc(s.id)}">Delete</button>
         </div></td></tr>`;
@@ -208,6 +224,7 @@
     const s = state.servers.find((x) => x.id === b.dataset.id);
     if (b.dataset.act === 'test-rdp') startJob({ type: 'test', mode: 'rdp', serverIds: [s.id] });
     if (b.dataset.act === 'test-winrm') startJob({ type: 'test', mode: 'winrm', serverIds: [s.id] });
+    if (b.dataset.act === 'rebind' && confirm(`Bind the PRTG web server on "${s.name}" to this server's address (${s.host}) and restart PRTG there?`)) startJob({ type: 'rebind', serverIds: [s.id] });
     if (b.dataset.act === 'rdp') {
       try {
         const r = await api('POST', `/api/servers/${encodeURIComponent(s.id)}/rdp`);
@@ -296,7 +313,7 @@
     html += yes(prtg, 'PRTG configuration — all probes, groups, devices, sensors, <b>notifications</b>, <b>triggers</b>, users, schedules, maps, reports');
     html += yes(prtg, 'PRTG registry, SSL certificate, custom sensors, notification scripts, lookups, MIBs, device templates');
     html += yes(prtg && f.IncludeProgram.checked, 'PRTG program files + Windows services (clone, no installer)');
-    html += yes(prtg && f.CopyLicense.checked, 'PRTG license');
+    html += yes(prtg && f.CopyLicense.checked, 'PRTG license key (PRTG asks for a new activation on the new server)');
     html += yes(prtg && f.IncludeHistory.checked, 'Historic monitoring data');
     html += yes(f.IncludeVpn.checked, 'Windows VPN connections');
     html += yes(f.IncludeDesktop.checked, 'Desktop files of every user (.bat, VPN files, …)');
@@ -565,7 +582,7 @@
         const rep = t.report || {};
         const b = (v) => `<span class="badge ${v === 'ok' ? 'ok' : v === 'failed' ? 'err' : v === 'skipped' ? '' : 'warn'}">${esc(v || '–')}</span>`;
         return `<div class="rt"><b>${esc(t.target)}</b> ${t.ok ? '<span class="badge ok">OK</span>' : '<span class="badge err">errors</span>'}
-          <div class="sub-text">PRTG ${b(rep.Prtg)}${rep.Version ? ` ${esc(rep.Version)}` : ''} · License ${b(rep.License && rep.License.startsWith('copied') ? 'ok' : rep.License)} · VPN ${b(rep.Vpn)} · Desktop ${b(rep.Desktop)} · Extra ${b(rep.Extra)}</div>
+          <div class="sub-text">PRTG ${b(rep.Prtg)}${rep.Version ? ` ${esc(rep.Version)}` : ''} · License ${rep.License === 'needs-activation' ? '<span class="badge err" title="A PRTG license is bound to the server it was activated on. Activate it for this server in PRTG: Setup → License Information.">activation needed</span>' : b(rep.License && rep.License.startsWith('active') ? 'ok' : rep.License)} · VPN ${b(rep.Vpn)} · Desktop ${b(rep.Desktop)} · Extra ${b(rep.Extra)}</div>
           ${rep.WebUrl ? `<div class="sub-text">Web: ${esc(rep.WebUrl)}</div>` : ''}${t.error ? `<div class="sub-text" style="color:var(--err)">${esc(t.error)}</div>` : ''}</div>`;
       }).join('') + '</div>';
     }

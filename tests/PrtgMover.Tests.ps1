@@ -58,6 +58,48 @@ Describe 'RAS phonebook handling' {
     }
 }
 
+Describe 'PRTG web server binding after a migration' {
+    It 'replaces addresses of the source by the address of this server' {
+        Get-PmReboundIpList -Current '109.122.248.8,127.0.0.1' -Local @('127.0.0.1', '109.122.248.2', '10.66.66.2') -Own '109.122.248.2' | Should -Be '109.122.248.2,127.0.0.1'
+    }
+    It 'keeps addresses that exist on this server and always keeps localhost' {
+        Get-PmReboundIpList -Current '10.0.0.5' -Local @('10.0.0.5') -Own '10.0.0.5' | Should -Be '10.0.0.5,127.0.0.1'
+        Get-PmReboundIpList -Current '1.1.1.1, 2.2.2.2' -Local @('3.3.3.3') -Own '3.3.3.3' | Should -Be '3.3.3.3,127.0.0.1'
+    }
+    It 'leaves a localhost-only binding alone unless the own address is requested' {
+        Get-PmReboundIpList -Current '127.0.0.1' -Local @('127.0.0.1', '109.122.248.2') -Own '109.122.248.2' | Should -Be '127.0.0.1'
+        Get-PmReboundIpList -Current '127.0.0.1' -Local @('127.0.0.1', '109.122.248.2') -Own '109.122.248.2' -AddOwn | Should -Be '109.122.248.2,127.0.0.1'
+    }
+}
+
+Describe 'PRTG license state from the core log' {
+    It 'recognises a license that needs activation on a new system' {
+        $s = ConvertTo-PmLicenseState -PausedByLicense '386' -LogLines @(
+            'Core.log: 2026-09-29 09:31:26.219031 INFO TId    3956 Core> PRTG No License (System Changed) licensed for "name" (<key>) Edt=-100 MaxS=0',
+            'CoreWebServer.log: 2026-09-29 09:38:24.052464 INFO TId    2520 CoreWebServer> System has changed. New activation required. (Verify Error, EIdHTTPProtocolException: HTTP/1.1 403 Forbidden)')
+        $s.Known | Should -BeTrue
+        $s.NeedsActivation | Should -BeTrue
+        $s.Edition | Should -Be 'No License (System Changed)'
+        $s.MaxSensors | Should -Be 0
+        $s.LastError | Should -BeLike '*403 Forbidden*'
+        $s.PausedByLicense | Should -Be '386'
+    }
+    It 'recognises an active license and uses the latest entry' {
+        $s = ConvertTo-PmLicenseState -LogLines @(
+            'Core.log: 2026 INFO TId 1 Core> PRTG No License (System Changed) licensed for "name" (<key>) Edt=-100 MaxS=0',
+            'CoreActivationLog.log: 2026-09-29 06:34:47.205268 INFO TId    1660 CoreActivationLog> PRTG  (Site License) licensed for "name" (<key>) Edt=70 MaxS=99999')
+        $s.NeedsActivation | Should -BeFalse
+        $s.Edition | Should -Be 'Site License'
+        $s.MaxSensors | Should -Be 99999
+    }
+    It 'reports an unknown state when the log has no license line' {
+        (ConvertTo-PmLicenseState -LogLines @('Core.log: nothing relevant')).Known | Should -BeFalse
+    }
+    It 'never returns a license value, only a fingerprint' {
+        Get-PmShortHash 'SECRET-LICENSE-KEY' | Should -Match '^[0-9a-f]{10}$'
+    }
+}
+
 Describe 'Backup / restore round trip (local, no PRTG)' {
     It 'packages extra paths and restores them to the original location' {
         $extra = Join-Path $Work 'extra-data'
@@ -125,7 +167,7 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         New-Item -ItemType Directory -Force -Path (Join-Path $src 'sub') | Out-Null
         ('x' * 100000) | Set-Content (Join-Path $src 'sub\big.txt')
         'hidden' | Set-Content (Join-Path $src 'h.dat')
-        (Get-Item (Join-Path $src 'h.dat')).Attributes = 'Hidden'
+        try { (Get-Item (Join-Path $src 'h.dat')).Attributes = 'Hidden' } catch { }
         $c = (New-PmTransferChunk -Source $src -Files @('sub\big.txt', 'h.dat')) | Where-Object PmType -eq 'result'
         $c.Size | Should -BeLessThan 100000
         $dst = Join-Path $Work 'chunk-dst'
@@ -151,8 +193,14 @@ Describe 'RDP agent transport (end to end, local)' {
         $env:PRTGMOVER_TSCLIENT_ROOT = $Root   # the local "agent" reaches the manager folder directly, not via \\tsclient
         Set-PmRoot -Path $Root   # the agent resolves the manager folder from its own location
         $script:AgentSrv = Set-PmServer -Name 'PESTER-AGENT' -HostName '127.0.0.1' -Transport rdp
-        $script:AgentProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-            (Join-Path $Root 'agent\PrtgMover-Agent.ps1'), '-ServerId', $AgentSrv.id, '-AllowNonAdmin'
+        $agentStart = @{
+            FilePath = (Get-Process -Id $PID).Path
+            PassThru = $true
+            ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'agent\PrtgMover-Agent.ps1'), '-ServerId', $script:AgentSrv.id, '-AllowNonAdmin')
+        }
+        # -WindowStyle is Windows PowerShell 5.1 only. PowerShell 7 rejects the parameter.
+        if ($PSVersionTable.PSEdition -eq 'Desktop') { $agentStart.WindowStyle = 'Hidden' }
+        $script:AgentProc = Start-Process @agentStart
     }
     AfterAll {
         if ($script:AgentProc) { Stop-Process -Id $AgentProc.Id -Force -ErrorAction SilentlyContinue }

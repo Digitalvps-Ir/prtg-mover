@@ -14,7 +14,51 @@ $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
 $script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram', 'IncludeLogs', 'IncludeAutoBackups'
-$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage'
+$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage', 'TargetAddress'
+
+function Get-PmOsCaption {
+    <# Windows caption when CIM exists; otherwise the runtime OS description. #>
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            if ($os.Caption) { return [string]$os.Caption }
+        } catch { }
+    }
+    return [Environment]::OSVersion.VersionString
+}
+
+function Get-PmLogicalDisk {
+    <# Free space for a path. Uses Win32_LogicalDisk on Windows, .NET DriveInfo otherwise. #>
+    param([string]$Path)
+    $qualifier = ''
+    if ($Path) {
+        try { $qualifier = [string](Split-Path -Path $Path -Qualifier -ErrorAction Stop) } catch { $qualifier = '' }
+    }
+    if (-not $qualifier -and $env:SystemDrive) { $qualifier = $env:SystemDrive }
+    if ($qualifier -and (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        try {
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $qualifier) -ErrorAction Stop
+            if ($disk) { return $disk }
+        } catch { }
+    }
+    $probe = $Path
+    if (-not $probe) { $probe = (Get-Location).Path }
+    try { $probe = [IO.Path]::GetFullPath($probe) } catch { }
+    $match = $null
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if (-not $d.IsReady) { continue }
+        if ($probe.StartsWith($d.Name, [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $match -or $d.Name.Length -gt $match.Name.Length) { $match = $d }
+        }
+    }
+    if (-not $match) {
+        foreach ($d in [IO.DriveInfo]::GetDrives()) {
+            if ($d.IsReady -and ($d.Name -eq '/' -or $d.Name -eq '\')) { $match = $d; break }
+        }
+    }
+    if (-not $match) { return $null }
+    return [pscustomobject]@{ DeviceID = $match.Name; FreeSpace = [int64]$match.AvailableFreeSpace; Size = [int64]$match.TotalSize }
+}
 
 # ======================================================================= paths
 
@@ -461,10 +505,11 @@ function Invoke-PmRemote {
 
 function Get-PmManagerRelative {
     param([Parameter(Mandatory)][string]$LocalPath)
-    $root = (Get-PmPath Root).TrimEnd('\') + '\'
-    $full = [IO.Path]::GetFullPath($LocalPath)
-    if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { throw "$LocalPath is outside the PRTG Mover folder." }
-    return $full.Substring($root.Length)
+    $root = (Get-PmPath Root).TrimEnd('\').TrimEnd('/').Replace('/', '\')
+    $full = [IO.Path]::GetFullPath($LocalPath).TrimEnd('\').TrimEnd('/').Replace('/', '\')
+    $inside = $full.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)
+    if (-not $inside) { throw "$LocalPath is outside the PRTG Mover folder." }
+    return $full.Substring($root.Length).TrimStart('\')
 }
 
 function Copy-PmFromServer {
@@ -641,16 +686,22 @@ function New-PmDiagnosticsBundle {
     & $add 'Created' (Get-Date).ToString('o')
     & $add 'PRTG Mover version' ((Get-Content (Join-Path (Get-PmPath Root) 'VERSION') -ErrorAction SilentlyContinue | Select-Object -First 1))
     & $add 'Manager' "$env:COMPUTERNAME ($env:USERDOMAIN\$env:USERNAME)"
-    & $add 'OS' ((Get-CimInstance Win32_OperatingSystem).Caption)
+    & $add 'OS' (Get-PmOsCaption)
     & $add 'PowerShell' $PSVersionTable.PSVersion
     & $add '.NET release' ((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release)
-    $admin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $admin = $false
+    try {
+        $admin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { $admin = $false }
     & $add 'Manager elevated' $admin
-    & $add 'WinRM service' ((Get-Service WinRM -ErrorAction SilentlyContinue).Status)
+    $winrm = $null
+    if (Get-Command Get-Service -ErrorAction SilentlyContinue) { $winrm = (Get-Service WinRM -ErrorAction SilentlyContinue).Status }
+    & $add 'WinRM service' $winrm
     try { & $add 'TrustedHosts' ((Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop).Value) } catch { & $add 'TrustedHosts' "unreadable ($($_.Exception.Message))" }
     & $add 'Root' (Get-PmPath Root)
-    $rootDrive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path (Get-PmPath Root) -Qualifier))
-    & $add 'Root drive free' ('{0:N1} GB' -f ($rootDrive.FreeSpace / 1GB))
+    $rootDrive = Get-PmLogicalDisk -Path (Get-PmPath Root)
+    $rootFree = if ($rootDrive) { '{0:N1} GB' -f ($rootDrive.FreeSpace / 1GB) } else { 'unknown' }
+    & $add 'Root drive free' $rootFree
     [void]$env.AppendLine('')
     [void]$env.AppendLine('Servers:')
     foreach ($s in (Get-PmServers)) {
@@ -733,6 +784,24 @@ function Invoke-PmTestFlow {
                 $(if ($r.Prtg.Installed) { 'yes' } else { 'no' }), $r.Prtg.Version, $r.PrtgDataGB, $r.Prtg.CoreStatus, @($r.VpnAllUsers).Count, $r.RdpPort) -Computer $r.Computer
         foreach ($d in @($r.Disks)) { Add-PmJobLog -Job $Job -Message ("Disk {0} {1} GB free of {2} GB" -f $d.Drive, $d.FreeGB, $d.SizeGB) -Computer $r.Computer }
         if ($r.Prtg.Installed -and $r.PrtgConfigStats) { Add-PmJobLog -Job $Job -Message "PRTG configuration: $($r.PrtgConfigStats)" -Computer $r.Computer }
+        if ($r.Prtg.Installed -and $r.PrtgLicense) {
+            $lic = $r.PrtgLicense
+            if ($lic.Error) { Add-PmJobLog -Job $Job -Level WARN -Message "License report failed: $($lic.Error)" -Computer $r.Computer }
+            else {
+                $ls = $r.PrtgLicenseState
+                if ($ls -and $ls.Known -and $ls.NeedsActivation) {
+                    Add-PmJobLog -Job $Job -Level WARN -Computer $r.Computer -Message "PRTG license: '$($ls.Edition)' - the license must be activated for this server (PRTG > Setup > License Information). Sensors paused by the license: $($ls.PausedByLicense)."
+                    if ($ls.LastError) { Add-PmJobLog -Job $Job -Level WARN -Computer $r.Computer -Message "PRTG license: last activation attempt: $($ls.LastError)" }
+                } elseif ($ls -and $ls.Known) {
+                    Add-PmJobLog -Job $Job -Level OK -Computer $r.Computer -Message "PRTG license: $($ls.Edition), $($ls.MaxSensors) sensors, active. Sensors paused by the license: $($ls.PausedByLicense)."
+                } else {
+                    Add-PmJobLog -Job $Job -Computer $r.Computer -Message 'PRTG license: no license lines in the core log of the last days (the core was not restarted recently).'
+                }
+                Add-PmJobLog -Job $Job -Level DEBUG -Message "License (fingerprints only): $(@($lic.Values) -join '; ') | system id $($lic.SystemId) | auto activation $($lic.AutoActivation)" -Computer $r.Computer
+                foreach ($l in @($lic.LogLines)) { Add-PmJobLog -Job $Job -Level DEBUG -Message "License log: $l" -Computer $r.Computer }
+            }
+        }
+        if ($r.Prtg.Installed) { Add-PmJobLog -Job $Job -Message "PRTG listens on: $(if (@($r.Prtg.ListenEndpoints).Count) { @($r.Prtg.ListenEndpoints) -join ', ' } else { 'nothing (core not running)' }) | server addresses: $(@($r.Prtg.LocalAddresses) -join ', ')" -Computer $r.Computer }
         if (-not $r.IsAdmin) { Add-PmJobLog -Job $Job -Level WARN -Message 'Session is NOT elevated - an administrator is required.' }
         if ($r.RdpPort -and [int]$r.RdpPort -ne (Get-PmRdpPort $Server)) { Add-PmJobLog -Job $Job -Level WARN -Message "The server's RDP service listens on port $($r.RdpPort) but the inventory says $(Get-PmRdpPort $Server) - edit the server." }
     }
@@ -808,7 +877,7 @@ function Invoke-PmPreflight {
             }
         }
         # manager: staging copy + zip
-        $mgrDrive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path (Get-PmPath Root) -Qualifier))
+        $mgrDrive = Get-PmLogicalDisk -Path (Get-PmPath Root)
         if ($data -gt 0 -and $mgrDrive -and $mgrDrive.FreeSpace -lt ($data * 2.2)) {
             $problems += ("Manager: needs ~{0:N1} GB free on {1} for staging + package, has {2:N1} GB." -f ($data * 2.2 / 1GB), $mgrDrive.DeviceID, ($mgrDrive.FreeSpace / 1GB))
         }
@@ -926,10 +995,11 @@ function Get-PmLocalFileList {
     param([Parameter(Mandatory)][string]$Root)
     $out = @{}
     if (-not (Test-Path -LiteralPath $Root)) { return $out }
-    $r = (Get-Item -LiteralPath $Root).FullName.TrimEnd('\')
+    $r = (Get-Item -LiteralPath $Root).FullName.TrimEnd('\').TrimEnd('/')
     foreach ($f in (Get-ChildItem -LiteralPath $r -Recurse -File -Force -ErrorAction SilentlyContinue)) {
         if ($f.Name -in 'desktop.ini', 'Thumbs.db') { continue }   # Windows shell junk
-        $out[$f.FullName.Substring($r.Length + 1).ToLowerInvariant()] = $f
+        $rel = $f.FullName.Substring($r.Length + 1).Replace('/', '\').ToLowerInvariant()
+        $out[$rel] = $f
     }
     return $out
 }
@@ -1281,6 +1351,7 @@ function Invoke-PmRestoreFlow {
         $init = Invoke-PmRemote -Session $s -Function 'Initialize-PmRemoteWorkRoot' -Job $Job
         $params = ConvertTo-PmHashtable -InputObject $Options -Keys $script:PmRestoreKeys
         $params.JobId = $jobId
+        $params.TargetAddress = [string]$Server.host
         $streams = if ([int]$Options.TransferStreams -gt 0) { [math]::Min(8, [int]$Options.TransferStreams) } else { 4 }
         $chunkBytes = if ([int]$Options.TransferChunkMB -gt 0) { [int64]$Options.TransferChunkMB * 1MB } else { [int64]256MB }
 
@@ -1302,7 +1373,8 @@ function Invoke-PmRestoreFlow {
             # Stable folder name per package, so Resume continues the push instead of starting again.
             $remoteStage = Join-Path $init.WorkRoot ('restore\' + [IO.Path]::GetFileNameWithoutExtension($BackupPath))
             [void](Invoke-PmRemote -Session $s -Function 'Clear-PmRemoteStages' -Parameters @{ Keep = $remoteStage } -Job $Job)
-            $files = @((Get-PmLocalFileList -Root $stageLocal).GetEnumerator() | ForEach-Object { [pscustomobject]@{ Rel = $_.Value.FullName.Substring($stageLocal.TrimEnd('\').Length + 1); Size = $_.Value.Length; Time = $_.Value.LastWriteTimeUtc.Ticks } })
+            $stageBase = $stageLocal.TrimEnd('\').TrimEnd('/')
+            $files = @((Get-PmLocalFileList -Root $stageLocal).GetEnumerator() | ForEach-Object { [pscustomobject]@{ Rel = $_.Value.FullName.Substring($stageBase.Length + 1).Replace('/', '\'); Size = $_.Value.Length; Time = $_.Value.LastWriteTimeUtc.Ticks } })
             $bytes = [int64](($files | Measure-Object -Property Size -Sum).Sum)
             if ($init.FreeBytes -and $init.FreeBytes -lt ($bytes + 2GB)) {
                 throw ("Not enough free space on the target: {0:N1} GB free, {1:N1} GB needed." -f ($init.FreeBytes / 1GB), (($bytes + 2GB) / 1GB))
@@ -1321,6 +1393,22 @@ function Invoke-PmRestoreFlow {
         Write-PmAudit -Action 'restore.finished' -Data @{ job = $jobId; server = $Server.name; package = (Split-Path $BackupPath -Leaf); prtg = $r.Report.Prtg; errors = @($r.Report.Errors).Count }
         return $r.Report
     } finally { if ($s) { Close-PmSession $s } }
+}
+
+function Invoke-PmRebindFlow {
+    <#
+        Binds the web server of an already migrated PRTG to the server's own address (it kept
+        the source's address and only answers on 127.0.0.1), restarts PRTG and verifies it.
+    #>
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, $Job)
+    if ((Get-PmTransport $Server) -eq 'rdp') { throw "$($Server.name): this action needs the WinRM connection method." }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $r = Invoke-PmRemote -Session $s -Function 'Repair-PmPrtgBinding' -Parameters @{ TargetAddress = [string]$Server.host } -Job $Job -ProgressBase 0 -ProgressSpan 100
+        Write-PmAudit -Action 'prtg.rebind' -Data @{ server = $Server.name; changed = $r.Changed; before = $r.Before; after = $r.After }
+        return [pscustomobject]@{ target = $Server.name; ok = $true; changed = $r.Changed; before = $r.Before; after = $r.After; listens = @($r.ListenEndpoints) }
+    } finally { Close-PmSession $s }
 }
 
 # ======================================================================= jobs
@@ -1420,6 +1508,15 @@ function Invoke-PmJob {
                 }
                 $Job.result = $results
                 if (@($results | Where-Object { -not $_.ok }).Count -gt 0) { throw 'One or more servers failed the test (see the lines above).' }
+            }
+            'rebind' {
+                # Fix the web server binding of an already migrated PRTG (it kept the source's IP addresses).
+                $results = @()
+                foreach ($id in @($Params.ServerIds)) {
+                    $srv = Get-PmServer -Id $id
+                    $results += Invoke-PmRebindFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Job $Job
+                }
+                $Job.result = $results
             }
             'backup' {
                 $srv = Get-PmServer -Id $Params.SourceId

@@ -24,15 +24,83 @@ $PmProgramFolders = @(
 
 function Get-PmWorkRoot {
     <# Folder for PRTG Mover's own temporary files on this server. #>
-    if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\') }
-    return (Join-Path $env:SystemDrive 'PrtgMover')
+    if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\').TrimEnd('/') }
+    if ($env:SystemDrive) { return (Join-Path $env:SystemDrive 'PrtgMover') }
+    # PowerShell 7 on Linux has no SystemDrive. Keep the same folder name under temp.
+    return (Join-Path ([IO.Path]::GetTempPath()) 'PrtgMover')
+}
+
+function Get-PmComputerName {
+    if ($env:COMPUTERNAME) { return [string]$env:COMPUTERNAME }
+    $n = [Environment]::MachineName
+    if ($n) { return [string]$n }
+    return 'localhost'
+}
+
+function Test-PmIsAdmin {
+    <# True when the process is elevated. False on platforms without a Windows identity. #>
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        return [bool]$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Get-PmCurrentUserName {
+    try { return [string][Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { return "$env:USERDOMAIN\$env:USERNAME" }
+}
+
+function Get-PmOsCaption {
+    <# Windows caption when CIM exists; otherwise the runtime OS description. #>
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            if ($os.Caption) { return [string]$os.Caption }
+        } catch { }
+    }
+    return [Environment]::OSVersion.VersionString
+}
+
+function Get-PmLogicalDisk {
+    <#
+        Free space for a path. On Windows this is the Win32_LogicalDisk for the drive letter.
+        Without CIM (PowerShell 7 on Linux) it uses the .NET volume that contains the path.
+    #>
+    param([string]$Path)
+    $qualifier = ''
+    if ($Path) {
+        try { $qualifier = [string](Split-Path -Path $Path -Qualifier -ErrorAction Stop) } catch { $qualifier = '' }
+    }
+    if (-not $qualifier -and $env:SystemDrive) { $qualifier = $env:SystemDrive }
+    if ($qualifier -and (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        try {
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $qualifier) -ErrorAction Stop
+            if ($disk) { return $disk }
+        } catch { }
+    }
+    $probe = $Path
+    if (-not $probe) { $probe = (Get-Location).Path }
+    try { $probe = [IO.Path]::GetFullPath($probe) } catch { }
+    $match = $null
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if (-not $d.IsReady) { continue }
+        if ($probe.StartsWith($d.Name, [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $match -or $d.Name.Length -gt $match.Name.Length) { $match = $d }
+        }
+    }
+    if (-not $match) {
+        foreach ($d in [IO.DriveInfo]::GetDrives()) {
+            if ($d.IsReady -and ($d.Name -eq '/' -or $d.Name -eq '\')) { $match = $d; break }
+        }
+    }
+    if (-not $match) { return $null }
+    return [pscustomobject]@{ DeviceID = $match.Name; FreeSpace = [int64]$match.AvailableFreeSpace; Size = [int64]$match.TotalSize }
 }
 
 # ---------------------------------------------------------------- output helpers
 
 function Write-PmLog {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'STEP', 'DEBUG')][string]$Level = 'INFO')
-    [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME }
+    [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = (Get-PmComputerName) }
 }
 
 function Format-PmError {
@@ -77,6 +145,17 @@ function Invoke-PmRobocopy {
         [switch]$Mirror
     )
     if (-not (Test-Path -LiteralPath $Source)) { return -1 }
+    if (-not (Get-Command robocopy.exe -ErrorAction SilentlyContinue)) {
+        # Same copy, used when robocopy is not installed (PowerShell 7 on Linux).
+        try {
+            Copy-PmTreeFallback -Source $Source -Destination $Destination -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
+            $global:PmLastRobocopy = "copy `"$Source`" -> `"$Destination`" (robocopy not installed)"
+            return 1
+        } catch {
+            $global:PmLastRobocopy = "copy `"$Source`" -> `"$Destination`" failed: $($_.Exception.Message)"
+            return 8
+        }
+    }
     # Redirected RDP drives (\\tsclient) do not support all directory attributes.
     $dcopy = if ($Destination.StartsWith('\\') -or $Source.StartsWith('\\')) { '/DCOPY:T' } else { '/DCOPY:DAT' }
     $rcArgs = @($Source.TrimEnd('\'), $Destination.TrimEnd('\'), '/COPY:DAT', $dcopy, '/R:2', '/W:2', '/MT:8', '/XJ', '/NP', '/NFL', '/NDL')
@@ -96,6 +175,29 @@ function Get-PmRobocopyErrors {
     if (-not $global:PmRobocopyLog -or -not (Test-Path -LiteralPath $global:PmRobocopyLog)) { return '' }
     $lines = @(Get-Content -LiteralPath $global:PmRobocopyLog -Tail 400 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'ERROR|Access is denied|cannot|failed' } | Select-Object -Last 5)
     return ($lines -join ' | ')
+}
+
+function Copy-PmTreeFallback {
+    <# Directory copy used only when robocopy.exe is absent. Honours the same exclude lists. #>
+    param([string]$Source, [string]$Destination, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @())
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $blocked = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') })
+    foreach ($item in @(Get-ChildItem -LiteralPath $Source -Force -ErrorAction SilentlyContinue)) {
+        $norm = $item.FullName.Replace('/', '\')
+        if ($item.PSIsContainer) {
+            $skip = $false
+            foreach ($b in $blocked) {
+                if ($norm.Equals($b, [StringComparison]::OrdinalIgnoreCase) -or $norm.StartsWith($b + '\', [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break }
+            }
+            if ($skip) { continue }
+            Copy-PmTreeFallback -Source $item.FullName -Destination (Join-Path $Destination $item.Name) -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
+        } else {
+            $skipFile = $false
+            foreach ($pat in @($ExcludeFiles)) { if ($pat -and $item.Name -like $pat) { $skipFile = $true; break } }
+            if ($skipFile) { continue }
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $Destination $item.Name) -Force
+        }
+    }
 }
 
 function Test-PmRobocopyOk { param([int]$Code) return ($Code -ge 0 -and $Code -lt 8) }
@@ -118,6 +220,7 @@ function Get-PmFileEncoding {
 
 function Get-PmUserProfiles {
     <# Real (non-special) local user profiles: name + path. #>
+    if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) { return @() }
     Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
         Where-Object { -not $_.Special -and $_.LocalPath -and (Test-Path -LiteralPath $_.LocalPath) } |
         ForEach-Object { [pscustomobject]@{ Name = (Split-Path $_.LocalPath -Leaf); Path = $_.LocalPath } }
@@ -196,18 +299,42 @@ function Invoke-PmReg {
     <# Runs reg.exe without letting its stderr chatter turn into PowerShell errors. Returns the exit code. #>
     param([Parameter(Mandatory)][ValidateSet('export', 'import')][string]$Verb, [Parameter(Mandatory)][string]$File, [string]$Key)
     $argLine = if ($Verb -eq 'export') { "export `"$Key`" `"$File`" /y" } else { "import `"$File`"" }
-    $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\reg.exe') -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
+    $sp = @{ FilePath = (Join-Path $env:SystemRoot 'System32\reg.exe'); ArgumentList = $argLine; Wait = $true; PassThru = $true }
+    # -WindowStyle exists on Windows PowerShell 5.1. PowerShell 7 rejects it.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $sp.WindowStyle = 'Hidden' }
+    $p = Start-Process @sp
     return $p.ExitCode
 }
 
 # ---------------------------------------------------------------- PRTG discovery / control
 
+function Get-PmLocalIPv4 {
+    <# IPv4 addresses of this machine (loopback included, link-local excluded). Works without the NetTCPIP module. #>
+    $list = @()
+    if (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue) {
+        try { $list = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { [string]$_.IPAddress }) } catch { $list = @() }
+    }
+    if (-not $list.Count) {
+        try {
+            foreach ($nic in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+                foreach ($a in $nic.GetIPProperties().UnicastAddresses) {
+                    if ($a.Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { $list += $a.Address.ToString() }
+                }
+            }
+        } catch { }
+    }
+    return @($list | Where-Object { $_ -and $_ -notlike '169.254.*' } | Select-Object -Unique)
+}
+
 function Get-PmPrtgInfo {
     $info = [ordered]@{
         Installed = $false; Version = $null; ProgramPath = $null; DataPath = $null
-        RegistryKeys = @(); CoreStatus = $null; ProbeStatus = $null; ListenPorts = @()
+        RegistryKeys = @(); CoreStatus = $null; ProbeStatus = $null; ListenPorts = @(); ListenEndpoints = @(); LocalAddresses = @()
     }
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$PmCoreService'" -ErrorAction SilentlyContinue
+    $svc = $null
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$PmCoreService'" -ErrorAction SilentlyContinue
+    }
     if ($svc) {
         $info.Installed = $true
         $exe = $svc.PathName
@@ -219,7 +346,10 @@ function Get-PmPrtgInfo {
         if (Test-Path -LiteralPath $exe) { $info.Version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion }
         $info.CoreStatus = [string]$svc.State
     }
-    $probe = Get-Service -Name $PmProbeService -ErrorAction SilentlyContinue
+    $probe = $null
+    if (Get-Command Get-Service -ErrorAction SilentlyContinue) {
+        $probe = Get-Service -Name $PmProbeService -ErrorAction SilentlyContinue
+    }
     if ($probe) { $info.ProbeStatus = [string]$probe.Status }
 
     foreach ($k in 'HKLM:\SOFTWARE\WOW6432Node\Paessler', 'HKLM:\SOFTWARE\Paessler') {
@@ -229,14 +359,18 @@ function Get-PmPrtgInfo {
     foreach ($core in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Core', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Core') {
         if (-not $dp -and (Test-Path $core)) { $dp = (Get-ItemProperty -Path $core -ErrorAction SilentlyContinue).Datapath }
     }
-    if (-not $dp) { $dp = Join-Path $env:ProgramData 'Paessler\PRTG Network Monitor' }
-    $info.DataPath = $dp.TrimEnd('\')
+    if (-not $dp -and $env:ProgramData) { $dp = Join-Path $env:ProgramData 'Paessler\PRTG Network Monitor' }
+    $info.DataPath = if ($dp) { $dp.TrimEnd('\').TrimEnd('/') } else { $null }
 
     $proc = Get-Process -Name 'PRTG Server' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($proc) {
-        $info.ListenPorts = @(Get-NetTCPConnection -State Listen -OwningProcess $proc.Id -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
+        $listen = @()
+        if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) { $listen = @(Get-NetTCPConnection -State Listen -OwningProcess $proc.Id -ErrorAction SilentlyContinue) }
+        $info.ListenPorts = @($listen | Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
+        # address:port pairs show whether the web server is bound to all addresses or only to specific ones
+        $info.ListenEndpoints = @($listen | Sort-Object LocalPort, LocalAddress | ForEach-Object { '{0}:{1}' -f $_.LocalAddress, $_.LocalPort } | Select-Object -Unique)
     }
+    $info.LocalAddresses = @(Get-PmLocalIPv4 | Where-Object { $_ -notlike '127.*' })
     return [pscustomobject]$info
 }
 
@@ -424,10 +558,177 @@ function Get-PmLicenseValues {
     return $out
 }
 
+function Get-PmShortHash {
+    <# First 10 hex digits of the SHA-256 of a text: lets two servers be compared without showing the value. #>
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (-join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)) | ForEach-Object { $_.ToString('x2') })).Substring(0, 10) } finally { $sha.Dispose() }
+}
+
+function Get-PmPrtgLicenseReport {
+    <#
+        READ-ONLY. What is known about the PRTG license on this server, without showing the key:
+          - the license related registry values as fingerprints (compare source and target)
+          - the system id fingerprint (PRTG licenses are activated per system id)
+          - the latest license / activation lines of the core log, with keys masked
+    #>
+    param([int]$Days = 4, [int]$MaxLines = 40)
+    $prtg = Get-PmPrtgInfo
+    $report = [ordered]@{ Installed = $prtg.Installed; Values = @(); SystemId = ''; AutoActivation = $null; LogFile = $null; LogLines = @() }
+    if (-not $prtg.Installed) { return [pscustomobject]$report }
+    $report.Values = @(Get-PmLicenseValues | ForEach-Object {
+            $v = if ($_.Value -is [byte[]]) { [Convert]::ToBase64String($_.Value) } else { [string]$_.Value }
+            '{0}={1}' -f $_.Name, $(if ($v) { "#$(Get-PmShortHash $v) ($($v.Length) chars)" } else { '<empty>' })
+        })
+    foreach ($core in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Core', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Core') {
+        if (-not (Test-Path $core)) { continue }
+        $p = Get-ItemProperty -Path $core -ErrorAction SilentlyContinue
+        if ($p.SystemId) { $report.SystemId = "#$(Get-PmShortHash ([string]$p.SystemId))" }
+        if ($null -ne $p.AutoActivation) { $report.AutoActivation = [int]$p.AutoActivation }
+        break
+    }
+    $logDir = Join-Path $prtg.DataPath 'Logs'
+    if (Test-Path -LiteralPath $logDir) {
+        $since = (Get-Date).AddDays(-$Days)
+        $files = @(Get-ChildItem -LiteralPath $logDir -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $since -and ($_.Name -match 'core' -or $_.DirectoryName -match '\\core$') } | Sort-Object LastWriteTime)
+        $hits = New-Object System.Collections.ArrayList
+        foreach ($lf in $files) {
+            try {
+                $fs = New-Object IO.FileStream($lf.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                # only the last 20 MB of a log are read
+                if ($fs.Length -gt 20MB) { [void]$fs.Seek(-20MB, [IO.SeekOrigin]::End) }
+                $sr = New-Object IO.StreamReader($fs)
+                try {
+                    while (-not $sr.EndOfStream) {
+                        $line = $sr.ReadLine()
+                        if ($line -match '(?i)licen|activat|edition|system ?id|trial|freeware|subscription|maintenance|sensor limit|exceed') { [void]$hits.Add(("{0}: {1}" -f $lf.Name, $line)) }
+                    }
+                } finally { $sr.Dispose(); $fs.Dispose() }
+                $report.LogFile = $lf.FullName
+            } catch { }
+        }
+        $report.LogLines = @($hits | Select-Object -Last $MaxLines | ForEach-Object {
+                $l = $_ -replace '[0-9A-Za-z]{6}(-[0-9A-Za-z]{6}){3,}', '<key>' -replace '(?i)SYSTEMID-[0-9A-Z-]+', 'SYSTEMID-<masked>'
+                if ($l.Length -gt 260) { $l.Substring(0, 260) + ' ...' } else { $l }
+            })
+    }
+    return [pscustomobject]$report
+}
+
+function ConvertTo-PmLicenseState {
+    <#
+        Turns the license lines of the PRTG core log into a short state:
+        Edition, Name, MaxSensors, NeedsActivation, LastError. Pure function (testable).
+    #>
+    param([string[]]$LogLines = @(), [string]$PausedByLicense)
+    $state = [ordered]@{ Known = $false; Edition = $null; Name = $null; MaxSensors = $null; NeedsActivation = $false; LastError = $null; PausedByLicense = $PausedByLicense }
+    $lic = @($LogLines | Where-Object { $_ -match 'licensed for "' } | Select-Object -Last 1)
+    if ($lic.Count -and $lic[0] -match '>\s*PRTG\s+(?<edition>.*?)\s*licensed for "(?<name>[^"]*)".*?Edt=(?<edt>-?\d+)\s+MaxS=(?<max>\d+)') {
+        $edition = $Matches.edition.Trim(); $name = $Matches.name; $edt = [int]$Matches.edt; $max = [int]$Matches.max
+        if ($edition -match '^\((?<inner>[^()]*)\)$') { $edition = $Matches.inner }
+        $state.Known = $true
+        $state.Edition = $edition
+        $state.Name = $name
+        $state.MaxSensors = $max
+        $state.NeedsActivation = ($edition -match '(?i)no license|system changed' -or $edt -lt 0 -or $max -eq 0)
+    }
+    $err = @($LogLines | Where-Object { $_ -match '(?i)activation done .*error|new activation required|activation failed' } | Select-Object -Last 1)
+    if ($err.Count) { $state.LastError = ($err[0] -replace '^.*?>\s*', '').Trim() }
+    return [pscustomobject]$state
+}
+
+function Get-PmPrtgLicenseState {
+    <# READ-ONLY. Short license state of the PRTG on this server (from the registry and the core log). #>
+    $rep = Get-PmPrtgLicenseReport -Days 3 -MaxLines 400
+    $paused = $null
+    $pv = @(Get-PmLicenseValues | Where-Object { $_.Name -eq 'SensorCountPausedByLicenseMax' } | Select-Object -First 1)
+    if ($pv.Count) { $paused = [string]$pv[0].Value }
+    return (ConvertTo-PmLicenseState -LogLines @($rep.LogLines) -PausedByLicense $paused)
+}
+
 function Get-PmLicenseFiles {
     param([string]$DataPath)
     if (-not (Test-Path -LiteralPath $DataPath)) { return @() }
     @(Get-ChildItem -LiteralPath $DataPath -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'licen' })
+}
+
+# ---------------------------------------------------------------- web server binding
+
+function Get-PmReboundIpList {
+    <# "a,b" -> the same list with addresses that do not exist locally replaced by $Own; 127.0.0.1 is always kept. #>
+    param([string]$Current, [string[]]$Local = @(), [string]$Own, [switch]$AddOwn)
+    $new = @()
+    foreach ($ip in ($Current -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        if ($ip -eq '127.0.0.1' -or $Local -contains $ip) { $new += $ip } elseif ($Own) { $new += $Own }
+    }
+    # -AddOwn: PRTG itself drops addresses it cannot bind at start-up, leaving only 127.0.0.1.
+    if ($AddOwn -and $Own -and -not @($new | Where-Object { $_ -ne '127.0.0.1' }).Count) { $new = @($Own) + $new }
+    if ($new -notcontains '127.0.0.1') { $new += '127.0.0.1' }
+    return (@($new | Select-Object -Unique) -join ',')
+}
+
+function Set-PmPrtgWebBinding {
+    <#
+        The PRTG web server can be bound to specific IP addresses (registry: Server\Webserver,
+        UseIPs = owioSpecIPs, IPs = "a,b"). After a migration those are the SOURCE's addresses;
+        PRTG then only listens on 127.0.0.1. Addresses that do not exist on this server are
+        replaced by this server's own address. Nothing is changed when every address exists.
+    #>
+    param([string]$TargetAddress, [bool]$AddOwn = $false, [bool]$CheckOnly = $false)
+    $local = @(Get-PmLocalIPv4)
+    $own = if ($TargetAddress -and $local -contains $TargetAddress) { $TargetAddress }
+    else { $local | Where-Object { $_ -ne '127.0.0.1' -and $_ -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)' } | Select-Object -First 1 }
+    if (-not $own) { $own = $local | Where-Object { $_ -ne '127.0.0.1' } | Select-Object -First 1 }
+    $changed = $false; $before = $null; $after = $null
+    foreach ($key in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Webserver', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Webserver') {
+        if (-not (Test-Path $key)) { continue }
+        $p = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+        if ($p.UseIPs -ne 'owioSpecIPs' -or -not $p.IPs) { continue }
+        $before = [string]$p.IPs
+        $after = Get-PmReboundIpList -Current $before -Local $local -Own $own -AddOwn:$AddOwn
+        if ($after -ne $before) { if (-not $CheckOnly) { Set-ItemProperty -Path $key -Name 'IPs' -Value $after }; $changed = $true }
+    }
+    if ($CheckOnly) { return [pscustomobject]@{ PmType = 'binding'; Changed = $changed; Before = $before; After = $after } }
+    if ($changed) { Write-PmLog "PRTG web server binding changed from '$before' to '$after' (addresses of this server)." 'OK' }
+    elseif ($before) { Write-PmLog "PRTG web server binding is valid for this server ($before)." 'OK' }
+    else { Write-PmLog 'PRTG web server listens on all addresses (no specific binding).' 'OK' }
+    [pscustomobject]@{ PmType = 'binding'; Changed = $changed; Before = $before; After = $after }
+}
+
+function Repair-PmPrtgBinding {
+    <# Fixes the web server binding of an already migrated PRTG, restarts it and verifies it is fully up. #>
+    param([string]$TargetAddress, [int]$HealthTimeoutMinutes = 15)
+    $ErrorActionPreference = 'Stop'
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server.' }
+    Write-PmLog "PRTG currently listens on: $(@($prtg.ListenEndpoints) -join ', ')"
+    Write-PmProgress 10 'Adjusting web server binding'
+    $bx = @{ B = (Set-PmPrtgWebBinding -TargetAddress $TargetAddress -AddOwn $true -CheckOnly $true) }
+    $health = $null
+    if (-not $bx.B.Changed) { Write-PmLog "PRTG web server binding needs no change ($($bx.B.Before))." 'OK' }
+    if ($bx.B.Changed) {
+        # Order matters: the core writes its settings back to the registry when it stops,
+        # so the binding must be changed while PRTG is stopped.
+        Write-PmProgress 20 'Stopping PRTG'
+        Write-PmLog 'Stopping PRTG (the binding can only be changed while the core is stopped)...' 'STEP'
+        Stop-PmPrtgServices
+        Write-PmProgress 40 'Adjusting web server binding'
+        Set-PmPrtgWebBinding -TargetAddress $TargetAddress -AddOwn $true | ForEach-Object { if ($_.PmType -eq 'binding') { $bx.B = $_ } else { $_ } }
+        Write-PmProgress 50 'Starting PRTG'
+        $box = @{}
+        Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
+        $health = $box.Health
+        if (-not $health.Healthy) { throw "PRTG did not come up completely after the restart ($($health.Message))." }
+    }
+    $after = Get-PmPrtgInfo
+    $outside = @($after.ListenEndpoints | Where-Object { $_ -notmatch '^(127\.0\.0\.1|::1):' })
+    $reg = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Webserver' -ErrorAction SilentlyContinue)
+    Write-PmLog "Registry after start: UseIPs=$($reg.UseIPs) IPs=$($reg.IPs) Ports=$($reg.Ports)" 'DEBUG'
+    if ($outside.Count) { Write-PmLog "PRTG now listens on: $(@($after.ListenEndpoints) -join ', ')" 'OK' }
+    else { Write-PmLog "PRTG still only listens on this server itself: $(@($after.ListenEndpoints) -join ', ') (registry IPs=$($reg.IPs)). Set the web server IP in the PRTG Administration Tool on the server." 'ERROR' }
+    Write-PmProgress 100 'Done'
+    New-PmResult @{ Changed = $bx.B.Changed; Before = $bx.B.Before; After = $bx.B.After; ListenEndpoints = @($after.ListenEndpoints); Core = $after.CoreStatus; Probe = $after.ProbeStatus }
 }
 
 # ---------------------------------------------------------------- firewall
@@ -445,8 +746,13 @@ function Set-PmPrtgFirewall {
 # ---------------------------------------------------------------- system info (Test)
 
 function Get-PmSystemInfo {
-    $os = Get-CimInstance Win32_OperatingSystem
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $osCaption = Get-PmOsCaption
+    $osVersion = [Environment]::OSVersion.Version.ToString()
+    $isAdmin = Test-PmIsAdmin
+    $userName = Get-PmCurrentUserName
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try { $osVersion = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Version } catch { }
+    }
     $vpn = @()
     try { $vpn = @(Get-VpnConnection -AllUserConnection -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Server = $_.ServerAddress; Type = [string]$_.TunnelType; Status = [string]$_.ConnectionStatus } }) } catch { }
     $prtg = Get-PmPrtgInfo
@@ -455,18 +761,26 @@ function Get-PmSystemInfo {
         $dataSize = Get-PmDirectorySize -Path $prtg.DataPath
         $stats = Get-PmPrtgConfigStats -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat')
     }
-    $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
-            [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    $disks = @()
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    } else {
+        $disks = @(Get-PmLogicalDisk -Path (Get-PmWorkRoot) | Where-Object { $_ } | ForEach-Object {
+                [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    }
 
     New-PmResult @{
         Computer     = $env:COMPUTERNAME
-        OS           = $os.Caption
-        OSVersion    = $os.Version
-        IsAdmin      = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        User         = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        OS           = $osCaption
+        OSVersion    = $osVersion
+        IsAdmin      = $isAdmin
+        User         = $userName
         Prtg         = $prtg
         PrtgDataGB   = [math]::Round($dataSize / 1GB, 2)
         PrtgConfigStats = $stats
+        PrtgLicense  = $(if ($prtg.Installed) { try { Get-PmPrtgLicenseReport } catch { [pscustomobject]@{ Error = "$($_.Exception.Message)" } } })
+        PrtgLicenseState = $(if ($prtg.Installed) { try { Get-PmPrtgLicenseState } catch { $null } })
         VpnAllUsers  = $vpn
         Profiles     = @(Get-PmUserProfiles | Select-Object -ExpandProperty Name)
         Disks        = $disks
@@ -514,7 +828,7 @@ function Invoke-PmRemoteBackup {
     $manifest = [ordered]@{
         tool = 'prtg-mover'; formatVersion = 1; jobId = $JobId
         createdUtc = (Get-Date).ToUniversalTime().ToString('o')
-        source = [ordered]@{ computer = $env:COMPUTERNAME; os = (Get-CimInstance Win32_OperatingSystem).Caption }
+        source = [ordered]@{ computer = $env:COMPUTERNAME; os = (Get-PmOsCaption) }
         prtg = [ordered]@{ included = $false }
         vpn = [ordered]@{ included = $false; allUsers = @(); users = @{} }
         desktop = [ordered]@{ included = $false; users = @() }
@@ -621,7 +935,10 @@ function Invoke-PmRemoteBackup {
                     $svcDir = Join-Path $stage 'prtg\services'
                     New-Item -ItemType Directory -Force -Path $svcDir | Out-Null
                     foreach ($n in $PmCoreService, $PmProbeService) {
-                        $w = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+                        $w = $null
+                        if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+                            $w = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+                        }
                         if (-not $w) { continue }
                         [void](Invoke-PmReg -Verb export -Key "HKLM\SYSTEM\CurrentControlSet\Services\$n" -File (Join-Path $svcDir "$n.reg"))
                         $services += [ordered]@{ name = $w.Name; displayName = $w.DisplayName; pathName = $w.PathName; startMode = $w.StartMode; startName = $w.StartName; description = $w.Description }
@@ -817,7 +1134,9 @@ function Invoke-PmRemoteRestore {
         [string]$LogDir,
         # The staged package is local on this server: move folders into place instead of copying (saves disk space).
         [bool]$MoveFromStage = $false,
-        [bool]$CleanupStage = $false
+        [bool]$CleanupStage = $false,
+        # Address of this server as the manager knows it (used for the PRTG web server binding).
+        [string]$TargetAddress
     )
     $ErrorActionPreference = 'Stop'
     if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
@@ -834,11 +1153,12 @@ function Invoke-PmRemoteRestore {
         if (-not (Test-Path -LiteralPath (Join-Path $stage 'manifest.json'))) { throw "Staged package not found at $stage" }
         $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
         $need = [int64]$manifest.stagingBytes
-        $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+        $drive = if ($env:SystemDrive) { Get-PmLogicalDisk -Path ($env:SystemDrive + '\') } else { Get-PmLogicalDisk -Path $stage }
         # Local stage + move: the data already occupies the disk, only a margin is needed.
         $required = if ($MoveFromStage) { [int64]1GB } else { [int64]($need * 1.1 + 1GB) }
         if ($drive -and $drive.FreeSpace -lt $required) { throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB)) }
-        Write-PmLog ("Reading the staged package from {0}. Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK'
+        if ($drive) { Write-PmLog ("Reading the staged package from {0}. Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK' }
+        else { Write-PmLog "Reading the staged package from $stage. Disk free space could not be read." 'WARN' }
     }
     if (-not $direct -and $ExpectedSha256) {
         Write-PmProgress 2 'Verifying package checksum'
@@ -851,7 +1171,7 @@ function Invoke-PmRemoteRestore {
     $need = 0
     $zr = [IO.Compression.ZipFile]::OpenRead($ZipPath)
     try { foreach ($e in $zr.Entries) { $need += $e.Length } } finally { $zr.Dispose() }
-    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $drive = Get-PmLogicalDisk -Path $WorkRoot
     $required = [int64]($need * 2 + 1GB)   # extracted staging + restored data + margin
     if ($drive -and $drive.FreeSpace -lt $required) {
         throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB))
@@ -1003,6 +1323,9 @@ function Invoke-PmRemoteRestore {
                 Write-PmLog "Registry Datapath adjusted to $dataPath" 'OK'
             }
 
+            # ---- web server binding: the source's IP addresses do not exist here
+            Set-PmPrtgWebBinding -TargetAddress $TargetAddress | Where-Object { $_.PmType -ne 'binding' }
+
             # ---- license
             if ($CopyLicense) {
                 $report.License = 'copied-from-source'
@@ -1043,7 +1366,22 @@ function Invoke-PmRemoteRestore {
                 if ($health.Healthy) {
                     $report.WebUrl = $health.Url
                     $report.Prtg = 'ok'
+                    try {
+                        $ls = Get-PmPrtgLicenseState
+                        if ($ls.Known -and $ls.NeedsActivation) {
+                            $report.License = 'needs-activation'
+                            Write-PmLog "LICENSE: PRTG on this server reports '$($ls.Edition)'. A PRTG license is bound to the system it was activated on, so it must be activated again for this server (PRTG > Setup > License Information). Until then PRTG pauses the sensors. The license on the source server is not affected by this." 'WARN'
+                            if ($ls.LastError) { Write-PmLog "LICENSE: last activation attempt: $($ls.LastError)" 'WARN' }
+                        } elseif ($ls.Known) {
+                            $report.License = "active ($($ls.Edition), $($ls.MaxSensors) sensors)"
+                            Write-PmLog "LICENSE: $($ls.Edition), $($ls.MaxSensors) sensors - active on this server." 'OK'
+                        }
+                    } catch { Write-PmLog "License state could not be read: $($_.Exception.Message)" 'DEBUG' }
                     Write-PmLog "PRTG $($health.Version) is fully UP on $env:COMPUTERNAME : $($health.Url) (core $($health.Core), probe $($health.Probe))" 'OK'
+                    $ep = @((Get-PmPrtgInfo).ListenEndpoints)
+                    $outside = @($ep | Where-Object { $_ -notmatch '^(127\.0\.0\.1|::1):' })
+                    if ($outside.Count) { Write-PmLog "PRTG listens on: $($ep -join ', ')" 'OK' }
+                    else { Write-PmLog "PRTG only listens on this server itself ($($ep -join ', ')) - it is not reachable from the network. Check the web server IP setting in the PRTG Administration Tool." 'WARN' }
                 } else {
                     $report.Prtg = 'unhealthy'
                     $report.Errors += "PRTG did not come up completely within $HealthTimeoutMinutes min ($($health.Message))."
@@ -1142,14 +1480,15 @@ function Get-PmPullList {
     param([Parameter(Mandatory)][string]$Source, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @(), [switch]$Raw)
     $list = New-Object System.Collections.ArrayList
     if (Test-Path -LiteralPath $Source) {
-        $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
-        $xd = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' })
+        $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\').TrimEnd('/')
+        $xd = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') + '\' })
         foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
-            $full = $f.FullName
+            $full = $f.FullName.Replace('/', '\')
             if (@($xd | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
             if (@($ExcludeFiles | Where-Object { $f.Name -like $_ }).Count) { continue }
             if ($f.Name -in 'desktop.ini', 'Thumbs.db') { continue }   # Windows shell junk
-            [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($root.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
+            $relRoot = $root.Replace('/', '\')
+            [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($relRoot.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
         }
     }
     if ($Raw) { return $list }
@@ -1261,14 +1600,13 @@ function Initialize-PmRemoteWorkRoot {
     param([string]$WorkRoot)
     if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
     New-Item -ItemType Directory -Force -Path (Join-Path $WorkRoot 'in') | Out-Null
-    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $drive = Get-PmLogicalDisk -Path $WorkRoot
     $prtg = Get-PmPrtgInfo
     $dataBytes = 0
     if ($prtg.Installed) { $dataBytes = Get-PmDirectorySize -Path $prtg.DataPath }
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     New-PmResult @{
         WorkRoot = $WorkRoot; Inbox = (Join-Path $WorkRoot 'in'); Prtg = $prtg; Computer = $env:COMPUTERNAME
-        FreeBytes = [int64]$drive.FreeSpace; PrtgDataBytes = [int64]$dataBytes
-        IsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        FreeBytes = $(if ($drive) { [int64]$drive.FreeSpace } else { [int64]0 }); PrtgDataBytes = [int64]$dataBytes
+        IsAdmin = (Test-PmIsAdmin)
     }
 }
