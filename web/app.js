@@ -51,7 +51,7 @@
   });
 
   const statusBadge = (s) => {
-    const map = { succeeded: 'ok', failed: 'err', running: 'info', queued: '', cancelled: 'warn' };
+    const map = { succeeded: 'ok', failed: 'err', running: 'info', queued: '', cancelled: 'warn', interrupted: 'warn' };
     return `<span class="badge ${map[s] ?? ''}">${esc(s)}</span>`;
   };
 

@@ -34,11 +34,14 @@ param(
     [int]$Port = 8765,
     [switch]$ListenAll,
     [switch]$NoBrowser,
-    [switch]$NewToken
+    [switch]$NewToken,
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
+# Echo live job logs into this console (use -Quiet to turn it off).
+if (-not $Quiet) { $env:PRTGMOVER_ECHO = '1' }
 Import-Module (Join-Path $Root 'src\PrtgMover.psm1') -Force -DisableNameChecking
 Set-PmRoot -Path $Root
 # [string] + Trim() strips the provider NoteProperties Get-Content attaches (ConvertTo-Json would walk them).
@@ -349,6 +352,14 @@ function Invoke-PmRoute {
             Start-PmIoTask -Script $DownloadScript -Arguments @($Ctx, $zip, (Split-Path $zip -Leaf))
             return
         }
+        '^GET /api/logs/audit$' {
+            $af = Join-Path (Get-PmPath Data) 'logs\audit.log'
+            $items = @()
+            if (Test-Path -LiteralPath $af) { $items = @(Get-Content -LiteralPath $af -Tail 200 -Encoding UTF8 | ForEach-Object { try { $_ | ConvertFrom-Json } catch { } }) }
+            [array]::Reverse($items)
+            Send-PmJson $Ctx @($items)
+            return
+        }
         '^GET /api/logs/manager$' {
             $lf = Join-Path (Get-PmPath Data) ('logs\manager-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
             $lines = @(); if (Test-Path -LiteralPath $lf) { $lines = @(Get-Content -LiteralPath $lf -Tail 300 -Encoding UTF8) }
@@ -378,6 +389,7 @@ if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/?token
 Write-Host "  Data  : $Root"
 Write-Host '  Stop  : Ctrl+C'
 Write-Host "  Logs  : $(Join-Path (Get-PmPath Data) 'logs')  (manager, audit, robocopy) + data\jobs + data\agent\<id>\agent.log"
+Repair-PmInterruptedJobs
 Write-PmManagerLog -Message "Dashboard $Version started on $prefix by $env:USERDOMAIN\$env:USERNAME (PID $PID)" -Source 'dashboard'
 Write-Host ''
 if (-not $NoBrowser) { Start-Process $url }

@@ -67,6 +67,7 @@ function Invoke-PmRobocopy {
         [Parameter(Mandatory)][string]$Source,
         [Parameter(Mandatory)][string]$Destination,
         [string[]]$ExcludeDirs = @(),
+        [string[]]$ExcludeFiles = @(),
         [switch]$Mirror
     )
     if (-not (Test-Path -LiteralPath $Source)) { return -1 }
@@ -75,6 +76,7 @@ function Invoke-PmRobocopy {
     $rcArgs = @($Source.TrimEnd('\'), $Destination.TrimEnd('\'), '/COPY:DAT', $dcopy, '/R:2', '/W:2', '/MT:8', '/XJ', '/NP', '/NFL', '/NDL')
     if ($Mirror) { $rcArgs += '/MIR' } else { $rcArgs += '/E' }
     if ($ExcludeDirs.Count -gt 0) { $rcArgs += '/XD'; $rcArgs += $ExcludeDirs }
+    if ($ExcludeFiles.Count -gt 0) { $rcArgs += '/XF'; $rcArgs += $ExcludeFiles }
     # Full robocopy log (summary + every error) for troubleshooting.
     if ($global:PmRobocopyLog) { $rcArgs += "/LOG+:$global:PmRobocopyLog" }
     & robocopy.exe @rcArgs | Out-Null
@@ -205,6 +207,9 @@ function Get-PmPrtgInfo {
         $exe = $svc.PathName
         if ($exe -match '^"([^"]+)"') { $exe = $Matches[1] } elseif ($exe -match '^(.+?\.exe)') { $exe = $Matches[1] }
         $info.ProgramPath = Split-Path $exe -Parent
+        # PRTG 64-bit installs run the core from "<install dir>\64 bit\PRTG Server.exe" -
+        # customisations (Custom Sensors, Notifications, lookups, cert...) live in the install dir itself.
+        if ((Split-Path $info.ProgramPath -Leaf) -eq '64 bit') { $info.ProgramPath = Split-Path $info.ProgramPath -Parent }
         if (Test-Path -LiteralPath $exe) { $info.Version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion }
         $info.CoreStatus = [string]$svc.State
     }
@@ -458,6 +463,8 @@ function Invoke-PmRemoteBackup {
         [bool]$NoTouch = $false,
         [int]$HealthTimeoutMinutes = 15,
         [bool]$IncludeProgram = $true,
+        [bool]$IncludeLogs = $false,
+        [bool]$IncludeAutoBackups = $false,
         # Stage directly into this folder (e.g. the manager's disk via \\tsclient) and skip zipping on the source.
         [string]$StageDir,
         [string]$LogDir
@@ -517,9 +524,18 @@ function Invoke-PmRemoteBackup {
 
             try {
                 Write-PmProgress 20 'PRTG: copying data folder'
+                # Only what PRTG needs: no log files, caches, temp files or old automatic config copies (unless asked).
                 $exclude = @()
-                if (-not $IncludeHistory) { $exclude = @((Join-Path $dataSource 'Monitoring Database'), (Join-Path $dataSource 'Logs')) }
-                $code = Invoke-PmRobocopy -Source $dataSource -Destination (Join-Path $stage 'prtg\data') -ExcludeDirs $exclude
+                if (-not $IncludeHistory) { $exclude += (Join-Path $dataSource 'Monitoring Database') }
+                if (-not $IncludeLogs) { $exclude += (Join-Path $dataSource 'Logs') }
+                if (-not $IncludeAutoBackups) { $exclude += (Join-Path $dataSource 'Configuration Auto-Backups') }
+                $excludeFiles = @('*.tmp', 'PRTG Graph Data Cache*', '*.old', '*.bak')
+                $skipped = @()
+                foreach ($x in $exclude) {
+                    if (Test-Path -LiteralPath $x) { $skipped += ('{0} ({1:N2} GB)' -f (Split-Path $x -Leaf), ((Get-PmDirectorySize $x) / 1GB)) }
+                }
+                Write-PmLog "Copying only what PRTG needs. Skipped: $(if ($skipped) { $skipped -join ', ' } else { 'nothing' }) + temp/cache files ($($excludeFiles -join ', '))." 'INFO'
+                $code = Invoke-PmRobocopy -Source $dataSource -Destination (Join-Path $stage 'prtg\data') -ExcludeDirs $exclude -ExcludeFiles $excludeFiles -Mirror
                 if (-not (Test-PmRobocopyOk $code)) { throw "robocopy of PRTG data failed with exit code $code. $(Get-PmRobocopyErrors)" }
                 $cfg = Join-Path $stage 'prtg\data\PRTG Configuration.dat'
                 if (-not (Test-Path -LiteralPath $cfg)) { throw "'PRTG Configuration.dat' is missing from the copied data folder - aborting (backup would be unusable)." }
@@ -664,6 +680,13 @@ function Invoke-PmRemoteBackup {
         }
         $manifest.desktop.included = $true
         Write-PmLog "Desktop files copied for: $($manifest.desktop.users -join ', ')" 'OK'
+        foreach ($u in $manifest.desktop.users) {
+            $files = @(Get-ChildItem -LiteralPath (Join-Path $deskStage $u) -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })
+            if (-not $files.Count) { continue }
+            $special = @($files | Where-Object { $_.Extension -in '.bat', '.cmd', '.ps1', '.pbk', '.ovpn', '.conf', '.rdp', '.vbs' } | ForEach-Object { $_.Name })
+            Write-PmLog ("Desktop {0}: {1} file(s), {2:N1} MB{3}" -f $u, $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB), $(if ($special.Count) { " - scripts/VPN: $($special -join ', ')" } else { '' })) 'INFO'
+        }
+        $manifest.desktop.files = @(Get-ChildItem -LiteralPath $deskStage -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' } | ForEach-Object { $_.FullName.Substring($deskStage.Length + 1) } | Select-Object -First 500)
     }
 
     # ---- Extra paths

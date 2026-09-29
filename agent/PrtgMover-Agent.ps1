@@ -96,7 +96,26 @@ Get-ChildItem -LiteralPath $Req -Filter '*.working' -File -ErrorAction SilentlyC
 
 $lastWork = Get-Date
 try {
+    $linkUp = $true
     while (((Get-Date) - $lastWork).TotalHours -lt $IdleHours) {
+        # The redirected drive disappears while the RDP window is closed/disconnected - keep running and wait.
+        $reachable = Test-Path -LiteralPath $Req
+        if (-not $reachable) {
+            if ($linkUp) {
+                $linkUp = $false
+                $Host.UI.RawUI.WindowTitle = 'PRTG Mover agent - WAITING for the RDP connection'
+                Write-Host ("[{0}] Link to the manager lost (RDP window closed or network drop). Still running - reconnect RDP and the job continues automatically." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Yellow
+            }
+            $lastWork = Get-Date
+            Start-Sleep -Seconds 2
+            continue
+        }
+        if (-not $linkUp) {
+            $linkUp = $true
+            Write-AgentLog 'Link to the manager restored.'
+            Write-Host ("[{0}] Link to the manager restored." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Green
+        }
+        $Host.UI.RawUI.WindowTitle = "PRTG Mover agent - connected ($ServerId)"
         $next = Get-ChildItem -LiteralPath $Req -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -First 1
         if (-not $next) { Start-Sleep -Milliseconds 700; continue }
 

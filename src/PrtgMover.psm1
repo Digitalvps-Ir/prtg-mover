@@ -13,7 +13,7 @@ $script:PmJobs = [hashtable]::Synchronized(@{})
 $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
-$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram'
+$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram', 'IncludeLogs', 'IncludeAutoBackups'
 $script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall'
 
 # ======================================================================= paths
@@ -255,6 +255,12 @@ function Start-PmRdp {
         'desktopheight:i:900'
         'redirectclipboard:i:1'
         "drivestoredirect:s:$drive;"
+        # keep the session (and the redirected drive) alive through short network drops
+        'autoreconnection enabled:i:1'
+        'autoreconnect max retries:i:200'
+        'networkautodetect:i:1'
+        'bandwidthautodetect:i:1'
+        'connection type:i:7'
     )
     if ($user) { $lines += "username:s:$user" }
     Set-Content -LiteralPath $file -Value $lines -Encoding Unicode
@@ -827,7 +833,13 @@ function Invoke-PmBackupFlow {
         $stageLocal = $null
         if ($agent) {
             $stageLocal = Join-Path (Get-PmPath Data) "staging\$jobId"
-            if (Test-Path -LiteralPath $stageLocal) { Remove-Item -LiteralPath $stageLocal -Recurse -Force }
+            # Resume: continue the partial copy of the interrupted run instead of starting from zero
+            # (robocopy then only transfers what is missing or changed).
+            $prevStage = if ($Job -and $Job.resumedFrom) { Join-Path (Get-PmPath Data) "staging\$($Job.resumedFrom)" } else { $null }
+            if ($prevStage -and (Test-Path -LiteralPath $prevStage) -and -not (Test-Path -LiteralPath $stageLocal)) {
+                Move-Item -LiteralPath $prevStage -Destination $stageLocal
+                Add-PmJobLog -Job $Job -Level OK -Message ("Reusing the partial staging copy of {0} ({1:N2} GB already transferred)." -f $Job.resumedFrom, ((Get-ChildItem -LiteralPath $stageLocal -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB))
+            }
             New-Item -ItemType Directory -Force -Path $stageLocal | Out-Null
             $params.StageDir = ConvertTo-PmTsClientPath $stageLocal
             $params.LogDir = ConvertTo-PmTsClientPath (Join-Path (Get-PmPath Data) 'logs\robocopy')
@@ -963,6 +975,15 @@ function Add-PmJobLog {
         try { Add-Content -LiteralPath (Join-Path (Get-PmPath Jobs) "$($Job.id).log") -Value ("{0} [{1}] {2}: {3}" -f $entry.time, $Level, $Computer, $Message) -Encoding UTF8 } catch { }
     }
     if ($Level -in 'WARN', 'ERROR') { Write-PmManagerLog -Level $Level -Message "${Computer}: $Message" -Source $(if ($Job) { "job:$($Job.id)" } else { 'manager' }) }
+    # Dashboard console: echo every job's progress live, so one console shows everything.
+    if ($Job -and -not $Job.console -and $env:PRTGMOVER_ECHO -eq '1' -and $Level -ne 'DEBUG') {
+        try {
+            $c = @{ WARN = 'Yellow'; ERROR = 'Red'; OK = 'Green'; STEP = 'Cyan' }[$Level]; if (-not $c) { $c = 'Gray' }
+            [Console]::ForegroundColor = $c
+            [Console]::WriteLine(('[{0}] {1,-5} {2,-16} {3}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Computer, $Message))
+            [Console]::ResetColor()
+        } catch { }
+    }
     if ((-not $Job -or $Job.console) -and $Level -ne 'DEBUG') {
         $color = @{ INFO = 'Gray'; WARN = 'Yellow'; ERROR = 'Red'; OK = 'Green'; STEP = 'Cyan' }[$Level]
         if (-not $color) { $color = 'Gray' }
@@ -1150,6 +1171,22 @@ function Stop-PmJob {
     }
 }
 
+function Repair-PmInterruptedJobs {
+    <# Called at dashboard start: jobs recorded as running/queued were interrupted by a restart - make them resumable. #>
+    foreach ($f in (Get-ChildItem -LiteralPath (Get-PmPath Jobs) -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
+        try {
+            $j = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($j.status -in 'running', 'queued') {
+                $j.status = 'interrupted'
+                $j.error = 'The dashboard was restarted while this job was running - press Resume to continue.'
+                if (-not $j.finished) { $j | Add-Member -NotePropertyName finished -NotePropertyValue ((Get-Date).ToString('o')) -Force }
+                ConvertTo-Json -InputObject $j -Depth 10 | Set-Content -LiteralPath $f.FullName -Encoding UTF8
+                Write-PmManagerLog -Level WARN -Message "Job $($j.id) marked as interrupted (dashboard restart)." -Source 'dashboard'
+            }
+        } catch { }
+    }
+}
+
 function Resume-PmJob {
     <#
         Starts a new job that continues a failed / cancelled one: the package that was
@@ -1202,7 +1239,7 @@ function Get-PmJob {
         id = $j.id; type = $j.type; summary = $j.summary; status = $j.status; progress = $j.progress; step = $j.step
         created = $j.created; started = $j.started; finished = $j.finished; error = $j.error; result = $j.result
         checkpoint = $j.checkpoint; resumedFrom = $j.resumedFrom
-        resumable = [bool]($j.params -and $j.status -in 'failed', 'cancelled')
+        resumable = [bool]($j.params -and $j.status -in 'failed', 'cancelled', 'interrupted')
         logCount = $logs.Count; logs = @($logs | Select-Object -Skip $Since)
     }
 }
