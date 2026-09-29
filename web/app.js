@@ -293,10 +293,10 @@
     const viaTunnel = transfer === 'wireguard' || transfer === 'ipip';
     const tunnelName = transfer === 'ipip' ? 'an IPIP tunnel (10.66.67.0/24)' : 'a WireGuard tunnel (10.66.66.0/24)';
     const pathText = viaTunnel
-      ? `copied over ${tunnelName} straight to the target — <b>not through this computer</b>`
+      ? `sent with WinRM over ${tunnelName} straight to the target's tunnel address — <b>not through this computer</b>`
       : (transfer === 'rdp' ? 'copied through this computer over RDP' : (transfer === 'winrm' ? 'copied through this computer over WinRM' : 'copied with each server\'s saved RDP or WinRM method'));
     $('#transferHint').textContent = viaTunnel
-      ? `${transfer === 'ipip' ? 'IPIP' : 'WireGuard'}: the two Windows servers talk to each other on ${transfer === 'ipip' ? '10.66.67.0/24' : '10.66.66.0/24'}. Commands still use each server's saved RDP or WinRM method. The backup is not stored on this computer.`
+      ? `${transfer === 'ipip' ? 'IPIP' : 'WireGuard'}: WinRM (TCP 5985) runs between the two Windows servers on ${transfer === 'ipip' ? '10.66.67.0/24' : '10.66.66.0/24'}, the same point-to-point path a bandwidth test would use. A short probe reports MB/s before the copy. Commands still use each server's saved RDP or WinRM method. The backup is not stored on this computer.`
       : 'RDP and WinRM copy the files through this computer. WireGuard and IPIP build a tunnel between the two servers and copy only there. This computer sends commands and does not keep the backup.';
     let html = '<h3>What this job will do</h3><ul>';
     html += `<li><b>Source:</b> ${src ? esc(src.name) : '–'} — ${f.NoTouch.checked ? `<b>not touched</b> (PRTG keeps running, ${pathText})` : `PRTG is stopped (${esc(f.SourceAfter.value)}), ${pathText}`}</li>`;
@@ -349,9 +349,9 @@
       const srcLine = srcText || `PRTG on the source will be stopped (${options.SourceAfter}).`;
       const lic = options.CopyLicense ? 'The source license IS copied.' : 'The source license is NOT copied (targets keep their own).';
       const path = options.transfer === 'wireguard'
-        ? 'Files go from the source to the target over a WireGuard tunnel (10.66.66.0/24). Nothing is copied to this computer.'
+        ? 'Files go over WinRM from the source to the target tunnel address on 10.66.66.0/24. Nothing is copied to this computer.'
         : (options.transfer === 'ipip'
-          ? 'Files go from the source to the target over an IPIP tunnel (10.66.67.0/24). Nothing is copied to this computer.'
+          ? 'Files go over WinRM from the source to the target tunnel address on 10.66.67.0/24. Nothing is copied to this computer.'
           : (options.transfer === 'rdp' ? 'Files are copied through this computer over RDP.' : (options.transfer === 'winrm' ? 'Files are copied through this computer over WinRM.' : 'Files are copied with each server\'s saved method.')));
       if (!confirm(`Migrate ${src} → ${names}?\n\n${path}\n${srcLine}\n${lic}\nThe PRTG data on each target is replaced (a rollback copy is kept on the target).\n\nPre-flight checks run first — nothing is changed if they fail.`)) return;
       startJob({ type: 'migrate', sourceId: f.sourceId.value, targetIds: targets, options });

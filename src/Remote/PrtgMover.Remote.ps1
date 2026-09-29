@@ -24,15 +24,83 @@ $PmProgramFolders = @(
 
 function Get-PmWorkRoot {
     <# Folder for PRTG Mover's own temporary files on this server. #>
-    if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\') }
-    return (Join-Path $env:SystemDrive 'PrtgMover')
+    if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\').TrimEnd('/') }
+    if ($env:SystemDrive) { return (Join-Path $env:SystemDrive 'PrtgMover') }
+    # PowerShell 7 on Linux has no SystemDrive. Keep the same folder name under temp.
+    return (Join-Path ([IO.Path]::GetTempPath()) 'PrtgMover')
+}
+
+function Get-PmComputerName {
+    if ($env:COMPUTERNAME) { return [string]$env:COMPUTERNAME }
+    $n = [Environment]::MachineName
+    if ($n) { return [string]$n }
+    return 'localhost'
+}
+
+function Test-PmIsAdmin {
+    <# True when the process is elevated. False on platforms without a Windows identity. #>
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        return [bool]$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Get-PmCurrentUserName {
+    try { return [string][Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { return "$env:USERDOMAIN\$env:USERNAME" }
+}
+
+function Get-PmOsCaption {
+    <# Windows caption when CIM exists; otherwise the runtime OS description. #>
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            if ($os.Caption) { return [string]$os.Caption }
+        } catch { }
+    }
+    return [Environment]::OSVersion.VersionString
+}
+
+function Get-PmLogicalDisk {
+    <#
+        Free space for a path. On Windows this is the Win32_LogicalDisk for the drive letter.
+        Without CIM (PowerShell 7 on Linux) it uses the .NET volume that contains the path.
+    #>
+    param([string]$Path)
+    $qualifier = ''
+    if ($Path) {
+        try { $qualifier = [string](Split-Path -Path $Path -Qualifier -ErrorAction Stop) } catch { $qualifier = '' }
+    }
+    if (-not $qualifier -and $env:SystemDrive) { $qualifier = $env:SystemDrive }
+    if ($qualifier -and (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        try {
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $qualifier) -ErrorAction Stop
+            if ($disk) { return $disk }
+        } catch { }
+    }
+    $probe = $Path
+    if (-not $probe) { $probe = (Get-Location).Path }
+    try { $probe = [IO.Path]::GetFullPath($probe) } catch { }
+    $match = $null
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if (-not $d.IsReady) { continue }
+        if ($probe.StartsWith($d.Name, [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $match -or $d.Name.Length -gt $match.Name.Length) { $match = $d }
+        }
+    }
+    if (-not $match) {
+        foreach ($d in [IO.DriveInfo]::GetDrives()) {
+            if ($d.IsReady -and ($d.Name -eq '/' -or $d.Name -eq '\')) { $match = $d; break }
+        }
+    }
+    if (-not $match) { return $null }
+    return [pscustomobject]@{ DeviceID = $match.Name; FreeSpace = [int64]$match.AvailableFreeSpace; Size = [int64]$match.TotalSize }
 }
 
 # ---------------------------------------------------------------- output helpers
 
 function Write-PmLog {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'STEP', 'DEBUG')][string]$Level = 'INFO')
-    [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME }
+    [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = (Get-PmComputerName) }
 }
 
 function Format-PmError {
@@ -77,6 +145,17 @@ function Invoke-PmRobocopy {
         [switch]$Mirror
     )
     if (-not (Test-Path -LiteralPath $Source)) { return -1 }
+    if (-not (Get-Command robocopy.exe -ErrorAction SilentlyContinue)) {
+        # Same copy, used when robocopy is not installed (PowerShell 7 on Linux).
+        try {
+            Copy-PmTreeFallback -Source $Source -Destination $Destination -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
+            $global:PmLastRobocopy = "copy `"$Source`" -> `"$Destination`" (robocopy not installed)"
+            return 1
+        } catch {
+            $global:PmLastRobocopy = "copy `"$Source`" -> `"$Destination`" failed: $($_.Exception.Message)"
+            return 8
+        }
+    }
     # Redirected RDP drives (\\tsclient) do not support all directory attributes.
     $dcopy = if ($Destination.StartsWith('\\') -or $Source.StartsWith('\\')) { '/DCOPY:T' } else { '/DCOPY:DAT' }
     $rcArgs = @($Source.TrimEnd('\'), $Destination.TrimEnd('\'), '/COPY:DAT', $dcopy, '/R:2', '/W:2', '/MT:8', '/XJ', '/NP', '/NFL', '/NDL')
@@ -96,6 +175,29 @@ function Get-PmRobocopyErrors {
     if (-not $global:PmRobocopyLog -or -not (Test-Path -LiteralPath $global:PmRobocopyLog)) { return '' }
     $lines = @(Get-Content -LiteralPath $global:PmRobocopyLog -Tail 400 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'ERROR|Access is denied|cannot|failed' } | Select-Object -Last 5)
     return ($lines -join ' | ')
+}
+
+function Copy-PmTreeFallback {
+    <# Directory copy used only when robocopy.exe is absent. Honours the same exclude lists. #>
+    param([string]$Source, [string]$Destination, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @())
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $blocked = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') })
+    foreach ($item in @(Get-ChildItem -LiteralPath $Source -Force -ErrorAction SilentlyContinue)) {
+        $norm = $item.FullName.Replace('/', '\')
+        if ($item.PSIsContainer) {
+            $skip = $false
+            foreach ($b in $blocked) {
+                if ($norm.Equals($b, [StringComparison]::OrdinalIgnoreCase) -or $norm.StartsWith($b + '\', [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break }
+            }
+            if ($skip) { continue }
+            Copy-PmTreeFallback -Source $item.FullName -Destination (Join-Path $Destination $item.Name) -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
+        } else {
+            $skipFile = $false
+            foreach ($pat in @($ExcludeFiles)) { if ($pat -and $item.Name -like $pat) { $skipFile = $true; break } }
+            if ($skipFile) { continue }
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $Destination $item.Name) -Force
+        }
+    }
 }
 
 function Test-PmRobocopyOk { param([int]$Code) return ($Code -ge 0 -and $Code -lt 8) }
@@ -118,6 +220,7 @@ function Get-PmFileEncoding {
 
 function Get-PmUserProfiles {
     <# Real (non-special) local user profiles: name + path. #>
+    if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) { return @() }
     Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
         Where-Object { -not $_.Special -and $_.LocalPath -and (Test-Path -LiteralPath $_.LocalPath) } |
         ForEach-Object { [pscustomobject]@{ Name = (Split-Path $_.LocalPath -Leaf); Path = $_.LocalPath } }
@@ -196,7 +299,10 @@ function Invoke-PmReg {
     <# Runs reg.exe without letting its stderr chatter turn into PowerShell errors. Returns the exit code. #>
     param([Parameter(Mandatory)][ValidateSet('export', 'import')][string]$Verb, [Parameter(Mandatory)][string]$File, [string]$Key)
     $argLine = if ($Verb -eq 'export') { "export `"$Key`" `"$File`" /y" } else { "import `"$File`"" }
-    $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\reg.exe') -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
+    $sp = @{ FilePath = (Join-Path $env:SystemRoot 'System32\reg.exe'); ArgumentList = $argLine; Wait = $true; PassThru = $true }
+    # -WindowStyle exists on Windows PowerShell 5.1. PowerShell 7 rejects it.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $sp.WindowStyle = 'Hidden' }
+    $p = Start-Process @sp
     return $p.ExitCode
 }
 
@@ -207,7 +313,10 @@ function Get-PmPrtgInfo {
         Installed = $false; Version = $null; ProgramPath = $null; DataPath = $null
         RegistryKeys = @(); CoreStatus = $null; ProbeStatus = $null; ListenPorts = @()
     }
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$PmCoreService'" -ErrorAction SilentlyContinue
+    $svc = $null
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$PmCoreService'" -ErrorAction SilentlyContinue
+    }
     if ($svc) {
         $info.Installed = $true
         $exe = $svc.PathName
@@ -219,7 +328,10 @@ function Get-PmPrtgInfo {
         if (Test-Path -LiteralPath $exe) { $info.Version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion }
         $info.CoreStatus = [string]$svc.State
     }
-    $probe = Get-Service -Name $PmProbeService -ErrorAction SilentlyContinue
+    $probe = $null
+    if (Get-Command Get-Service -ErrorAction SilentlyContinue) {
+        $probe = Get-Service -Name $PmProbeService -ErrorAction SilentlyContinue
+    }
     if ($probe) { $info.ProbeStatus = [string]$probe.Status }
 
     foreach ($k in 'HKLM:\SOFTWARE\WOW6432Node\Paessler', 'HKLM:\SOFTWARE\Paessler') {
@@ -229,8 +341,8 @@ function Get-PmPrtgInfo {
     foreach ($core in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Core', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Core') {
         if (-not $dp -and (Test-Path $core)) { $dp = (Get-ItemProperty -Path $core -ErrorAction SilentlyContinue).Datapath }
     }
-    if (-not $dp) { $dp = Join-Path $env:ProgramData 'Paessler\PRTG Network Monitor' }
-    $info.DataPath = $dp.TrimEnd('\')
+    if (-not $dp -and $env:ProgramData) { $dp = Join-Path $env:ProgramData 'Paessler\PRTG Network Monitor' }
+    $info.DataPath = if ($dp) { $dp.TrimEnd('\').TrimEnd('/') } else { $null }
 
     $proc = Get-Process -Name 'PRTG Server' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($proc) {
@@ -445,8 +557,13 @@ function Set-PmPrtgFirewall {
 # ---------------------------------------------------------------- system info (Test)
 
 function Get-PmSystemInfo {
-    $os = Get-CimInstance Win32_OperatingSystem
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $osCaption = Get-PmOsCaption
+    $osVersion = [Environment]::OSVersion.Version.ToString()
+    $isAdmin = Test-PmIsAdmin
+    $userName = Get-PmCurrentUserName
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try { $osVersion = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Version } catch { }
+    }
     $vpn = @()
     try { $vpn = @(Get-VpnConnection -AllUserConnection -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Server = $_.ServerAddress; Type = [string]$_.TunnelType; Status = [string]$_.ConnectionStatus } }) } catch { }
     $prtg = Get-PmPrtgInfo
@@ -455,15 +572,21 @@ function Get-PmSystemInfo {
         $dataSize = Get-PmDirectorySize -Path $prtg.DataPath
         $stats = Get-PmPrtgConfigStats -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat')
     }
-    $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
-            [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    $disks = @()
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    } else {
+        $disks = @(Get-PmLogicalDisk -Path (Get-PmWorkRoot) | Where-Object { $_ } | ForEach-Object {
+                [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    }
 
     New-PmResult @{
         Computer     = $env:COMPUTERNAME
-        OS           = $os.Caption
-        OSVersion    = $os.Version
-        IsAdmin      = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        User         = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        OS           = $osCaption
+        OSVersion    = $osVersion
+        IsAdmin      = $isAdmin
+        User         = $userName
         Prtg         = $prtg
         PrtgDataGB   = [math]::Round($dataSize / 1GB, 2)
         PrtgConfigStats = $stats
@@ -498,7 +621,7 @@ function Invoke-PmRemoteBackup {
         [string]$LogDir,
         # WinRM pull mode: big folders are NOT copied here - the manager pulls them straight from the snapshot.
         [bool]$PullMode = $false,
-        # StageDir is the other server (UNC over a tunnel). Nothing is written on the manager.
+        # Kept so an older caller can still ask for a direct stage. Tunnel jobs no longer use it.
         [bool]$TunnelCopy = $false
     )
     $ErrorActionPreference = 'Stop'
@@ -517,7 +640,7 @@ function Invoke-PmRemoteBackup {
     $manifest = [ordered]@{
         tool = 'prtg-mover'; formatVersion = 1; jobId = $JobId
         createdUtc = (Get-Date).ToUniversalTime().ToString('o')
-        source = [ordered]@{ computer = $env:COMPUTERNAME; os = (Get-CimInstance Win32_OperatingSystem).Caption }
+        source = [ordered]@{ computer = $env:COMPUTERNAME; os = (Get-PmOsCaption) }
         prtg = [ordered]@{ included = $false }
         vpn = [ordered]@{ included = $false; allUsers = @(); users = @{} }
         desktop = [ordered]@{ included = $false; users = @() }
@@ -624,7 +747,10 @@ function Invoke-PmRemoteBackup {
                     $svcDir = Join-Path $stage 'prtg\services'
                     New-Item -ItemType Directory -Force -Path $svcDir | Out-Null
                     foreach ($n in $PmCoreService, $PmProbeService) {
-                        $w = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+                        $w = $null
+                        if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+                            $w = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+                        }
                         if (-not $w) { continue }
                         [void](Invoke-PmReg -Verb export -Key "HKLM\SYSTEM\CurrentControlSet\Services\$n" -File (Join-Path $svcDir "$n.reg"))
                         $services += [ordered]@{ name = $w.Name; displayName = $w.DisplayName; pathName = $w.PathName; startMode = $w.StartMode; startName = $w.StartName; description = $w.Description }
@@ -838,11 +964,12 @@ function Invoke-PmRemoteRestore {
         if (-not (Test-Path -LiteralPath (Join-Path $stage 'manifest.json'))) { throw "Staged package not found at $stage" }
         $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
         $need = [int64]$manifest.stagingBytes
-        $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+        $drive = if ($env:SystemDrive) { Get-PmLogicalDisk -Path ($env:SystemDrive + '\') } else { Get-PmLogicalDisk -Path $stage }
         # Local stage + move: the data already occupies the disk, only a margin is needed.
         $required = if ($MoveFromStage) { [int64]1GB } else { [int64]($need * 1.1 + 1GB) }
         if ($drive -and $drive.FreeSpace -lt $required) { throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB)) }
-        Write-PmLog ("Reading the staged package from {0}. Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK'
+        if ($drive) { Write-PmLog ("Reading the staged package from {0}. Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK' }
+        else { Write-PmLog "Reading the staged package from $stage. Disk free space could not be read." 'WARN' }
     }
     if (-not $direct -and $ExpectedSha256) {
         Write-PmProgress 2 'Verifying package checksum'
@@ -855,7 +982,7 @@ function Invoke-PmRemoteRestore {
     $need = 0
     $zr = [IO.Compression.ZipFile]::OpenRead($ZipPath)
     try { foreach ($e in $zr.Entries) { $need += $e.Length } } finally { $zr.Dispose() }
-    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $drive = Get-PmLogicalDisk -Path $WorkRoot
     $required = [int64]($need * 2 + 1GB)   # extracted staging + restored data + margin
     if ($drive -and $drive.FreeSpace -lt $required) {
         throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB))
@@ -1146,14 +1273,15 @@ function Get-PmPullList {
     param([Parameter(Mandatory)][string]$Source, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @(), [switch]$Raw)
     $list = New-Object System.Collections.ArrayList
     if (Test-Path -LiteralPath $Source) {
-        $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
-        $xd = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' })
+        $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\').TrimEnd('/')
+        $xd = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') + '\' })
         foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
-            $full = $f.FullName
+            $full = $f.FullName.Replace('/', '\')
             if (@($xd | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
             if (@($ExcludeFiles | Where-Object { $f.Name -like $_ }).Count) { continue }
             if ($f.Name -in 'desktop.ini', 'Thumbs.db') { continue }   # Windows shell junk
-            [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($root.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
+            $relRoot = $root.Replace('/', '\')
+            [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($relRoot.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
         }
     }
     if ($Raw) { return $list }
@@ -1265,15 +1393,14 @@ function Initialize-PmRemoteWorkRoot {
     param([string]$WorkRoot)
     if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
     New-Item -ItemType Directory -Force -Path (Join-Path $WorkRoot 'in') | Out-Null
-    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $drive = Get-PmLogicalDisk -Path $WorkRoot
     $prtg = Get-PmPrtgInfo
     $dataBytes = 0
     if ($prtg.Installed) { $dataBytes = Get-PmDirectorySize -Path $prtg.DataPath }
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     New-PmResult @{
         WorkRoot = $WorkRoot; Inbox = (Join-Path $WorkRoot 'in'); Prtg = $prtg; Computer = $env:COMPUTERNAME
-        FreeBytes = [int64]$drive.FreeSpace; PrtgDataBytes = [int64]$dataBytes
-        IsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        FreeBytes = $(if ($drive) { [int64]$drive.FreeSpace } else { [int64]0 }); PrtgDataBytes = [int64]$dataBytes
+        IsAdmin = (Test-PmIsAdmin)
     }
 }
 
@@ -1473,7 +1600,6 @@ function Enable-PmWireGuardEndpoint {
     }
     New-NetFirewallRule -Name 'PrtgMover-WireGuard' -DisplayName 'PRTG Mover WireGuard' -Enabled True -Direction Inbound -Action Allow -Protocol UDP -LocalPort $ListenPort -RemoteAddress $peerIps -Profile Any | Out-Null
     New-NetFirewallRule -Name 'PrtgMover-Tunnel-ICMP' -DisplayName 'PRTG Mover tunnel ICMP' -Enabled True -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -RemoteAddress '10.66.66.0/24' -Profile Any | Out-Null
-    New-NetFirewallRule -Name 'PrtgMover-Tunnel-SMB' -DisplayName 'PRTG Mover tunnel SMB' -Enabled True -Direction Inbound -Action Allow -Protocol TCP -LocalPort 445 -RemoteAddress '10.66.66.0/24' -Profile Any | Out-Null
 
     $ui = 'C:\Program Files\WireGuard\wireguard.exe'
     if (Get-Service -Name 'WireGuardTunnel$prtg' -ErrorAction SilentlyContinue) {
@@ -1556,6 +1682,202 @@ function Disconnect-PmUncShare {
     param([Parameter(Mandatory)][string]$RemoteName)
     if ('PmNetUse' -as [type]) { [void][PmNetUse]::WNetCancelConnection2($RemoteName, 0, $true) }
     New-PmResult @{ RemoteName = $RemoteName; Ok = $true }
+}
+
+function Test-PmTunnelPeer {
+    <# WinRM on the tunnel may only dial 10.66.66.x or 10.66.67.x. #>
+    param([string]$Ip)
+    return ((Test-PmTunnelHost $Ip) -or (Test-PmIpipHost $Ip))
+}
+
+function Enable-PmTunnelWinRm {
+    <#
+        WinRM listens for the other server. TCP 5985 is allowed only from the tunnel
+        network, never from the public address. Same point-to-point shape as a
+        bandwidth test aimed at the tunnel address.
+    #>
+    param([Parameter(Mandatory)][string]$TunnelNetwork)
+    if ($TunnelNetwork -notin @('10.66.66.0/24', '10.66.67.0/24')) {
+        throw "WinRM on the tunnel only accepts 10.66.66.0/24 or 10.66.67.0/24, not '$TunnelNetwork'."
+    }
+    $ErrorActionPreference = 'Stop'
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+    Set-Service WinRM -StartupType Automatic
+    Start-Service WinRM
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force | Out-Null
+    Set-Item WSMan:\localhost\MaxEnvelopeSizekb 8192
+    Set-Item WSMan:\localhost\Shell\MaxMemoryPerShellMB 4096
+    $name = 'PrtgMover-Tunnel-WinRM'
+    if (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -Name $name }
+    New-NetFirewallRule -Name $name -DisplayName 'PRTG Mover tunnel WinRM' -Enabled True -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5985 -RemoteAddress $TunnelNetwork -Profile Any | Out-Null
+    Write-PmLog "WinRM TCP 5985 is open only from $TunnelNetwork (not from the public address)." 'OK'
+    New-PmResult @{ Port = 5985; Network = $TunnelNetwork }
+}
+
+function Open-PmTunnelWinRmSession {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Passed once over the already-authenticated command channel so this server can sign in to the peer over the tunnel. Never logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'The peer is a tunnel address. The password is turned into a PSCredential and is not logged.')]
+    param(
+        [Parameter(Mandatory)][string]$PeerTunnelIp,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password
+    )
+    if (-not (Test-PmTunnelPeer $PeerTunnelIp)) { throw "Refusing WinRM to '$PeerTunnelIp'. The session must use the tunnel address (10.66.66.x or 10.66.67.x)." }
+    $item = Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue
+    $cur = if ($item) { [string]$item.Value } else { '' }
+    $parts = @($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne '*' })
+    if ($parts -notcontains $PeerTunnelIp) {
+        $parts += $PeerTunnelIp
+        Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value ($parts -join ',') -Force
+    }
+    $secure = ConvertTo-SecureString $Password -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($UserName, $secure)
+    $opt = New-PSSessionOption -OpenTimeout 60000 -OperationTimeout 14400000 -IdleTimeout 14400000
+    New-PSSession -ComputerName $PeerTunnelIp -Port 5985 -Credential $cred -Authentication Negotiate -SessionOption $opt -ErrorAction Stop
+}
+
+function Measure-PmTunnelWinRm {
+    <#
+        Sends 32 MB to the peer's tunnel address over WinRM and reports MB/s.
+        The bytes take the tunnel path, the same way a point-to-point bandwidth test would.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Used only to open the tunnel WinRM session. Never logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Required to sign in to the peer tunnel address.')]
+    param(
+        [Parameter(Mandatory)][string]$PeerTunnelIp,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-PmTunnelPeer $PeerTunnelIp)) { throw "Refusing WinRM to '$PeerTunnelIp'. The session must use the tunnel address (10.66.66.x or 10.66.67.x)." }
+    $session = Open-PmTunnelWinRmSession -PeerTunnelIp $PeerTunnelIp -UserName $UserName -Password $Password
+    $local = Join-Path ([IO.Path]::GetTempPath()) 'prtg-mover-winrm-probe.bin'
+    try {
+        $remoteDir = 'C:\PrtgMover\tunnel\probe'
+        Invoke-Command -Session $session -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $remoteDir
+        $remote = Join-Path $remoteDir 'probe.bin'
+        $fs = [IO.File]::Open($local, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+        try {
+            $buf = New-Object byte[] 1048576
+            for ($i = 0; $i -lt $buf.Length; $i++) { $buf[$i] = [byte]($i -band 255) }
+            for ($n = 0; $n -lt 32; $n++) { $fs.Write($buf, 0, $buf.Length) }
+        } finally { $fs.Dispose() }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Copy-Item -ToSession $session -LiteralPath $local -Destination $remote -Force
+        $sw.Stop()
+        Invoke-Command -Session $session -ScriptBlock { param($p) Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } -ArgumentList $remote
+        $rate = 32 / [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
+        Write-PmLog ("WinRM {0}:5985  32 MB in {1:N2} s ({2:N1} MB/s). Point to point on the tunnel, the same shape as a bandwidth test." -f $PeerTunnelIp, $sw.Elapsed.TotalSeconds, $rate) 'OK'
+        New-PmResult @{ Peer = $PeerTunnelIp; Port = 5985; Megabytes = 32; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 2); MegabytesPerSecond = [math]::Round($rate, 1) }
+    } finally {
+        Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue
+        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+    }
+}
+
+function Send-PmTunnelWinRmBatch {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string[]]$Files
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $chunk = Join-Path ([IO.Path]::GetTempPath()) ('pm-tunnel-{0}.zip' -f [guid]::NewGuid().ToString('N'))
+    $remoteChunk = 'C:\PrtgMover\tunnel\chunks\{0}.zip' -f [guid]::NewGuid().ToString('N')
+    $zip = [IO.Compression.ZipFile]::Open($chunk, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($rel in $Files) {
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $Source $rel), $rel.Replace('\', '/'), [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $zip.Dispose() }
+    try {
+        Invoke-Command -Session $Session -ScriptBlock { param($p) New-Item -ItemType Directory -Force -Path (Split-Path $p -Parent) | Out-Null } -ArgumentList $remoteChunk
+        Copy-Item -ToSession $Session -LiteralPath $chunk -Destination $remoteChunk -Force
+        $size = [int64](Get-Item -LiteralPath $chunk).Length
+        Invoke-Command -Session $Session -ScriptBlock {
+            param($ChunkPath, $Dest)
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $opened = [IO.Compression.ZipFile]::OpenRead($ChunkPath)
+            try {
+                foreach ($e in $opened.Entries) {
+                    if (-not $e.Name) { continue }
+                    $target = Join-Path $Dest ($e.FullName.Replace('/', '\'))
+                    $dir = Split-Path $target -Parent
+                    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+                    [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+                }
+            } finally { $opened.Dispose() }
+            Remove-Item -LiteralPath $ChunkPath -Force -ErrorAction SilentlyContinue
+        } -ArgumentList $remoteChunk, $Destination
+        New-PmResult @{ WireBytes = $size; Count = $Files.Count }
+    } finally {
+        Remove-Item -LiteralPath $chunk -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Send-PmTunnelWinRmCopy {
+    <# Pushes the staged files to the other server over WinRM, using only its tunnel address. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Used only to open the tunnel WinRM session. Never logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Required to sign in to the peer tunnel address.')]
+    param(
+        [Parameter(Mandatory)][string]$PeerTunnelIp,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password,
+        [Parameter(Mandatory)][string]$Destination,
+        [string]$StageDir,
+        [object[]]$PullItems = @()
+    )
+    $ErrorActionPreference = 'Stop'
+    if ($Destination -notmatch '^C:\\PrtgMover\\tunnel(\\|$)') { throw "Refusing to write WinRM data to '$Destination'." }
+    if (-not (Test-PmTunnelPeer $PeerTunnelIp)) { throw "Refusing WinRM to '$PeerTunnelIp'. The session must use the tunnel address (10.66.66.x or 10.66.67.x)." }
+    $session = Open-PmTunnelWinRmSession -PeerTunnelIp $PeerTunnelIp -UserName $UserName -Password $Password
+    $wire = [int64]0
+    $fileCount = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        Invoke-Command -Session $session -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $Destination
+        $roots = New-Object System.Collections.Generic.List[object]
+        if ($StageDir -and (Test-Path -LiteralPath $StageDir)) {
+            $roots.Add([pscustomobject]@{ Source = $StageDir; Target = ''; ExcludeDirs = @(); ExcludeFiles = @() })
+        }
+        foreach ($pi in @($PullItems)) {
+            $src = [string]$pi.Source
+            if (-not $src) { continue }
+            $roots.Add([pscustomobject]@{ Source = $src; Target = [string]$pi.Target; ExcludeDirs = @($pi.ExcludeDirs); ExcludeFiles = @($pi.ExcludeFiles) })
+        }
+        foreach ($root in $roots) {
+            $list = @(Get-PmPullList -Source $root.Source -ExcludeDirs @($root.ExcludeDirs) -ExcludeFiles @($root.ExcludeFiles) -Raw)
+            $destRoot = if ($root.Target) { Join-Path $Destination $root.Target } else { $Destination }
+            Invoke-Command -Session $session -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $destRoot
+            $batch = New-Object System.Collections.Generic.List[string]
+            $batchBytes = [int64]0
+            foreach ($f in $list) {
+                $batch.Add([string]$f.Rel)
+                $batchBytes += [int64]$f.Size
+                if ($batchBytes -ge 256MB) {
+                    $sent = Send-PmTunnelWinRmBatch -Session $session -Source $root.Source -Destination $destRoot -Files @($batch)
+                    $wire += [int64]$sent.WireBytes
+                    $fileCount += [int]$sent.Count
+                    $batch.Clear()
+                    $batchBytes = 0
+                    $rate = ($wire / 1MB) / [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
+                    Write-PmLog ("WinRM {0}:5985  {1:N1} MB on the wire so far ({2:N1} MB/s)." -f $PeerTunnelIp, ($wire / 1MB), $rate) 'INFO'
+                }
+            }
+            if ($batch.Count -gt 0) {
+                $sent = Send-PmTunnelWinRmBatch -Session $session -Source $root.Source -Destination $destRoot -Files @($batch)
+                $wire += [int64]$sent.WireBytes
+                $fileCount += [int]$sent.Count
+            }
+        }
+        $sw.Stop()
+        $rate = ($wire / 1MB) / [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
+        Write-PmLog ("WinRM copy to {0}:5985 finished: {1} file(s), {2:N1} MB on the wire, {3:N1} MB/s." -f $PeerTunnelIp, $fileCount, ($wire / 1MB), $rate) 'OK'
+        New-PmResult @{ Files = $fileCount; WireBytes = $wire; MegabytesPerSecond = [math]::Round($rate, 1); Destination = $Destination }
+    } finally {
+        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+    }
 }
 
 function Test-PmTunnelPing {
@@ -1666,7 +1988,6 @@ function Enable-PmIpipEndpoint {
     }
     New-NetFirewallRule -Name 'PrtgMover-IPIP' -DisplayName 'PRTG Mover IPIP' -Enabled True -Direction Inbound -Action Allow -Protocol 4 -RemoteAddress $peerIps -Profile Any | Out-Null
     New-NetFirewallRule -Name 'PrtgMover-IPIP-ICMP' -DisplayName 'PRTG Mover IPIP ICMP' -Enabled True -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -RemoteAddress '10.66.67.0/24' -Profile Any | Out-Null
-    New-NetFirewallRule -Name 'PrtgMover-IPIP-SMB' -DisplayName 'PRTG Mover IPIP SMB' -Enabled True -Direction Inbound -Action Allow -Protocol TCP -LocalPort 445 -RemoteAddress '10.66.67.0/24' -Profile Any | Out-Null
 
     $task = 'PRTG Mover IPIP'
     Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue

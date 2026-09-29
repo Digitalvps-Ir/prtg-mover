@@ -109,7 +109,7 @@
             <option value="wireguard">WireGuard — tunnel between the two Windows servers</option>
             <option value="ipip">IPIP — tunnel between the two Windows servers</option>
           </select></label>
-          <p class="hint" id="transferHint">RDP and WinRM copy the files through this computer. WireGuard and IPIP build a tunnel between the two servers and copy only there. This computer sends commands and does not keep the backup.</p>
+          <p class="hint" id="transferHint">RDP and WinRM copy the files through this computer. WireGuard and IPIP build a tunnel between the two servers, then WinRM (TCP 5985) carries the files from one tunnel address to the other. This computer sends commands and does not keep the backup.</p>
           <h2 class="mt">4 · Source server</h2>
           <label class="check notouch"><input type="checkbox" name="NoTouch" checked> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
           <div id="sourceAfterBox" class="disabled">

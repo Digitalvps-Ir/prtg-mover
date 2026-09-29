@@ -125,7 +125,7 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         New-Item -ItemType Directory -Force -Path (Join-Path $src 'sub') | Out-Null
         ('x' * 100000) | Set-Content (Join-Path $src 'sub\big.txt')
         'hidden' | Set-Content (Join-Path $src 'h.dat')
-        (Get-Item (Join-Path $src 'h.dat')).Attributes = 'Hidden'
+        try { (Get-Item (Join-Path $src 'h.dat')).Attributes = 'Hidden' } catch { }
         $c = (New-PmTransferChunk -Source $src -Files @('sub\big.txt', 'h.dat')) | Where-Object PmType -eq 'result'
         $c.Size | Should -BeLessThan 100000
         $dst = Join-Path $Work 'chunk-dst'
@@ -151,8 +151,14 @@ Describe 'RDP agent transport (end to end, local)' {
         $env:PRTGMOVER_TSCLIENT_ROOT = $Root   # the local "agent" reaches the manager folder directly, not via \\tsclient
         Set-PmRoot -Path $Root   # the agent resolves the manager folder from its own location
         $script:AgentSrv = Set-PmServer -Name 'PESTER-AGENT' -HostName '127.0.0.1' -Transport rdp
-        $script:AgentProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-            (Join-Path $Root 'agent\PrtgMover-Agent.ps1'), '-ServerId', $AgentSrv.id, '-AllowNonAdmin'
+        $agentStart = @{
+            FilePath = (Get-Process -Id $PID).Path
+            PassThru = $true
+            ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'agent\PrtgMover-Agent.ps1'), '-ServerId', $script:AgentSrv.id, '-AllowNonAdmin')
+        }
+        # -WindowStyle is Windows PowerShell 5.1 only. PowerShell 7 rejects the parameter.
+        if ($PSVersionTable.PSEdition -eq 'Desktop') { $agentStart.WindowStyle = 'Hidden' }
+        $script:AgentProc = Start-Process @agentStart
     }
     AfterAll {
         if ($script:AgentProc) { Stop-Process -Id $AgentProc.Id -Force -ErrorAction SilentlyContinue }
@@ -495,5 +501,17 @@ Describe 'WireGuard tunnel config' {
         Test-PmTunnelShare '\\203.0.113.8\C$' | Should -BeFalse
         { Assert-PmTransferSelection -Transfer 'ipip' -JobType 'backup' -TargetCount 0 } | Should -Throw
         { Assert-PmTransferSelection -Transfer 'ipip' -JobType 'migrate' -TargetCount 1 } | Should -Not -Throw
+    }
+
+    It 'only allows WinRM to a tunnel address' {
+        Test-PmTunnelPeer '10.66.66.2' | Should -BeTrue
+        Test-PmTunnelPeer '10.66.67.1' | Should -BeTrue
+        Test-PmTunnelPeer '203.0.113.8' | Should -BeFalse
+        Test-PmTunnelPeer '0.0.0.0' | Should -BeFalse
+        { Enable-PmTunnelWinRm -TunnelNetwork '0.0.0.0/0' } | Should -Throw
+        { Enable-PmTunnelWinRm -TunnelNetwork '203.0.113.0/24' } | Should -Throw
+        { Measure-PmTunnelWinRm -PeerTunnelIp '203.0.113.8' -UserName '.\Administrator' -Password 'x' } | Should -Throw
+        { Send-PmTunnelWinRmCopy -PeerTunnelIp '10.66.66.2' -UserName '.\Administrator' -Password 'x' -Destination 'D:\data' } | Should -Throw
+        { Send-PmTunnelWinRmCopy -PeerTunnelIp '203.0.113.8' -UserName '.\Administrator' -Password 'x' -Destination 'C:\PrtgMover\tunnel\job' } | Should -Throw
     }
 }
