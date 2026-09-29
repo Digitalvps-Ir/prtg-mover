@@ -27,10 +27,14 @@
 .EXAMPLE
     # A migrated PRTG only answers on 127.0.0.1: bind its web server to the server's own address
     .\cli\Invoke-PrtgMover.ps1 -Action FixBinding -Target PRTG-NEW1
+
+.EXAMPLE
+    # Remove the PRTG license data from a migrated server (never from a source server)
+    .\cli\Invoke-PrtgMover.ps1 -Action RemoveLicense -Target PRTG-NEW1
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)][ValidateSet('Test', 'Backup', 'Restore', 'Migrate', 'FixBinding')][string]$Action,
+    [Parameter(Mandatory)][ValidateSet('Test', 'Backup', 'Restore', 'Migrate', 'FixBinding', 'RemoveLicense')][string]$Action,
     [string]$Source,
     [string[]]$Target = @(),
     [string]$BackupName,
@@ -119,6 +123,10 @@ try {
                 $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -BackupPath $file -Options $options -Job $job
                 if (@($rep.Errors).Count) { $exit = 2 }
             }
+        }
+        'RemoveLicense' {
+            if (-not $Target) { throw '-Target is required.' }
+            $job.result = @(foreach ($ref in $Target) { $srv = Resolve-CliServer $ref; Invoke-PmUnlicenseFlow -Server $srv -Credential (Get-CliCredential $srv) -Job $job -Options $options })
         }
         'FixBinding' {
             if (-not $Target) { throw '-Target is required.' }

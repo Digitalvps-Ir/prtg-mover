@@ -171,7 +171,9 @@
           const ls = info.PrtgLicenseState;
           let lic = '';
           if (ls && ls.Known) {
-            lic = ls.NeedsActivation
+            lic = (ls.NeedsActivation && !ls.Name)
+              ? `<span class="badge warn" title="${esc(ls.Edition)} · No license is installed on this server. Enter one in PRTG: Setup → License Information.">license: none</span>`
+              : ls.NeedsActivation
               ? `<span class="badge err" title="${esc(ls.Edition)}${ls.LastError ? ` · ${esc(ls.LastError)}` : ''} · A PRTG license is bound to the server it was activated on. Activate it for this server in PRTG: Setup → License Information.">license: activation needed</span>`
               : `<span class="badge ok" title="${esc(ls.Edition)} · ${esc(ls.MaxSensors)} sensors">license ok</span>`;
           }
@@ -196,6 +198,7 @@
           <button class="btn small" data-act="test-rdp" data-id="${esc(s.id)}">Test RDP</button>
           <button class="btn small" data-act="test-winrm" data-id="${esc(s.id)}">Test WinRM</button>
           ${localOnly && s.role !== 'source' && s.transport === 'winrm' ? `<button class="btn small primary" data-act="rebind" data-id="${esc(s.id)}" title="PRTG on this server only answers on 127.0.0.1 because its web server is still bound to the old server's address. This binds it to this server's address and restarts PRTG. New migrations do this automatically.">Make PRTG reachable</button>` : ''}
+          ${s.role !== 'source' && s.transport === 'winrm' && info && info.Prtg && info.Prtg.Installed && info.PrtgLicenseState && info.PrtgLicenseState.Known && info.PrtgLicenseState.Name ? `<button class="btn small danger" data-act="unlicense" data-id="${esc(s.id)}" title="Removes the license name and key from the PRTG on this server. A copy is kept on the server. Not available for source servers.">Remove license</button>` : ''}
           <button class="btn small" data-act="edit" data-id="${esc(s.id)}">Edit</button>
           <button class="btn small danger" data-act="del" data-id="${esc(s.id)}">Delete</button>
         </div></td></tr>`;
@@ -211,6 +214,7 @@
     const s = state.servers.find((x) => x.id === b.dataset.id);
     if (b.dataset.act === 'test-rdp') startJob({ type: 'test', mode: 'rdp', serverIds: [s.id] });
     if (b.dataset.act === 'test-winrm') startJob({ type: 'test', mode: 'winrm', serverIds: [s.id] });
+    if (b.dataset.act === 'unlicense' && confirm(`Remove the PRTG license from "${s.name}" (${s.host})?\n\nPRTG is restarted there without a license. License name and key are removed; a copy is kept on the server. Configuration and monitoring data stay.\n\nThe source server is not contacted.`)) startJob({ type: 'unlicense', serverIds: [s.id] });
     if (b.dataset.act === 'rebind' && confirm(`Bind the PRTG web server on "${s.name}" to this server's address (${s.host}) and restart PRTG there?`)) startJob({ type: 'rebind', serverIds: [s.id] });
     if (b.dataset.act === 'rdp') {
       try {

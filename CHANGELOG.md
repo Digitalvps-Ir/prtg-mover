@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.6.1 — 2026-09-29
+
+### Added
+- **Remove license** for a migrated server (Servers page, job type `unlicense`, command line `-Action RemoveLicense -Target <server>`). PRTG is stopped, license name, key, hash and license files are removed, and PRTG is started again. A copy of the removed data is kept on the server in `C:\PrtgMover\rollback\license-<timestamp>`. System id, configuration and monitoring data are not changed.
+- A source server is always refused: the license of the original installation is never touched.
+- A server with no license name is shown as **license: none**, separate from a license that still needs activation.
+
 ## 1.6.0 — 2026-09-29
 
 ### Added

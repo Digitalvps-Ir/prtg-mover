@@ -421,6 +421,79 @@ Describe 'Resume' {
     }
 }
 
+Describe 'Removing the PRTG license from a migrated server' -Skip:($env:OS -ne 'Windows_NT') {
+    BeforeAll {
+        $script:LicKey = "HKCU:\Software\PrtgMoverTest-$([guid]::NewGuid().ToString('N'))"
+        $script:LicData = Join-Path $Work 'lic-data'
+        $env:PRTGMOVER_WORKROOT = Join-Path $Work 'lic-workroot'
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:LicKey -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\PRTGMOVER_WORKROOT -ErrorAction SilentlyContinue
+    }
+    BeforeEach {
+        Remove-Item -LiteralPath $script:LicKey -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -Path "$($script:LicKey)\Server\Core" -Force | Out-Null
+        Set-ItemProperty -Path "$($script:LicKey)\Server" -Name LicenseName -Value 'demo'
+        Set-ItemProperty -Path "$($script:LicKey)\Server" -Name LicenseKey -Value '000000-AAAAAA-BBBBBB'
+        Set-ItemProperty -Path "$($script:LicKey)\Server" -Name LicenseHash -Value 'abc'
+        Set-ItemProperty -Path "$($script:LicKey)\Server" -Name SensorCountPausedByLicenseMax -Value '3'
+        Set-ItemProperty -Path "$($script:LicKey)\Server\Core" -Name SystemId -Value '{1}'
+        Set-ItemProperty -Path "$($script:LicKey)\Server\Core" -Name Datapath -Value $script:LicData
+        New-Item -ItemType Directory -Force -Path $script:LicData | Out-Null
+        'lic' | Set-Content (Join-Path $script:LicData 'PRTG License.dat')
+        'cfg' | Set-Content (Join-Path $script:LicData 'PRTG Configuration.dat')
+
+        Mock Get-PmPrtgInfo { [pscustomobject]@{ Installed = $true; DataPath = $script:LicData; RegistryKeys = @($script:LicKey); ListenPorts = @(); CoreStatus = 'Running' } }
+        Mock Get-PmLicenseValues {
+            $keys = @(Get-Item -LiteralPath $script:LicKey) + @(Get-ChildItem -LiteralPath $script:LicKey -Recurse)
+            foreach ($k in $keys) { foreach ($n in $k.GetValueNames()) { if ($n -match 'licen') { [pscustomobject]@{ Path = $k.PSPath; Name = $n; Kind = $k.GetValueKind($n); Value = $k.GetValue($n) } } } }
+        }
+        Mock Stop-PmPrtgServices { }
+        Mock Invoke-PmReg { 'saved' | Set-Content -LiteralPath $File; 0 }
+        Mock Invoke-PmHealthCheck { $Box.Health = [pscustomobject]@{ Healthy = $true; Url = 'https://localhost/ (HTTP 200)'; Message = '' } }
+        Mock Get-PmPrtgLicenseState { [pscustomobject]@{ Known = $true; Edition = 'No License (System Changed)'; Name = 'demo'; MaxSensors = 0; NeedsActivation = $true } }
+    }
+
+    It 'removes the license values and files, keeps everything else and saves a copy first' {
+        $r = @(Remove-PmPrtgLicense) | Where-Object PmType -eq 'result'
+        @($r.Removed) | Should -Contain 'LicenseKey'
+        @($r.Removed) | Should -Contain 'LicenseName'
+        @($r.Removed) | Should -Contain 'PRTG License.dat'
+        (Get-Item "$($script:LicKey)\Server").GetValueNames() | Should -BeNullOrEmpty
+        (Get-ItemProperty "$($script:LicKey)\Server\Core").SystemId | Should -Be '{1}'
+        (Get-ItemProperty "$($script:LicKey)\Server\Core").Datapath | Should -Be $script:LicData
+        Test-Path (Join-Path $script:LicData 'PRTG License.dat') | Should -BeFalse
+        Test-Path (Join-Path $script:LicData 'PRTG Configuration.dat') | Should -BeTrue
+        Test-Path (Join-Path $r.Rollback 'PRTG License.dat') | Should -BeTrue
+        @(Get-ChildItem $r.Rollback -Filter '*.reg').Count | Should -Be 1
+        $r.Healthy | Should -BeTrue
+        Should -Invoke Stop-PmPrtgServices -Times 1 -Exactly
+    }
+
+    It 'changes nothing when the copy of the license data cannot be saved' {
+        Mock Invoke-PmReg { 1 }
+        { Remove-PmPrtgLicense } | Should -Throw '*nothing was removed*'
+        (Get-ItemProperty "$($script:LicKey)\Server").LicenseKey | Should -Be '000000-AAAAAA-BBBBBB'
+        Should -Invoke Stop-PmPrtgServices -Times 0 -Exactly
+    }
+
+    It 'does nothing on a server without license data' {
+        Remove-ItemProperty -Path "$($script:LicKey)\Server" -Name LicenseName, LicenseKey, LicenseHash, SensorCountPausedByLicenseMax
+        Remove-Item (Join-Path $script:LicData 'PRTG License.dat')
+        $r = @(Remove-PmPrtgLicense) | Where-Object PmType -eq 'result'
+        @($r.Removed).Count | Should -Be 0
+        Should -Invoke Stop-PmPrtgServices -Times 0 -Exactly
+    }
+
+    It 'never runs against a source server or over the RDP method' {
+        $src = [pscustomobject]@{ id = 'x'; name = 'OLD'; host = '192.0.2.1'; role = 'source'; transport = 'winrm' }
+        { Invoke-PmUnlicenseFlow -Server $src } | Should -Throw '*source*'
+        $rdp = [pscustomobject]@{ id = 'y'; name = 'NEW'; host = '192.0.2.2'; role = 'target'; transport = 'rdp' }
+        { Invoke-PmUnlicenseFlow -Server $rdp } | Should -Throw '*WinRM*'
+    }
+}
+
 Describe 'Manager module' {
     BeforeAll {
         $mgr = Join-Path $Work 'manager'

@@ -298,6 +298,10 @@ function Invoke-PmRoute {
                     $params.Mode = if ($b.mode -in 'rdp', 'winrm') { [string]$b.mode } else { 'auto' }
                     $summary = "Test ($($params.Mode.ToUpper())): " + (($params.ServerIds | ForEach-Object { $names[$_] }) -join ', ')
                 }
+                'unlicense' {
+                    $params.ServerIds = [string[]]@($b.serverIds)
+                    $summary = 'Remove PRTG license: ' + (($params.ServerIds | ForEach-Object { $names[$_] }) -join ', ')
+                }
                 'rebind' {
                     $params.ServerIds = [string[]]@($b.serverIds)
                     $summary = 'Fix PRTG web binding: ' + (($params.ServerIds | ForEach-Object { $names[$_] }) -join ', ')

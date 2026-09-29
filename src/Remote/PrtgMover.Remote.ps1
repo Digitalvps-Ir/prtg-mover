@@ -647,6 +647,73 @@ function Get-PmPrtgLicenseState {
     return (ConvertTo-PmLicenseState -LogLines @($rep.LogLines) -PausedByLicense $paused)
 }
 
+function Remove-PmPrtgLicense {
+    <#
+        Removes the PRTG license data from THIS server: license name, key, hash and install
+        date in the registry, and license files in the data folder. PRTG is stopped first,
+        because the core writes its settings back when it stops. A copy of what is removed is
+        kept in <work root>\rollback\license-<timestamp>.
+        Nothing else is changed: system id, configuration and monitoring data stay as they are.
+    #>
+    param([int]$HealthTimeoutMinutes = 10, [bool]$StartServices = $true)
+    $ErrorActionPreference = 'Stop'
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server.' }
+    $describe = { param($s) if ($s -and $s.Known) { "$($s.Edition), licensed for `"$($s.Name)`", $($s.MaxSensors) sensors" } else { 'no license line in the core log' } }
+    $before = Get-PmPrtgLicenseState
+    Write-PmLog "License before: $(& $describe $before)"
+    $values = @(Get-PmLicenseValues)
+    $files = @(Get-PmLicenseFiles -DataPath $prtg.DataPath)
+    if (-not $values.Count -and -not $files.Count) {
+        Write-PmLog 'There is no license data on this server - nothing to remove.' 'OK'
+        return (New-PmResult @{ Removed = @(); Rollback = $null; Before = $before; After = $before; Healthy = $null; WebUrl = $null; Core = $prtg.CoreStatus })
+    }
+
+    Write-PmProgress 10 'Saving a copy of the license data'
+    $keep = Join-Path (Get-PmWorkRoot) ('rollback\license-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Force -Path $keep | Out-Null
+    foreach ($k in @($prtg.RegistryKeys)) {
+        $native = $k -replace '^HKLM:\\', 'HKLM\'
+        if ((Invoke-PmReg -Verb export -Key $native -File (Join-Path $keep (($native -replace '[\\: ]', '_') + '.reg'))) -ne 0) { throw "Could not save a copy of $native - nothing was removed." }
+    }
+    foreach ($f in $files) { Copy-Item -LiteralPath $f.FullName -Destination $keep -Force }
+    Write-PmLog "Copy of the license data (to undo this): $keep" 'OK'
+
+    Write-PmProgress 25 'Stopping PRTG'
+    Write-PmLog 'Stopping PRTG (license data can only be removed while the core is stopped)...' 'STEP'
+    Stop-PmPrtgServices
+    Write-PmProgress 45 'Removing license data'
+    $removed = @()
+    foreach ($v in @(Get-PmLicenseValues)) {
+        Remove-ItemProperty -LiteralPath $v.Path -Name $v.Name -ErrorAction Stop
+        $removed += $v.Name
+    }
+    foreach ($f in @(Get-PmLicenseFiles -DataPath $prtg.DataPath)) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed += $f.Name }
+    $left = @(Get-PmLicenseValues | ForEach-Object { $_.Name })
+    if ($left.Count) { throw "These license values could not be removed: $($left -join ', ')" }
+    Write-PmLog "Removed: $(@($removed | Select-Object -Unique) -join ', ')" 'OK'
+
+    $health = $null
+    if ($StartServices) {
+        Write-PmProgress 60 'Starting PRTG'
+        Write-PmLog 'Starting PRTG without a license...' 'STEP'
+        $box = @{}
+        Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
+        $health = $box.Health
+        if ($health.Healthy) { Write-PmLog "PRTG is running: $($health.Url). Enter a license in PRTG under Setup > License Information." 'OK' }
+        else { Write-PmLog "PRTG did not come up completely without a license ($($health.Message)). Enter a license with the PRTG Administration Tool on the server, or restore the copy in $keep." 'WARN' }
+    }
+    $after = Get-PmPrtgLicenseState
+    $back = @(Get-PmLicenseValues | Where-Object { $_.Name -in 'LicenseKey', 'LicenseName' -and [string]$_.Value } | ForEach-Object { $_.Name })
+    if ($back.Count) { Write-PmLog "PRTG wrote these values again while starting: $($back -join ', ')" 'WARN' }
+    Write-PmLog "License after: $(& $describe $after)"
+    Write-PmProgress 100 'Done'
+    New-PmResult @{
+        Removed = @($removed | Select-Object -Unique); Rollback = $keep; Before = $before; After = $after; WrittenAgain = $back
+        Healthy = $(if ($health) { [bool]$health.Healthy }); WebUrl = $(if ($health) { $health.Url }); Core = (Get-PmPrtgInfo).CoreStatus
+    }
+}
+
 function Get-PmLicenseFiles {
     param([string]$DataPath)
     if (-not (Test-Path -LiteralPath $DataPath)) { return @() }

@@ -242,6 +242,9 @@ The same engine is available for scripts and scheduled tasks:
 
 # Bind the web server of a migrated PRTG to the server's own address
 .\cli\Invoke-PrtgMover.ps1 -Action FixBinding -Target PRTG-NEW1
+
+# Remove the PRTG license data from a migrated server (a source server is refused)
+.\cli\Invoke-PrtgMover.ps1 -Action RemoveLicense -Target PRTG-NEW1
 ```
 
 Other switches: `-NoPrtg -NoHistory -NoVpn -NoDesktop -ExtraPaths -NoProgramClone -NoLicense -NoFirewall -NoStart -HealthTimeoutMinutes -ConnectVpn -AllowDowngrade -InstallerFile -SkipPreflight`.

@@ -827,7 +827,9 @@ function Invoke-PmTestFlow {
             if ($lic.Error) { Add-PmJobLog -Job $Job -Level WARN -Message "License report failed: $($lic.Error)" -Computer $r.Computer }
             else {
                 $ls = $r.PrtgLicenseState
-                if ($ls -and $ls.Known -and $ls.NeedsActivation) {
+                if ($ls -and $ls.Known -and $ls.NeedsActivation -and -not [string]$ls.Name) {
+                    Add-PmJobLog -Job $Job -Level WARN -Computer $r.Computer -Message "PRTG license: none installed ('$($ls.Edition)'). Enter a license in PRTG (Setup > License Information). Sensors paused by the license: $($ls.PausedByLicense)."
+                } elseif ($ls -and $ls.Known -and $ls.NeedsActivation) {
                     Add-PmJobLog -Job $Job -Level WARN -Computer $r.Computer -Message "PRTG license: '$($ls.Edition)' - the license must be activated for this server (PRTG > Setup > License Information). Sensors paused by the license: $($ls.PausedByLicense)."
                     if ($ls.LastError) { Add-PmJobLog -Job $Job -Level WARN -Computer $r.Computer -Message "PRTG license: last activation attempt: $($ls.LastError)" }
                 } elseif ($ls -and $ls.Known) {
@@ -1439,6 +1441,26 @@ function Invoke-PmRestoreFlow {
     } finally { if ($s) { Close-PmSession $s } }
 }
 
+function Invoke-PmUnlicenseFlow {
+    <#
+        Removes the PRTG license data from a migrated server (target). A source server is
+        refused: the license of the original installation is never touched.
+    #>
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, $Job, [hashtable]$Options = @{})
+    if ($Server.PSObject.Properties['role'] -and $Server.role -eq 'source') { throw "$($Server.name) is a source server - the license of a source is never touched." }
+    if ((Get-PmTransport $Server) -eq 'rdp') { throw "$($Server.name): this action needs the WinRM connection method." }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $p = @{}
+        if ([int]$Options.HealthTimeoutMinutes -gt 0) { $p.HealthTimeoutMinutes = [int]$Options.HealthTimeoutMinutes }
+        $r = Invoke-PmRemote -Session $s -Function 'Remove-PmPrtgLicense' -Parameters $p -Job $Job -ProgressBase 0 -ProgressSpan 90
+        if (-not $r) { throw 'The server returned no result.' }
+        Write-PmAudit -Action 'prtg.license.removed' -Data @{ server = $Server.name; removed = @($r.Removed); rollback = $r.Rollback; healthy = $r.Healthy }
+        return [pscustomobject]@{ target = $Server.name; ok = $true; removed = @($r.Removed); rollback = $r.Rollback; before = $r.Before; after = $r.After; healthy = $r.Healthy; web = $r.WebUrl; core = $r.Core }
+    } finally { Close-PmSession $s }
+}
+
 function Invoke-PmRebindFlow {
     <#
         Binds the web server of an already migrated PRTG to the server's own address (it kept
@@ -1695,6 +1717,17 @@ function Invoke-PmJob {
                 }
                 $Job.result = $results
                 if (@($results | Where-Object { -not $_.ok }).Count -gt 0) { throw 'One or more servers failed the test (see the lines above).' }
+            }
+            'unlicense' {
+                # Remove the PRTG license data from migrated servers (never from a source).
+                $results = @()
+                foreach ($id in @($Params.ServerIds)) {
+                    $srv = Get-PmServer -Id $id
+                    $results += Invoke-PmUnlicenseFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Job $Job -Options $options
+                    # refresh what the dashboard shows for this server
+                    try { [void](Invoke-PmTestFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Job $Job -Mode $(if ((Get-PmTransport $srv) -eq 'winrm') { 'winrm' } else { 'auto' })) } catch { Add-PmJobLog -Job $Job -Level WARN -Message "Status refresh failed: $($_.Exception.Message)" }
+                }
+                $Job.result = $results
             }
             'rebind' {
                 # Fix the web server binding of an already migrated PRTG (it kept the source's IP addresses).
