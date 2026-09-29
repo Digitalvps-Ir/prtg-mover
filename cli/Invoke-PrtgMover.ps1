@@ -130,6 +130,7 @@ try {
             $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'KeepStopped' }
             $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
             $creds = @{}; if ($Credential) { foreach ($x in @($srv) + $targets) { $creds[$x.id] = $Credential } }
+            if (-not $Transfer) { $Transfer = Resolve-PmTunnelFromServers -Servers (@($srv) + $targets); if ($Transfer) { $options.Transfer = $Transfer } }
             if ($Transfer -in 'rdp', 'winrm') {
                 $srv = Copy-PmServerTransport -Server $srv -Transport $Transfer
                 $targets = @($targets | ForEach-Object { Copy-PmServerTransport -Server $_ -Transport $Transfer })

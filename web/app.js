@@ -92,6 +92,8 @@
     $('#sideAgents').innerHTML = state.servers.length ? '<b style="color:var(--muted)">Servers</b>' + state.servers.map((s) => {
       const on = s.agent && s.agent.connected;
       const tag = s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
+        : s.transport === 'wireguard' ? '<span class="badge info">WireGuard</span>'
+        : s.transport === 'ipip' ? '<span class="badge info">IPIP</span>'
         : on ? `<span class="badge ok">agent ${esc(s.agent.state || 'on')}</span>` : '<span class="badge">agent off</span>';
       return `<div class="row"><span>${esc(s.name)}</span>${tag}</div>`;
     }).join('') : '';
@@ -99,6 +101,8 @@
   function serverLine(s) {
     if (!s) return '';
     if (s.transport === 'winrm') return `<div class="srvline"><span class="badge info">WinRM</span> ${esc(s.host)}</div>`;
+    if (s.transport === 'wireguard') return `<div class="srvline"><span class="badge info">WireGuard</span> ${esc(s.host)} · commands over RDP</div>`;
+    if (s.transport === 'ipip') return `<div class="srvline"><span class="badge info">IPIP</span> ${esc(s.host)} · commands over RDP</div>`;
     const on = s.agent && s.agent.connected;
     return `<div class="srvline"><span class="badge info">RDP</span> ${esc(s.host)}:${esc(s.rdpPort || 3389)} · ${on ? `<span class="badge ok">agent connected (${esc(s.agent.computer)})</span>` : '<span class="badge warn">agent not running — press RDP on the Servers page</span>'}</div>`;
   }
@@ -196,7 +200,10 @@
         } else { prtg = '<span class="badge warn">not installed</span>'; }
       }
       const cred = s.hasCredential ? '<span class="badge ok">saved</span>' : '<span class="badge" title="The current Windows identity of the manager is used">Windows identity</span>';
-      const method = (s.transport === 'winrm') ? '<span class="badge info">WinRM</span>' : '<span class="badge info">RDP</span>';
+      const method = s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
+        : s.transport === 'wireguard' ? '<span class="badge info">WireGuard</span>'
+        : s.transport === 'ipip' ? '<span class="badge info">IPIP</span>'
+        : '<span class="badge info">RDP</span>';
       const ag = s.agent && s.agent.connected
         ? `<span class="badge ok" title="${esc(s.agent.computer)} · ${esc(s.agent.user)}">agent ${esc(s.agent.state || 'on')}</span>`
         : (s.transport === 'winrm' ? '' : '<span class="badge" title="Only needed while a job runs">agent off</span>');
@@ -254,7 +261,7 @@
     f.transport.value = 'rdp';
     if (s) {
       f.name.value = s.name; f.host.value = s.host; f.role.value = s.role || 'both'; f.port.value = s.port || 0; f.rdpPort.value = s.rdpPort || 3389;
-      f.transport.value = s.transport === 'winrm' ? 'winrm' : 'rdp';
+      f.transport.value = ['winrm', 'wireguard', 'ipip'].includes(s.transport) ? s.transport : 'rdp';
       f.authentication.value = s.authentication || 'Default'; f.useSsl.checked = !!s.useSsl; f.skipCaCheck.checked = !!s.skipCaCheck; f.notes.value = s.notes || '';
     }
     $('#serverDialog').showModal();
@@ -306,7 +313,9 @@
     const targets = $$('#targetList input:checked').map((i) => state.servers.find((s) => s.id === i.value)).filter(Boolean);
     const yes = (on, text) => `<li class="${on ? '' : 'no'}">${on ? '✓' : '✗'} ${text}</li>`;
     const prtg = f.IncludePrtg.checked;
-    const transfer = f.transfer.value;
+    const chosen = f.transfer.value;
+    const savedModes = [...new Set([src, ...targets].filter(Boolean).map((s) => s.transport).filter((t) => t === 'wireguard' || t === 'ipip'))];
+    const transfer = chosen || (savedModes.length === 1 ? savedModes[0] : '');
     const viaTunnel = transfer === 'wireguard' || transfer === 'ipip';
     const tunnelName = transfer === 'ipip' ? 'an IPIP tunnel (10.66.67.0/24)' : 'a WireGuard tunnel (10.66.66.0/24)';
     const pathText = viaTunnel

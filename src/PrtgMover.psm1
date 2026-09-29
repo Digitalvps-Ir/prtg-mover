@@ -138,7 +138,7 @@ function Set-PmServer {
         [string]$Role = 'both',
         [string]$Notes = '',
         [ValidateRange(1, 65535)][int]$RdpPort = 3389,
-        [ValidateSet('rdp', 'winrm', 'local')][string]$Transport = 'rdp'
+        [ValidateSet('rdp', 'winrm', 'wireguard', 'ipip', 'local')][string]$Transport = 'rdp'
     )
     if (-not $Id) { $Id = ([guid]::NewGuid().ToString('N')).Substring(0, 10) }
     $all = @(Get-PmServers | Where-Object { $_.id -ne $Id })
@@ -214,11 +214,22 @@ function Get-PmRdpPort {
 }
 
 function Get-PmTransport {
-    <# 'rdp' (agent inside an RDP session, default) or 'winrm' (PowerShell remoting). #>
+    <# Command channel: 'rdp' or 'winrm'. A saved WireGuard or IPIP method still sends commands over RDP. #>
     param([Parameter(Mandatory)]$Server)
     if ($Server.PSObject.Properties['transport'] -and $Server.transport -eq 'winrm') { return 'winrm' }
     if ($Server.PSObject.Properties['transport'] -and $Server.transport -eq 'local') { return 'local' }
     return 'rdp'
+}
+
+function Resolve-PmTunnelFromServers {
+    <# The tunnel saved on the selected servers, when the job did not pick a path itself. #>
+    param([object[]]$Servers)
+    $modes = @($Servers | ForEach-Object {
+            if ($_ -and $_.PSObject.Properties['transport'] -and $_.transport -in 'wireguard', 'ipip') { [string]$_.transport }
+        } | Where-Object { $_ } | Select-Object -Unique)
+    if ($modes.Count -gt 1) { throw 'The selected servers do not use the same tunnel. Choose WireGuard or IPIP under How the files move for this job.' }
+    if ($modes.Count -eq 1) { return [string]$modes[0] }
+    return ''
 }
 
 function Copy-PmServerTransport {
