@@ -58,6 +58,16 @@ Describe 'RAS phonebook handling' {
     }
 }
 
+Describe 'PRTG web server binding after a migration' {
+    It 'replaces addresses of the source by the address of this server' {
+        Get-PmReboundIpList -Current '109.122.248.8,127.0.0.1' -Local @('127.0.0.1', '109.122.248.2', '10.66.66.2') -Own '109.122.248.2' | Should -Be '109.122.248.2,127.0.0.1'
+    }
+    It 'keeps addresses that exist on this server and always keeps localhost' {
+        Get-PmReboundIpList -Current '10.0.0.5' -Local @('10.0.0.5') -Own '10.0.0.5' | Should -Be '10.0.0.5,127.0.0.1'
+        Get-PmReboundIpList -Current '1.1.1.1, 2.2.2.2' -Local @('3.3.3.3') -Own '3.3.3.3' | Should -Be '3.3.3.3,127.0.0.1'
+    }
+}
+
 Describe 'Backup / restore round trip (local, no PRTG)' {
     It 'packages extra paths and restores them to the original location' {
         $extra = Join-Path $Work 'extra-data'

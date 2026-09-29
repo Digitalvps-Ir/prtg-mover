@@ -193,6 +193,7 @@
           <button class="btn small" data-act="rdp" data-id="${esc(s.id)}" title="Open Remote Desktop to ${esc(s.host)}:${esc(s.rdpPort || 3389)} and start the agent">RDP</button>
           <button class="btn small" data-act="test-rdp" data-id="${esc(s.id)}">Test RDP</button>
           <button class="btn small" data-act="test-winrm" data-id="${esc(s.id)}">Test WinRM</button>
+          ${s.role !== 'source' && s.transport === 'winrm' ? `<button class="btn small" data-act="rebind" data-id="${esc(s.id)}" title="After a migration PRTG may still be bound to the old server's IP and only answer on 127.0.0.1. This binds the web server to this server's address and restarts PRTG.">Fix PRTG IP</button>` : ''}
           <button class="btn small" data-act="edit" data-id="${esc(s.id)}">Edit</button>
           <button class="btn small danger" data-act="del" data-id="${esc(s.id)}">Delete</button>
         </div></td></tr>`;
@@ -208,6 +209,7 @@
     const s = state.servers.find((x) => x.id === b.dataset.id);
     if (b.dataset.act === 'test-rdp') startJob({ type: 'test', mode: 'rdp', serverIds: [s.id] });
     if (b.dataset.act === 'test-winrm') startJob({ type: 'test', mode: 'winrm', serverIds: [s.id] });
+    if (b.dataset.act === 'rebind' && confirm(`Bind the PRTG web server on "${s.name}" to this server's address (${s.host}) and restart PRTG there?`)) startJob({ type: 'rebind', serverIds: [s.id] });
     if (b.dataset.act === 'rdp') {
       try {
         const r = await api('POST', `/api/servers/${encodeURIComponent(s.id)}/rdp`);
