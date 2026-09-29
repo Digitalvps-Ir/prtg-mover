@@ -237,6 +237,113 @@ function Test-PmPrtgWeb {
     return $null
 }
 
+function Wait-PmPrtgHealthy {
+    <#
+        Brings PRTG fully up and proves it: both services Running, the core answering
+        HTTP(S), and everything still running after a stability window. A service that
+        stops/crashes during start-up is restarted (up to $MaxRestarts times).
+        Emits log records; the last object is PmType='health'.
+    #>
+    param([int]$TimeoutMinutes = 15, [int[]]$PreferredPorts = @(), [int]$StableSeconds = 45, [int]$MaxRestarts = 2)
+    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $restarts = 0; $url = $null; $healthy = $false; $msg = ''
+    foreach ($n in $PmCoreService, $PmProbeService) {
+        if (Get-Service -Name $n -ErrorAction SilentlyContinue) { Set-Service -Name $n -StartupType Automatic }
+    }
+    while ((Get-Date) -lt $deadline -and -not $healthy) {
+        foreach ($n in $PmCoreService, $PmProbeService) {
+            $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+            if ($s -and $s.Status -eq 'Stopped') {
+                if ($restarts -ge ($MaxRestarts + 2)) { continue }   # +2: the initial starts
+                $restarts++
+                Write-PmLog "Starting service $n (attempt $restarts)..."
+                try { Start-Service -Name $n -ErrorAction Stop } catch { Write-PmLog "Start-Service $n failed: $($_.Exception.Message)" 'WARN' }
+            }
+        }
+        Start-Sleep -Seconds 10
+        $info = Get-PmPrtgInfo
+        if ($info.CoreStatus -ne 'Running' -or ($info.ProbeStatus -and $info.ProbeStatus -ne 'Running')) { $msg = "core=$($info.CoreStatus) probe=$($info.ProbeStatus)"; continue }
+        $ports = @($info.ListenPorts) + @($PreferredPorts) + @(443, 80, 8443, 8080) | Where-Object { $_ } | Select-Object -Unique
+        $url = Test-PmPrtgWeb -Ports $ports
+        if (-not $url) { $msg = 'services running, web interface not answering yet'; continue }
+        Write-PmLog "Web interface answers at $url - verifying stability for $StableSeconds s..."
+        Start-Sleep -Seconds $StableSeconds
+        $info = Get-PmPrtgInfo
+        if ($info.CoreStatus -eq 'Running' -and (-not $info.ProbeStatus -or $info.ProbeStatus -eq 'Running') -and (Test-PmPrtgWeb -Ports $ports)) { $healthy = $true }
+        else { $msg = "became unstable (core=$($info.CoreStatus) probe=$($info.ProbeStatus))"; Write-PmLog "PRTG $msg - retrying." 'WARN' }
+    }
+    $final = Get-PmPrtgInfo
+    [pscustomobject]@{ PmType = 'health'; Healthy = $healthy; Url = $url; Core = $final.CoreStatus; Probe = $final.ProbeStatus; Message = $msg; Version = $final.Version }
+}
+
+function Invoke-PmHealthCheck {
+    <# Runs Wait-PmPrtgHealthy, forwarding its logs, and returns the health object via $Box.Health. #>
+    param([hashtable]$Box, [int]$TimeoutMinutes = 15, [int[]]$PreferredPorts = @())
+    Wait-PmPrtgHealthy -TimeoutMinutes $TimeoutMinutes -PreferredPorts $PreferredPorts | ForEach-Object {
+        if ($_.PmType -eq 'health') { $Box.Health = $_ } else { $_ }
+    }
+}
+
+# ---------------------------------------------------------------- VSS snapshots (no-touch backups)
+
+function New-PmShadowCopy {
+    <# Creates a VSS snapshot of the volume holding $Path and links it to a folder. Server OS only. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $volume = (Split-Path $Path -Qualifier) + '\'
+    $r = (Get-WmiObject -List Win32_ShadowCopy).Create($volume, 'ClientAccessible')
+    if ($r.ReturnValue -ne 0) { throw "VSS snapshot of $volume failed (code $($r.ReturnValue))." }
+    $sc = Get-WmiObject Win32_ShadowCopy -Filter "ID='$($r.ShadowID)'"
+    $link = Join-Path $env:SystemDrive ('PrtgMoverVss_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    cmd.exe /c "mklink /d `"$link`" `"$($sc.DeviceObject)\`"" | Out-Null
+    if (-not (Test-Path -LiteralPath $link)) { $sc.Delete(); throw 'Could not mount the VSS snapshot.' }
+    [pscustomobject]@{ Id = $sc.ID; Link = $link; Volume = $volume }
+}
+
+function Remove-PmShadowCopy {
+    param($Shadow)
+    if (-not $Shadow) { return }
+    cmd.exe /c "rmdir `"$($Shadow.Link)`"" | Out-Null
+    $sc = Get-WmiObject Win32_ShadowCopy -Filter "ID='$($Shadow.Id)'"
+    if ($sc) { $sc.Delete() }
+}
+
+# ---------------------------------------------------------------- PRTG license
+
+function Get-PmLicenseValues {
+    <# All registry values below the Paessler keys whose name contains "licen" (name, path, kind, value). #>
+    $out = @()
+    foreach ($root in 'HKLM:\SOFTWARE\WOW6432Node\Paessler', 'HKLM:\SOFTWARE\Paessler') {
+        if (-not (Test-Path $root)) { continue }
+        $keys = @(Get-Item -LiteralPath $root) + @(Get-ChildItem -LiteralPath $root -Recurse -ErrorAction SilentlyContinue)
+        foreach ($k in $keys) {
+            foreach ($name in $k.GetValueNames()) {
+                if ($name -match 'licen') {
+                    $out += [pscustomobject]@{ Path = $k.PSPath; Name = $name; Kind = $k.GetValueKind($name); Value = $k.GetValue($name, $null, 'DoNotExpandEnvironmentNames') }
+                }
+            }
+        }
+    }
+    return $out
+}
+
+function Get-PmLicenseFiles {
+    param([string]$DataPath)
+    if (-not (Test-Path -LiteralPath $DataPath)) { return @() }
+    @(Get-ChildItem -LiteralPath $DataPath -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'licen' })
+}
+
+# ---------------------------------------------------------------- firewall
+
+function Set-PmPrtgFirewall {
+    <# Opens inbound TCP for the PRTG web ports and the remote-probe port (23560). #>
+    param([int[]]$Ports)
+    $ports = @($Ports) + 23560 | Where-Object { $_ } | Select-Object -Unique | Sort-Object
+    $name = 'PRTG Mover - PRTG Core (web + probes)'
+    Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+    New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol TCP -LocalPort $ports -Action Allow -Profile Any | Out-Null
+    return $ports
+}
+
 # ---------------------------------------------------------------- system info (Test)
 
 function Get-PmSystemInfo {
@@ -262,6 +369,7 @@ function Get-PmSystemInfo {
         Profiles     = @(Get-PmUserProfiles | Select-Object -ExpandProperty Name)
         Disks        = $disks
         SystemDrive  = $env:SystemDrive
+        RdpPort      = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue).PortNumber
         PSVersion    = $PSVersionTable.PSVersion.ToString()
     }
 }
@@ -277,9 +385,12 @@ function Invoke-PmRemoteBackup {
         [bool]$IncludeVpn = $true,
         [bool]$IncludeDesktop = $true,
         [string[]]$ExtraPaths = @(),
-        [ValidateSet('Restart', 'KeepStopped', 'Disable')][string]$SourceAfter = 'Restart'
+        [ValidateSet('Restart', 'KeepStopped', 'Disable')][string]$SourceAfter = 'Restart',
+        [bool]$NoTouch = $false,
+        [int]$HealthTimeoutMinutes = 15
     )
     $ErrorActionPreference = 'Stop'
+    $sourceHealth = $null
     if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
     $stage = Join-Path $WorkRoot "staging\$JobId"
     $outDir = Join-Path $WorkRoot 'out'
@@ -307,18 +418,37 @@ function Invoke-PmRemoteBackup {
             $manifest.warnings += 'PRTG not installed on source'
         } else {
             Write-PmLog "PRTG $($prtg.Version) found. Program: $($prtg.ProgramPath) | Data: $($prtg.DataPath)"
-            Write-PmProgress 10 'PRTG: stopping services'
-            Write-PmLog 'Stopping PRTG services (the core flushes its configuration to disk)...' 'STEP'
-            Stop-PmPrtgServices
-            Write-PmLog 'PRTG services stopped.' 'OK'
+            $wasRunning = ($prtg.CoreStatus -eq 'Running')
+            $shadow = $null
+            $dataSource = $prtg.DataPath
+            if ($NoTouch) {
+                Write-PmLog 'NO-TOUCH mode: PRTG keeps running on the source, nothing is stopped, changed or deleted.' 'STEP'
+                try {
+                    $shadow = New-PmShadowCopy -Path $prtg.DataPath
+                    $dataSource = Join-Path $shadow.Link $prtg.DataPath.Substring($shadow.Volume.Length)
+                    Write-PmLog "Consistent VSS snapshot of $($shadow.Volume) created - copying from the snapshot." 'OK'
+                } catch {
+                    Write-PmLog "VSS snapshot not available ($($_.Exception.Message)) - copying live files. PRTG saves its configuration periodically; files locked at this moment are skipped." 'WARN'
+                    $manifest.warnings += 'No-touch backup without VSS snapshot (live copy)'
+                }
+            } else {
+                Write-PmProgress 10 'PRTG: stopping services'
+                Write-PmLog 'Stopping PRTG services (the core flushes its configuration to disk)...' 'STEP'
+                Stop-PmPrtgServices
+                Write-PmLog 'PRTG services stopped.' 'OK'
+            }
 
             try {
                 Write-PmProgress 20 'PRTG: copying data folder'
                 $exclude = @()
-                if (-not $IncludeHistory) { $exclude = @((Join-Path $prtg.DataPath 'Monitoring Database'), (Join-Path $prtg.DataPath 'Logs')) }
-                $code = Invoke-PmRobocopy -Source $prtg.DataPath -Destination (Join-Path $stage 'prtg\data') -ExcludeDirs $exclude
+                if (-not $IncludeHistory) { $exclude = @((Join-Path $dataSource 'Monitoring Database'), (Join-Path $dataSource 'Logs')) }
+                $code = Invoke-PmRobocopy -Source $dataSource -Destination (Join-Path $stage 'prtg\data') -ExcludeDirs $exclude
                 if (-not (Test-PmRobocopyOk $code)) { throw "robocopy of PRTG data failed with exit code $code" }
-                Write-PmLog ("Data folder copied ({0:N2} GB)." -f ((Get-PmDirectorySize (Join-Path $stage 'prtg\data')) / 1GB)) 'OK'
+                $cfg = Join-Path $stage 'prtg\data\PRTG Configuration.dat'
+                if (-not (Test-Path -LiteralPath $cfg)) { throw "'PRTG Configuration.dat' is missing from the copied data folder - aborting (backup would be unusable)." }
+                $cfgInfo = Get-Item -LiteralPath $cfg
+                $cfgHash = (Get-FileHash -LiteralPath $cfg -Algorithm SHA256).Hash
+                Write-PmLog ("Data folder copied ({0:N2} GB). PRTG Configuration.dat: {1:N1} MB, saved {2}." -f ((Get-PmDirectorySize (Join-Path $stage 'prtg\data')) / 1GB), ($cfgInfo.Length / 1MB), $cfgInfo.LastWriteTime) 'OK'
 
                 Write-PmProgress 35 'PRTG: copying customisations'
                 $copiedFolders = @()
@@ -342,21 +472,41 @@ function Invoke-PmRemoteBackup {
                 }
                 Write-PmLog "Registry exported: $($regFiles -join ', ')" 'OK'
 
+                $licNames = @(Get-PmLicenseValues | ForEach-Object { $_.Name } | Select-Object -Unique)
+                $licFiles = @(Get-PmLicenseFiles -DataPath $prtg.DataPath | ForEach-Object { $_.Name })
+                Write-PmLog ("License information found: {0} registry value(s){1}." -f $licNames.Count, $(if ($licFiles.Count) { ", files: $($licFiles -join ', ')" } else { '' }))
+
                 $manifest.prtg = [ordered]@{
                     included = $true; version = $prtg.Version; dataPath = $prtg.DataPath; programPath = $prtg.ProgramPath
                     includeHistory = $IncludeHistory; programFolders = $copiedFolders; registryFiles = $regFiles
-                    listenPorts = $prtg.ListenPorts
+                    listenPorts = $prtg.ListenPorts; configSha256 = $cfgHash; configSize = $cfgInfo.Length
+                    licenseValueNames = $licNames; licenseFiles = $licFiles
+                    consistency = $(if ($NoTouch) { if ($shadow) { 'vss-snapshot' } else { 'live-copy' } } else { 'services-stopped' })
                 }
             } finally {
-                switch ($SourceAfter) {
-                    'Restart' {
-                        Write-PmLog 'Restarting PRTG services on source...'
-                        try { Start-PmPrtgServices; Write-PmLog 'Source PRTG services running again.' 'OK' } catch { Write-PmLog "Failed to restart source services: $_" 'ERROR' }
-                    }
-                    'KeepStopped' { Write-PmLog 'Source PRTG services left STOPPED (migration mode).' 'WARN' }
-                    'Disable' {
-                        foreach ($n in $PmCoreService, $PmProbeService) { Set-Service -Name $n -StartupType Disabled -ErrorAction SilentlyContinue }
-                        Write-PmLog 'Source PRTG services STOPPED and DISABLED (migration mode).' 'WARN'
+                if ($shadow) { Remove-PmShadowCopy -Shadow $shadow; Write-PmLog 'VSS snapshot removed.' }
+                if ($NoTouch) {
+                    Write-PmLog 'Source untouched - PRTG kept running the whole time.' 'OK'
+                } else {
+                    switch ($SourceAfter) {
+                        'Restart' {
+                            if (-not $wasRunning) {
+                                Write-PmLog 'PRTG was not running before the backup - leaving it stopped.' 'WARN'
+                            } else {
+                                Write-PmProgress 72 'PRTG: restarting source and verifying health'
+                                Write-PmLog 'Starting PRTG on the source and waiting until it is FULLY up (services + web interface + stability)...' 'STEP'
+                                $box = @{}
+                                Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
+                                $sourceHealth = $box.Health
+                                if ($sourceHealth.Healthy) { Write-PmLog "Source PRTG is fully up again: $($sourceHealth.Url)" 'OK' }
+                                else { Write-PmLog "Source PRTG did NOT come back up correctly ($($sourceHealth.Message)). Check the core log on the source!" 'ERROR' }
+                            }
+                        }
+                        'KeepStopped' { Write-PmLog 'Source PRTG services left STOPPED (migration mode).' 'WARN' }
+                        'Disable' {
+                            foreach ($n in $PmCoreService, $PmProbeService) { Set-Service -Name $n -StartupType Disabled -ErrorAction SilentlyContinue }
+                            Write-PmLog 'Source PRTG services STOPPED and DISABLED (migration mode).' 'WARN'
+                        }
                     }
                 }
             }
@@ -446,7 +596,10 @@ function Invoke-PmRemoteBackup {
     Write-PmLog ("Package ready: {0} ({1:N2} MB, SHA256 {2})" -f $zipName, ($zip.Length / 1MB), $hash) 'OK'
     Write-PmProgress 80 'Packaging done'
 
-    New-PmResult @{ ZipPath = $zipPath; ZipName = $zipName; Size = $zip.Length; Sha256 = $hash; Manifest = ($manifest | ConvertTo-Json -Depth 8) }
+    New-PmResult @{
+        ZipPath = $zipPath; ZipName = $zipName; Size = $zip.Length; Sha256 = $hash; Manifest = ($manifest | ConvertTo-Json -Depth 8)
+        SourceHealth = $sourceHealth
+    }
 }
 
 # ---------------------------------------------------------------- RESTORE (runs on target)
@@ -466,19 +619,40 @@ function Invoke-PmRemoteRestore {
         [bool]$StartServices = $true,
         [int]$HealthTimeoutMinutes = 15,
         [bool]$ConnectVpn = $false,
-        [bool]$RemovePackage = $true
+        [bool]$RemovePackage = $true,
+        [bool]$CopyLicense = $true,
+        [bool]$OpenFirewall = $true,
+        [string]$ExpectedSha256
     )
     $ErrorActionPreference = 'Stop'
     if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
     $stage = Join-Path $WorkRoot "restore\$JobId"
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $report = [ordered]@{ Computer = $env:COMPUTERNAME; Prtg = 'skipped'; Vpn = 'skipped'; Desktop = 'skipped'; Extra = 'skipped'; WebUrl = $null; Errors = @() }
+    $report = [ordered]@{ Computer = $env:COMPUTERNAME; Prtg = 'skipped'; License = 'skipped'; Vpn = 'skipped'; Desktop = 'skipped'; Extra = 'skipped'; WebUrl = $null; Version = $null; Errors = @() }
 
     Write-PmLog "Restore started on $env:COMPUTERNAME" 'STEP'
+
+    # ---- integrity + disk space pre-checks
+    if ($ExpectedSha256) {
+        Write-PmProgress 2 'Verifying package checksum'
+        $h = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash
+        if ($h -ne $ExpectedSha256) { throw "Package checksum mismatch on target (expected $ExpectedSha256, got $h) - transfer corrupted." }
+        Write-PmLog 'Package SHA-256 verified on target.' 'OK'
+    }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $need = 0
+    $zr = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try { foreach ($e in $zr.Entries) { $need += $e.Length } } finally { $zr.Dispose() }
+    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $required = [int64]($need * 2 + 1GB)   # extracted staging + restored data + margin
+    if ($drive -and $drive.FreeSpace -lt $required) {
+        throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB))
+    }
+    if ($drive) { Write-PmLog ("Disk space OK: {0:N1} GB free, ~{1:N1} GB needed." -f ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK' }
+
     Write-PmProgress 5 'Extracting package'
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $stage)
     $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
     Write-PmLog "Package from $($manifest.source.computer) created $($manifest.createdUtc)" 'OK'
@@ -516,6 +690,15 @@ function Invoke-PmRemoteRestore {
                 } else { Write-PmLog "PRTG versions match ($dstV)." 'OK' }
             }
 
+            # Remember the target's own license before anything is overwritten.
+            $targetLicValues = @(Get-PmLicenseValues)
+            $licKeep = Join-Path $WorkRoot "license-keep\$stamp"
+            $targetLicFiles = @(Get-PmLicenseFiles -DataPath $prtg.DataPath)
+            if ($targetLicFiles.Count) {
+                New-Item -ItemType Directory -Force -Path $licKeep | Out-Null
+                $targetLicFiles | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $licKeep -Force }
+            }
+
             Write-PmProgress 25 'PRTG: stopping target services'
             Stop-PmPrtgServices
             Write-PmLog 'Target PRTG services stopped.' 'OK'
@@ -546,6 +729,11 @@ function Invoke-PmRemoteRestore {
             Write-PmProgress 45 'PRTG: restoring data folder'
             $code = Invoke-PmRobocopy -Source (Join-Path $stage 'prtg\data') -Destination $dataPath -Mirror
             if (-not (Test-PmRobocopyOk $code)) { throw "robocopy restore of data failed ($code)" }
+            if ($manifest.prtg.configSha256) {
+                $h = (Get-FileHash -LiteralPath (Join-Path $dataPath 'PRTG Configuration.dat') -Algorithm SHA256).Hash
+                if ($h -ne $manifest.prtg.configSha256) { throw 'PRTG Configuration.dat on target does not match the source (checksum) - aborting.' }
+                Write-PmLog 'PRTG Configuration.dat verified (SHA-256 identical to source).' 'OK'
+            }
             Write-PmLog "Data folder restored to $dataPath" 'OK'
 
             Write-PmProgress 55 'PRTG: importing registry'
@@ -562,6 +750,23 @@ function Invoke-PmRemoteRestore {
                 Write-PmLog "Registry Datapath adjusted to $dataPath" 'OK'
             }
 
+            # ---- license
+            if ($CopyLicense) {
+                $report.License = 'copied-from-source'
+                Write-PmLog ("Source license copied to target ({0} registry value(s){1})." -f @($manifest.prtg.licenseValueNames).Count, $(if (@($manifest.prtg.licenseFiles).Count) { ", files: $(@($manifest.prtg.licenseFiles) -join ', ')" } else { '' })) 'OK'
+                Write-PmLog 'Remember: a PRTG license may only be active on ONE core - keep the source stopped.' 'WARN'
+            } else {
+                foreach ($v in @(Get-PmLicenseValues)) { Remove-ItemProperty -LiteralPath $v.Path -Name $v.Name -ErrorAction SilentlyContinue }
+                foreach ($v in $targetLicValues) {
+                    if (-not (Test-Path -LiteralPath $v.Path)) { New-Item -Path $v.Path -Force | Out-Null }
+                    New-ItemProperty -LiteralPath $v.Path -Name $v.Name -Value $v.Value -PropertyType ([string]$v.Kind) -Force | Out-Null
+                }
+                Get-PmLicenseFiles -DataPath $dataPath | Remove-Item -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $licKeep) { Get-ChildItem -LiteralPath $licKeep -File | Copy-Item -Destination $dataPath -Force }
+                $report.License = if ($targetLicValues.Count -or $targetLicFiles.Count) { 'kept-target-license' } else { 'none (enter a license on the target)' }
+                Write-PmLog ("Source license NOT copied - target keeps its own license ({0} value(s) restored)." -f $targetLicValues.Count) 'OK'
+            }
+
             Write-PmProgress 60 'PRTG: restoring customisations'
             $progStage = Join-Path $stage 'prtg\program'
             foreach ($f in @($manifest.prtg.programFolders)) {
@@ -570,27 +775,26 @@ function Invoke-PmRemoteRestore {
             }
             Write-PmLog "Customisation folders restored: $(@($manifest.prtg.programFolders) -join ', ')" 'OK'
 
+            if ($OpenFirewall) {
+                $opened = Set-PmPrtgFirewall -Ports @($manifest.prtg.listenPorts)
+                Write-PmLog "Firewall opened for PRTG (TCP $($opened -join ', '))." 'OK'
+            }
+
             if ($StartServices) {
-                Write-PmProgress 70 'PRTG: starting services'
-                Write-PmLog 'Starting PRTG services...' 'STEP'
-                Start-PmPrtgServices
-                $deadline = (Get-Date).AddMinutes($HealthTimeoutMinutes)
-                $url = $null
-                Write-PmProgress 80 'PRTG: waiting for web interface'
-                while (-not $url -and (Get-Date) -lt $deadline) {
-                    Start-Sleep -Seconds 10
-                    $info = Get-PmPrtgInfo
-                    if ($info.CoreStatus -ne 'Running') { continue }
-                    $ports = @($info.ListenPorts) + @($manifest.prtg.listenPorts) + @(443, 80, 8443, 8080) | Where-Object { $_ } | Select-Object -Unique
-                    $url = Test-PmPrtgWeb -Ports $ports
-                }
-                if ($url) {
-                    $report.WebUrl = $url
-                    Write-PmLog "PRTG web interface is UP: $url" 'OK'
+                Write-PmProgress 70 'PRTG: starting and verifying'
+                Write-PmLog 'Starting PRTG and waiting until it is FULLY up (core + probe running, web interface answering, stable)...' 'STEP'
+                $box = @{}
+                Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($manifest.prtg.listenPorts)
+                $health = $box.Health
+                $report.Version = $health.Version
+                if ($health.Healthy) {
+                    $report.WebUrl = $health.Url
                     $report.Prtg = 'ok'
+                    Write-PmLog "PRTG $($health.Version) is fully UP on $env:COMPUTERNAME : $($health.Url) (core $($health.Core), probe $($health.Probe))" 'OK'
                 } else {
-                    Write-PmLog "PRTG services started but web interface did not answer within $HealthTimeoutMinutes min. Check '$dataPath\Logs\core'." 'WARN'
-                    $report.Prtg = 'started-no-web'
+                    $report.Prtg = 'unhealthy'
+                    $report.Errors += "PRTG did not come up completely within $HealthTimeoutMinutes min ($($health.Message))."
+                    Write-PmLog "PRTG did NOT come up completely ($($health.Message)). See '$dataPath\Logs\core' on the target. Rollback data: $dataPath.pre-restore-$stamp" 'ERROR'
                 }
             } else { $report.Prtg = 'restored-not-started' }
         } catch {
@@ -686,5 +890,14 @@ function Initialize-PmRemoteWorkRoot {
     param([string]$WorkRoot)
     if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
     New-Item -ItemType Directory -Force -Path (Join-Path $WorkRoot 'in') | Out-Null
-    New-PmResult @{ WorkRoot = $WorkRoot; Inbox = (Join-Path $WorkRoot 'in'); Prtg = (Get-PmPrtgInfo) }
+    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $prtg = Get-PmPrtgInfo
+    $dataBytes = 0
+    if ($prtg.Installed) { $dataBytes = Get-PmDirectorySize -Path $prtg.DataPath }
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    New-PmResult @{
+        WorkRoot = $WorkRoot; Inbox = (Join-Path $WorkRoot 'in'); Prtg = $prtg; Computer = $env:COMPUTERNAME
+        FreeBytes = [int64]$drive.FreeSpace; PrtgDataBytes = [int64]$dataBytes
+        IsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
 }
