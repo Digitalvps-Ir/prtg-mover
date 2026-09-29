@@ -275,8 +275,13 @@ function Set-LogonTask {
     # Credentials that a user saved in this installation can only be read by that user (Windows DPAPI).
     # Then the dashboard has to keep running as that user, which is only possible from the logon on.
     $saved = @(Get-ChildItem -LiteralPath (Join-Path $Path 'data\credentials') -Filter '*.cred.xml' -File -ErrorAction SilentlyContinue)
-    $bySystem = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
-    if ($saved.Count -and -not $bySystem -and -not (Test-SystemTask)) {
+    # Whose are they? Tried out, not guessed: only the account that saved a credential can read it.
+    $mine = $false
+    foreach ($f in $saved) { try { [void](Import-Clixml -LiteralPath $f.FullName -ErrorAction Stop); $mine = $true; break } catch { } }
+    if ($saved.Count -and -not $mine -and -not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
+        Write-Note "$($saved.Count) saved server credential(s) cannot be read by this account. They were saved by the dashboard that starts with the computer (SYSTEM), or by another user."
+    }
+    if ($mine -and -not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
         $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $me
         $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest
@@ -289,12 +294,6 @@ function Set-LogonTask {
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Mover dashboard when the computer starts (local mode).' -Force | Out-Null
     return "task '$LogonTask': starts with the computer, without logon"
-}
-
-function Test-SystemTask {
-    <# True when the dashboard of this computer already runs as SYSTEM: saved credentials then belong to SYSTEM. #>
-    $t = Get-ScheduledTask -TaskName $LogonTask -ErrorAction SilentlyContinue
-    return [bool]($t -and "$($t.Principal.UserId)" -match '^(SYSTEM|S-1-5-18|NT AUTHORITY\\SYSTEM)$')
 }
 
 function Start-LocalDashboard {
