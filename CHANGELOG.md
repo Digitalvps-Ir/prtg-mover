@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0 — 2026-09-29
+
+### Added
+- **RDP connection method (agent)**, now the default. It needs no WinRM and makes no configuration change on the server:
+  - The dashboard opens Remote Desktop with the manager's drive redirected. A one-line command (copied to the clipboard) starts `agent\PrtgMover-Agent.ps1` in an elevated PowerShell.
+  - The agent runs the same payload and talks to the manager over files in the redirected drive (requests, streamed JSON-lines responses, heartbeat from a background thread).
+  - Packages and installers travel over `\\tsclient`.
+- A **connection method** is chosen per server: RDP or WinRM.
+- Separate **Test RDP** and **Test WinRM** buttons. **Test all** checks both, and a server **PASSES** when at least one method works; the per-method results are shown.
+- Agent status badge (on/off, busy).
+- **PRTG configuration statistics**: probes, groups, devices, sensors, notifications, triggers, users, schedules, maps, reports, libraries and dependencies are counted on the source and on the target and logged.
+
+### Changed
+- **Don't touch the source** is now the **default** in the dashboard, the engine and the CLI. Stopping the source needs explicit consent (confirmation in the UI, `-AllowSourceStop` in the CLI).
+- Temporary work folders on the source are removed after the transfer.
+
 ## 1.1.0 — 2026-09-29
 
 ### Added

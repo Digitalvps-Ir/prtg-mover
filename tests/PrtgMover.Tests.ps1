@@ -95,6 +95,38 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
     }
 }
 
+Describe 'RDP agent transport (end to end, local)' {
+    BeforeAll {
+        $env:PRTGMOVER_TEST = '1'
+        Set-PmRoot -Path $Root   # the agent resolves the manager folder from its own location
+        $script:AgentSrv = Set-PmServer -Name 'PESTER-AGENT' -HostName '127.0.0.1' -Transport rdp
+        $script:AgentProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $Root 'agent\PrtgMover-Agent.ps1'), '-ServerId', $AgentSrv.id, '-AllowNonAdmin'
+    }
+    AfterAll {
+        if ($script:AgentProc) { Stop-Process -Id $AgentProc.Id -Force -ErrorAction SilentlyContinue }
+        Remove-PmServer -Id $AgentSrv.id
+        Remove-Item -LiteralPath (Join-Path $Root "data\agent\$($AgentSrv.id)") -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\PRTGMOVER_TEST -ErrorAction SilentlyContinue
+    }
+
+    It 'backs up through the agent, stores the package on the manager and restores it' {
+        $src = Join-Path $Work 'agent-extra'
+        New-Item -ItemType Directory -Force -Path $src | Out-Null
+        'via-agent' | Set-Content (Join-Path $src 'f.txt')
+        $job = New-PmJobObject -Type 'backup' -Summary 'pester'
+        $file = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src); NoTouch = $true } -Job $job
+        try {
+            Test-Path -LiteralPath $file | Should -BeTrue
+            Remove-Item -LiteralPath $src -Recurse -Force
+            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $file -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
+            $rep.Extra | Should -Be 'ok'
+            Get-Content (Join-Path $src 'f.txt') | Should -Be 'via-agent'
+            @($job.logs | Where-Object { $_.message -like '*over RDP*' }).Count | Should -BeGreaterThan 0
+        } finally { Remove-PmBackup -Name (Split-Path $file -Leaf) }
+    }
+}
+
 Describe 'Manager module' {
     BeforeAll {
         $mgr = Join-Path $Work 'manager'
