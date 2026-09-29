@@ -1,5 +1,233 @@
+<div align="center">
+
 # PRTG Mover
 
-Backup, migrate and restore a complete PRTG Network Monitor server (configuration, history, registry, certificates, custom sensors), Windows VPN connections and user Desktop files between Windows servers — from a single manager machine with a web dashboard.
+**Back up, migrate and restore a complete PRTG Network Monitor server, including Windows VPN connections and desktop files, from one manager machine with a web dashboard.**
 
-> Work in progress — see the open pull request.
+![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B-2563eb)
+![Windows Server 2012 R2 – 2025](https://img.shields.io/badge/Windows%20Server-2012%20R2%20%E2%80%93%202025-0078d4)
+![No dependencies](https://img.shields.io/badge/dependencies-none-15803d)
+![License MIT](https://img.shields.io/badge/license-MIT-lightgrey)
+
+[فارسی / Persian guide](README.fa.md) · [Architecture](docs/ARCHITECTURE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
+
+</div>
+
+---
+
+## Contents
+
+- [What it does](#what-it-does)
+- [What gets migrated](#what-gets-migrated)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start: migrate a PRTG server](#quick-start-migrate-a-prtg-server)
+- [Dashboard](#dashboard)
+- [Command line](#command-line)
+- [Backup package format](#backup-package-format)
+- [Security](#security)
+- [Limitations and after-migration checklist](#limitations-and-after-migration-checklist)
+- [Project layout](#project-layout)
+- [Development](#development)
+
+## What it does
+
+PRTG Mover moves a PRTG core server to one or more new Windows servers without manual copying:
+
+1. **Stops PRTG** on the source cleanly, so the core writes its configuration to disk.
+2. **Packages** the PRTG data folder, registry, SSL certificate, custom sensors, lookups, MIBs, device templates, map objects, **Windows VPN connections**, **desktop files of all users** and any extra paths you add into a single `.zip`, with a manifest and a SHA-256 checksum.
+3. **Downloads** the package to the manager. Every backup stays there and can be **downloaded from the dashboard**.
+4. **Restores** it on each target. If PRTG is missing it installs it silently, keeps a rollback copy of the target's own data and registry, restores everything, and **starts PRTG automatically**.
+5. **Verifies** that the PRTG web interface answers on every target before the job is marked successful.
+
+Everything runs in **plain Windows PowerShell 5.1**. You don't need to install anything on the servers except enabling WinRM.
+
+## What gets migrated
+
+| Area | Details |
+|---|---|
+| PRTG data folder | `PRTG Configuration.dat`, historic monitoring database (optional), logs, tickets, reports, toplists, configuration auto-backups. The path comes from the registry (`Datapath`) and falls back to `%ProgramData%\Paessler\PRTG Network Monitor`. |
+| PRTG registry | `HKLM\SOFTWARE\WOW6432Node\Paessler` and `HKLM\SOFTWARE\Paessler` (license key, server and probe settings, encryption settings). |
+| PRTG program customisations | `Custom Sensors`, `Notifications` (EXE/scripts), `lookups\custom`, `devicetemplates`, `MIB`, `snmplibs`, `cert` (web server SSL certificate), `webroot\map*` / `webroot\custom`. |
+| Windows VPN | All-user phonebook (`%ProgramData%\Microsoft\Network\Connections\Pbk\*.pbk`) and every user's own phonebook. Entries are **merged**: connections that already exist on the target are never overwritten. |
+| Desktop files | `Desktop` of every local user profile plus the Public desktop. On the target, files go to the same user's desktop, or to `C:\PrtgMover-Restored\Desktop\<user>` if that profile doesn't exist. |
+| Extra paths | Any folders or files you list, such as `D:\Scripts`, restored to the same path. |
+
+## How it works
+
+```
+          ┌───────────────────────── Manager (this repo) ─────────────────────────┐
+          │  Start-PrtgMover.ps1  →  http://localhost:8765  (dashboard + REST API)  │
+          │  src\PrtgMover.psm1   →  jobs, sessions, credentials (DPAPI), backups   │
+          └───────────────┬───────────────────────────────────────┬────────────────┘
+               WinRM 5985/5986 (PowerShell remoting)      WinRM 5985/5986
+                          │                                        │
+          ┌───────────────▼──────────────┐         ┌───────────────▼──────────────┐
+          │ SOURCE  (old PRTG server)    │         │ TARGET(s) (new servers)      │
+          │ 1 stop PRTG                  │  .zip   │ 4 install PRTG if missing    │
+          │ 2 copy data/registry/VPN/... │ ──────► │ 5 rollback copy, restore     │
+          │ 3 zip + SHA-256              │ via mgr │ 6 start PRTG, wait for web UI│
+          └──────────────────────────────┘         └──────────────────────────────┘
+```
+
+The code that runs on the servers (`src\Remote\PrtgMover.Remote.ps1`) is sent with every call. Nothing is installed on the servers, and there's no agent to keep up to date.
+
+## Requirements
+
+| Machine | Requirement |
+|---|---|
+| **Manager** | Windows 10/11 or Windows Server 2012 R2+, Windows PowerShell 5.1, network access to the servers on TCP 5985 (or 5986), enough free disk space for the backups. |
+| **Source / target** | Windows Server 2012 R2 – 2025 with PowerShell 5.1, WinRM enabled (see below), an administrator account, and free disk space of about **2 × the PRTG data folder** (staging + zip). |
+| **PRTG** | Same or newer version on the target as on the source. If PRTG isn't installed on the target, upload the installer in the dashboard and it's installed silently. |
+
+## Installation
+
+### 1. Get PRTG Mover on the manager
+
+```powershell
+git clone https://github.com/<your-account>/prtg-mover.git C:\PrtgMover
+cd C:\PrtgMover
+```
+
+(Or download the ZIP from GitHub and extract it.)
+
+### 2. Prepare every source and target server (once)
+
+Connect with RDP, copy `tools\Enable-PrtgMoverRemoting.ps1` over, and run it in an **elevated** PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Enable-PrtgMoverRemoting.ps1 -ManagerAddress <manager-ip>
+```
+
+This enables WinRM, allows remote administration with local admin accounts (`LocalAccountTokenFilterPolicy`), raises the WinRM limits and opens the firewall **only for the manager's IP**. If the servers are reached over the internet, use HTTPS as well:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Enable-PrtgMoverRemoting.ps1 -ManagerAddress <manager-ip> -Https
+```
+
+### 3. Prepare the manager (once, elevated)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tools\Setup-Manager.ps1 -TrustedHosts 10.0.0.10,10.0.0.20
+```
+
+This adds the servers to WinRM *TrustedHosts*, which you need when you address servers by IP or they aren't in the same domain. It also unblocks the downloaded scripts.
+
+### 4. Start the dashboard
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1
+```
+
+You can also double-click `Start-PrtgMover.cmd`. Your browser opens `http://localhost:8765/?token=…`. The token is stored in `data\token.txt`.
+
+## Quick start: migrate a PRTG server
+
+1. **Servers → Add server**: add the old PRTG server (role *Source*) and the new one (role *Target*), each with its administrator credential (for example `HOSTNAME\Administrator`).
+2. **Test all**: every server should show `ok`, and the source should show its PRTG version and data size.
+3. *(Only if PRTG isn't installed on the target yet.)* **Backup & Migrate → Upload installer**: upload the PRTG installer of the **same version** as the source (the *PRTG Network Monitor* setup `.exe` or the `.zip` from Paessler).
+4. **Backup & Migrate**: choose the source, tick the target(s), keep *Source after backup = Keep stopped*, and press **Migrate**.
+5. Follow the live log under **Jobs**. When it finishes, each target shows `PRTG ok` and the URL where the web interface answered.
+6. Work through the [after-migration checklist](#limitations-and-after-migration-checklist).
+
+A **backup only** run is the same, just without ticking any target. The source is restarted right after the backup.
+
+## Dashboard
+
+| Page | Purpose |
+|---|---|
+| **Overview** | Counters, recent jobs and a short summary of the process. |
+| **Servers** | Inventory, per-server connectivity test (OS, admin rights, PRTG version and data size, VPNs, disks) and credentials. |
+| **Backup & Migrate** | One source → any number of targets. Choose what to include, what happens to the source afterwards, the installer and the health-check timeout. |
+| **Backups** | Every package on the manager: **download**, restore to any target(s), delete, or **upload** a package (for example from another manager). |
+| **Jobs** | Live progress bar, step and colour-coded log for every job, per-target result, cancel, and full log download. |
+
+The dashboard listens on `localhost` only. To reach it from another machine on a trusted management network, run `tools\Setup-Manager.ps1 -DashboardPort 8765` once, then `Start-PrtgMover.ps1 -ListenAll`.
+
+## Command line
+
+The same engine is available for scripts and scheduled tasks:
+
+```powershell
+# Connectivity test (prompts for a credential)
+.\cli\Invoke-PrtgMover.ps1 -Action Test -Source 10.0.0.10 -Credential (Get-Credential)
+
+# Nightly backup of an inventory server, keep the last 7 packages
+.\cli\Invoke-PrtgMover.ps1 -Action Backup -Source PRTG-OLD -KeepLast 7
+
+# Migration to two servers; old server stopped and disabled
+.\cli\Invoke-PrtgMover.ps1 -Action Migrate -Source PRTG-OLD -Target PRTG-NEW1,PRTG-NEW2 -SourceAfter Disable
+
+# Restore an existing package, installing PRTG from installers\ if needed
+.\cli\Invoke-PrtgMover.ps1 -Action Restore -BackupName PRTG_OLDSRV_20260928-221500.zip -Target PRTG-NEW1 -InstallerFile PRTG_Installer.exe
+```
+
+Other switches: `-NoPrtg -NoHistory -NoVpn -NoDesktop -ExtraPaths -NoStart -HealthTimeoutMinutes -ConnectVpn -AllowDowngrade`.
+Exit codes: `0` success, `1` failure, `2` finished with errors on a target.
+
+## Backup package format
+
+`backups\PRTG_<SOURCE>_<yyyyMMdd-HHmmss>.zip`:
+
+```
+manifest.json              source, PRTG version and paths, VPN names, desktop users, extra paths
+prtg\data\...              PRTG data folder
+prtg\program\<folder>\...  program customisations (Custom Sensors, cert, lookups\custom, ...)
+prtg\registry\*.reg        exported Paessler registry keys
+vpn\allusers\*.pbk         all-user VPN phonebooks
+vpn\users\<user>\*.pbk     per-user VPN phonebooks
+vpn\vpn-connections.json   readable list of the VPN connections
+desktop\<user>\...         desktop files
+extra\<n>\...              extra paths
+```
+
+The manager keeps `<package>.zip.meta.json` next to each package (SHA-256 and manifest) for the dashboard. You can open packages with any ZIP tool.
+
+## Security
+
+- **Passwords are never written in plain text.** Credentials saved in the dashboard are encrypted with Windows DPAPI (`Export-Clixml`). Only the same Windows user on the same manager machine can decrypt them. `config\servers.json` holds no secrets.
+- **The dashboard needs a token**, and it listens on `localhost` by default.
+- **Restrict WinRM** to the manager's IP (`-ManagerAddress`), and use **HTTPS (5986)** whenever servers are reached over the internet.
+- **Backups contain sensitive data**: the PRTG configuration (including encrypted device credentials), the license key and the SSL private key. Store and share them like a password vault export.
+- `backups/`, `data/` and `config/servers.json` are in `.gitignore`. **Never commit them.**
+
+## Limitations and after-migration checklist
+
+- **License**: a PRTG license may only run on one core at a time. Keep the old core stopped (the default for a migration). If PRTG asks for it, re-activate the license on the new server.
+- **Remote probes** connect to the core's IP or DNS name. If the new core has a different address, update the DNS record or change the core address on each remote probe (*PRTG Administration Tool → Probe settings*).
+- **Saved VPN passwords and machine certificates** are protected by Windows DPAPI and can't be moved. Enter the VPN credentials once on the new server, and import any IKEv2/SSTP certificates.
+- **Target version**: it must be equal to or newer than the source. Older is blocked unless you enable *Allow downgrade*.
+- **Data drive**: if the source data folder lives on a drive the target doesn't have (for example `D:`), the target's default data path is used and the registry is updated.
+- **Rollback**: each target keeps its previous data folder as `<datapath>.pre-restore-<timestamp>` and its registry in `C:\PrtgMover\rollback\<timestamp>`.
+- **"Dial VPN after restore"** is off by default. A full-tunnel VPN can cut the WinRM connection the manager is using.
+
+## Project layout
+
+```
+Start-PrtgMover.ps1 / .cmd     dashboard (HttpListener) + REST API
+cli\Invoke-PrtgMover.ps1       command-line front end
+src\PrtgMover.psm1             manager engine: inventory, credentials, sessions, jobs, flows
+src\Remote\PrtgMover.Remote.ps1  code executed on source / target servers
+web\                           dashboard UI (vanilla HTML/CSS/JS, no build step)
+tools\Enable-PrtgMoverRemoting.ps1   run once on every server
+tools\Setup-Manager.ps1        run once on the manager
+tests\                         Pester 5 tests
+docs\                          architecture, troubleshooting
+```
+
+Runtime folders created automatically: `backups\`, `installers\`, `data\` (token, credentials, job logs, status) and `config\servers.json`.
+
+## Development
+
+```powershell
+Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -SkipPublisherCheck
+Invoke-Pester -Path .\tests -Output Detailed
+Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
+```
+
+CI (GitHub Actions, `windows-latest`, Windows PowerShell 5.1) parses every script, runs PSScriptAnalyzer and the Pester suite on each push and pull request.
+
+## License
+
+[MIT](LICENSE)
