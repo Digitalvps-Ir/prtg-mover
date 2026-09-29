@@ -531,6 +531,29 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
     It 'serves API requests without any check' {
         & $StatusOf POST "$Dash/api/servers" @{ 'Content-Type' = 'application/json'; 'Origin' = 'http://other.example' } '{"name":"T1","host":"192.0.2.10","role":"target"}' | Should -Be 200
     }
+
+    It 'a second start on the same port ends without an error and leaves the dashboard running' {
+        $out = Join-Path $Work 'second-start.txt'
+        $second = Start-Process powershell -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $DashPort, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work 'dash-data-2')
+        $null = $second.Handle   # without the handle Windows PowerShell does not report the exit code
+        $second.WaitForExit(30000) | Should -BeTrue
+        $second.ExitCode | Should -Be 0
+        [IO.File]::ReadAllText($out) | Should -Match 'is already running'
+        $DashProc.HasExited | Should -BeFalse
+        & $StatusOf GET "$Dash/api/info" | Should -Be 200
+    }
+
+    It 'refuses a port that another program uses' {
+        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start()
+        try {
+            $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $l.LocalEndpoint.Port, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work 'dash-data-3')
+            $null = $p.Handle
+            $p.WaitForExit(30000) | Should -BeTrue
+            $p.ExitCode | Should -Be 1
+        } finally { $l.Stop() }
+    }
 }
 
 Describe 'Manager module' {

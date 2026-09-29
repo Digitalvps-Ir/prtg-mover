@@ -43,6 +43,22 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
+
+# A dashboard that already runs on this port is opened, not started a second time.
+$probe = New-Object Net.Sockets.TcpClient
+try { $portInUse = $probe.ConnectAsync('127.0.0.1', $Port).Wait(500) -and $probe.Connected } catch { $portInUse = $false } finally { $probe.Close() }
+if ($portInUse) {
+    $other = $null
+    try { $other = Invoke-RestMethod -Uri "http://localhost:$Port/api/info" -TimeoutSec 5 } catch { }
+    if ($other -and ($other.PSObject.Properties['product'] -or $other.PSObject.Properties['backupsPath'])) {
+        Write-Host "PRTG Mover $($other.version) is already running: http://localhost:$Port/" -ForegroundColor Green
+        if (-not $NoBrowser) { Start-Process "http://localhost:$Port/" }
+        exit 0
+    }
+    Write-Host "Port $Port is used by another program. Start PRTG Mover on another port: .\Start-PrtgMover.ps1 -Port 8766" -ForegroundColor Red
+    exit 1
+}
+
 # Echo live job logs into this console (use -Quiet to turn it off).
 if (-not $Quiet) { $env:PRTGMOVER_ECHO = '1' }
 Import-Module (Join-Path $Root 'src\PrtgMover.psm1') -Force -DisableNameChecking
@@ -196,7 +212,7 @@ function Invoke-PmRoute {
     switch -Regex ("$method $path") {
         '^GET /api/info$' {
             Send-PmJson $Ctx @{
-                version = $Version; manager = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; root = $DataRootPath
+                product = 'PRTG Mover'; version = $Version; manager = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; root = $DataRootPath
                 backupsPath = (Get-PmPath Backups); installersPath = (Get-PmPath Installers)
                 servers = @(Get-PmServers).Count; backups = @(Get-PmBackups).Count
             }

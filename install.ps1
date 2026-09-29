@@ -43,6 +43,16 @@
 .PARAMETER NoShortcut
     Do not create shortcuts.
 
+.PARAMETER Autostart
+    Start the dashboard when you log on to Windows (shortcut in the Startup folder, minimized,
+    without opening the browser). An update keeps it.
+
+.PARAMETER NoAutostart
+    Remove the start with Windows again.
+
+.PARAMETER StartupFolder
+    Folder for the autostart shortcut. Default: the Startup folder of the current user.
+
 .PARAMETER NoStart
     Do not start the dashboard at the end.
 
@@ -69,6 +79,9 @@ param(
     [ValidateRange(1, 65535)][int]$Port = 8765,
     [string[]]$ShortcutFolder,
     [switch]$NoShortcut,
+    [switch]$Autostart,
+    [switch]$NoAutostart,
+    [string]$StartupFolder,
     [switch]$NoStart,
     [switch]$Uninstall
 )
@@ -224,11 +237,40 @@ function New-Shortcuts {
     return $made
 }
 
+function Get-AutostartShortcut {
+    $folder = if ($StartupFolder) { $StartupFolder } else { [Environment]::GetFolderPath('Startup') }
+    return (Join-Path $folder 'PRTG Mover.lnk')
+}
+
+function Set-AutostartShortcut {
+    <# The dashboard starts at logon: minimized and without opening the browser. #>
+    param([string]$Path)
+    $lnk = Get-AutostartShortcut
+    New-Item -ItemType Directory -Force -Path (Split-Path $lnk -Parent) | Out-Null
+    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+    $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Path 'Start-PrtgMover.ps1')`" -Port $Port -NoBrowser"
+    $s.WorkingDirectory = $Path
+    $s.WindowStyle = 7
+    $s.Description = 'PRTG Mover dashboard (start with Windows)'
+    $s.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll') + ',109'
+    $s.Save()
+    return $lnk
+}
+
 function Remove-Shortcuts {
+    <# Removes the shortcuts of THIS installation. A shortcut that starts another folder is left alone. #>
+    param([string]$Path)
     $removed = @()
+    $shell = New-Object -ComObject WScript.Shell
+    $links = @(Get-AutostartShortcut) + @(Get-ShortcutFolders | ForEach-Object { Join-Path $_ 'PRTG Mover.lnk' })
+    foreach ($lnk in $links) {
+        if (-not (Test-Path -LiteralPath $lnk)) { continue }
+        $s = $shell.CreateShortcut($lnk)
+        $mine = ("$($s.WorkingDirectory)".TrimEnd('\') -eq $Path) -or ("$($s.Arguments)" -like "*$Path\Start-PrtgMover.*") -or ("$($s.TargetPath)" -like "$Path\*")
+        if ($mine) { Remove-Item -LiteralPath $lnk -Force; $removed += $lnk }
+    }
     foreach ($folder in (Get-ShortcutFolders)) {
-        $lnk = Join-Path $folder 'PRTG Mover.lnk'
-        if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force; $removed += $lnk }
         if ((Split-Path $folder -Leaf) -eq 'PRTG Mover' -and (Test-Path -LiteralPath $folder) -and -not (Get-ChildItem -LiteralPath $folder -Force)) { Remove-Item -LiteralPath $folder -Force }
     }
     return $removed
@@ -248,7 +290,7 @@ $InstallPath = [IO.Path]::GetFullPath($InstallPath).TrimEnd('\')
 
 if ($Uninstall) {
     Write-Step 'Removing shortcuts'
-    $r = @(Remove-Shortcuts)
+    $r = @(Remove-Shortcuts -Path $InstallPath)
     if ($r.Count) { $r | ForEach-Object { Write-Ok "removed $_" } } else { Write-Info 'no shortcuts found' }
     Write-Step 'Removing program files'
     if (-not (Test-ProgramFolder $InstallPath)) { Write-Note "No PRTG Mover installation in $InstallPath - nothing removed."; return }
@@ -315,6 +357,14 @@ try {
     if ($NoShortcut) { Write-Info 'skipped (-NoShortcut)' }
     else { New-Shortcuts -Path $InstallPath | ForEach-Object { Write-Ok $_ } }
 
+    Write-Step 'Start with Windows'
+    $auto = Get-AutostartShortcut
+    if ($NoAutostart) {
+        if (Test-Path -LiteralPath $auto) { Remove-Item -LiteralPath $auto -Force; Write-Ok 'switched off' } else { Write-Info 'was not switched on' }
+    } elseif ($Autostart -or (Test-Path -LiteralPath $auto)) {
+        Write-Ok "the dashboard starts when you log on ($(Set-AutostartShortcut -Path $InstallPath))"
+    } else { Write-Info 'not switched on (use -Autostart)' }
+
     Write-Step 'WinRM on this computer'
     if (-not $TrustedHosts.Count) { Write-Info 'skipped - only needed for servers reached over plain WinRM (HTTP). RDP and WinRM over HTTPS need nothing here.' }
     else {
@@ -343,7 +393,7 @@ try {
 
     Write-Host ''
     Write-Host "  PRTG Mover $version is installed in $InstallPath" -ForegroundColor Green
-    Write-Host '  Start it with the "PRTG Mover" shortcut. Run install.ps1 again to update.'
+    Write-Host '  Open it with the "PRTG Mover" shortcut (it opens the running dashboard or starts it). Run install.ps1 again to update.'
     Write-Host ''
 } finally {
     if ($temporary -and (Test-Path -LiteralPath $temporary)) { Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue }
