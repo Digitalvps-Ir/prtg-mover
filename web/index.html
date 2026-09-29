@@ -59,12 +59,13 @@
       <header class="page-head">
         <div><h1>Servers</h1><p class="muted">Inventory of source and target servers. Passwords are stored DPAPI-encrypted for the current Windows user only.</p></div>
         <div class="actions">
+          <button class="btn" id="checkPortsBtn">Check ports</button>
           <button class="btn" id="testAllBtn">Test all</button>
           <button class="btn primary" id="addServerBtn">Add server</button>
         </div>
       </header>
       <div class="card flush"><div class="table-wrap"><table class="table" id="serversTable">
-        <thead><tr><th>Name</th><th>Host</th><th>Role</th><th>Credential</th><th>Last test</th><th>PRTG</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Host</th><th>Role</th><th>Ports</th><th>Credential</th><th>Last test</th><th>PRTG</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div></div>
     </section>
@@ -83,22 +84,27 @@
           <p class="hint">Leave all targets unchecked to create a backup only.</p>
           <h2 class="mt">3 · What to include</h2>
           <label class="check"><input type="checkbox" name="IncludePrtg" checked> PRTG (configuration, registry, certificates, custom sensors, lookups, MIBs…)</label>
+          <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source <b>license</b> to the target(s)</label>
           <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> Historic monitoring data &amp; logs</label>
           <label class="check"><input type="checkbox" name="IncludeVpn" checked> Windows VPN connections (all-user + per-user phonebooks)</label>
           <label class="check"><input type="checkbox" name="IncludeDesktop" checked> Desktop files of all user profiles + Public desktop</label>
           <label class="field"><span>Extra paths on the source (one per line, optional)</span><textarea name="ExtraPaths" rows="3" placeholder="D:\Scripts&#10;C:\Tools\prtg-helper.ps1"></textarea></label>
         </div>
         <div class="card">
-          <h2>4 · Source after backup</h2>
-          <div class="segmented" id="sourceAfter">
-            <label><input type="radio" name="SourceAfter" value="KeepStopped" checked><span>Keep stopped</span></label>
-            <label><input type="radio" name="SourceAfter" value="Disable"><span>Stop &amp; disable</span></label>
-            <label><input type="radio" name="SourceAfter" value="Restart"><span>Restart</span></label>
+          <h2>4 · Source server</h2>
+          <label class="check notouch"><input type="checkbox" name="NoTouch"> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
+          <div id="sourceAfterBox">
+            <div class="segmented" id="sourceAfter">
+              <label><input type="radio" name="SourceAfter" value="KeepStopped" checked><span>Keep stopped</span></label>
+              <label><input type="radio" name="SourceAfter" value="Disable"><span>Stop &amp; disable</span></label>
+              <label><input type="radio" name="SourceAfter" value="Restart"><span>Restart &amp; verify fully up</span></label>
+            </div>
+            <p class="hint"><b>Restart &amp; verify</b> starts core + probe and waits until both services run, the web interface answers and everything is still stable after 45 s — otherwise the job fails. For a real migration keep the old server stopped (two cores with the same license would alert twice).</p>
           </div>
-          <p class="hint">For a real migration keep the old server stopped — two cores with the same configuration and license would monitor and alert twice. For a backup-only run the source is always restarted.</p>
 
           <h2 class="mt">5 · Target options</h2>
-          <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and wait until the web interface is up</label>
+          <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify it is fully up (services + web + stability)</label>
+          <label class="check"><input type="checkbox" name="OpenFirewall" checked> Open the Windows firewall for the PRTG web ports and remote probes (23560)</label>
           <label class="field inline"><span>Health-check timeout (minutes)</span><input type="number" name="HealthTimeoutMinutes" value="15" min="1" max="120"></label>
           <label class="check"><input type="checkbox" name="ConnectVpn"> Dial the VPN connections after restore</label>
           <label class="check"><input type="checkbox" name="AllowDowngrade"> Allow restoring onto an older PRTG version (not recommended)</label>
@@ -150,7 +156,8 @@
       <label class="field"><span>Display name</span><input name="name" required placeholder="PRTG-OLD"></label>
       <label class="field"><span>Host / IP</span><input name="host" required placeholder="10.0.0.10"></label>
       <label class="field"><span>Role</span><select name="role"><option value="both">Source &amp; target</option><option value="source">Source</option><option value="target">Target</option></select></label>
-      <label class="field"><span>WinRM port (0 = default)</span><input type="number" name="port" value="0" min="0" max="65535"></label>
+      <label class="field"><span>RDP port</span><input type="number" name="rdpPort" value="3389" min="1" max="65535" required></label>
+      <label class="field"><span>WinRM port (0 = default 5985 / 5986)</span><input type="number" name="port" value="0" min="0" max="65535"></label>
       <label class="field"><span>Authentication</span><select name="authentication"><option>Default</option><option>Negotiate</option><option>Kerberos</option><option>CredSSP</option><option>Basic</option></select></label>
       <div class="field"><span>Transport</span>
         <label class="check"><input type="checkbox" name="useSsl"> HTTPS (5986)</label>
@@ -178,6 +185,8 @@
     <p class="muted" id="restoreName"></p>
     <div id="restoreTargets" class="checklist"></div>
     <label class="check"><input type="checkbox" name="RestorePrtg" checked> PRTG</label>
+    <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source license</label>
+    <label class="check sub"><input type="checkbox" name="OpenFirewall" checked> Open firewall for PRTG ports</label>
     <label class="check"><input type="checkbox" name="RestoreVpn" checked> VPN connections</label>
     <label class="check"><input type="checkbox" name="RestoreDesktop" checked> Desktop files</label>
     <label class="check"><input type="checkbox" name="RestoreExtra" checked> Extra paths</label>

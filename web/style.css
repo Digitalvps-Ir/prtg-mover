@@ -108,6 +108,10 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 .check { display: flex; gap: 8px; align-items: flex-start; margin: 7px 0; cursor: pointer; }
 .check input { width: auto; margin-top: 3px; accent-color: var(--accent); }
 .check.sub { margin-left: 24px; }
+.check.notouch { background: var(--ok-soft); border-radius: 8px; padding: 8px 10px; }
+#sourceAfterBox { margin-top: 10px; transition: opacity .2s; }
+#sourceAfterBox.disabled { opacity: .4; pointer-events: none; }
+.ports { display: flex; gap: 4px; flex-wrap: wrap; }
 .checklist { display: grid; gap: 2px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; max-height: 220px; overflow: auto; }
 .checklist .empty { color: var(--muted); padding: 8px 0; }
 fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 12px 0; padding: 4px 14px 8px; }

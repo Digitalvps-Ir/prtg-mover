@@ -211,8 +211,10 @@ function Invoke-PmRoute {
             if (-not $b.name -or -not $b.host) { Send-PmJson $Ctx @{ error = 'name and host are required' } 400; return }
             $auth = if ($b.authentication) { [string]$b.authentication } else { 'Default' }
             $role = if ($b.role) { [string]$b.role } else { 'both' }
+            $rdp = if ([int]$b.rdpPort -gt 0) { [int]$b.rdpPort } else { 3389 }
+            if ([int]$b.port -gt 0 -and [int]$b.port -eq $rdp) { Send-PmJson $Ctx @{ error = "WinRM port $rdp is the RDP port. Put $rdp in 'RDP port' and leave the WinRM port at 0 (default 5985/5986)." } 400; return }
             $srv = Set-PmServer -Id ([string]$b.id) -Name $b.name -HostName $b.host -Port ([int]$b.port) -UseSsl ([bool]$b.useSsl) `
-                -SkipCaCheck ([bool]$b.skipCaCheck) -Authentication $auth -Role $role -Notes ([string]$b.notes)
+                -SkipCaCheck ([bool]$b.skipCaCheck) -Authentication $auth -Role $role -Notes ([string]$b.notes) -RdpPort $rdp
             if ($b.username -and $b.password) { Save-PmCredential -ServerId $srv.id -Credential (New-PmCredential -UserName $b.username -Password $b.password) }
             Send-PmJson $Ctx $srv
             return
@@ -227,6 +229,33 @@ function Invoke-PmRoute {
             return
         }
         '^DELETE /api/servers/[^/]+/credential$' { Remove-PmCredential -ServerId $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
+        '^POST /api/servers/[^/]+/rdp$' {
+            $srv = Get-PmServer -Id $seg[2]
+            [void](Start-PmRdp -Server $srv)
+            Send-PmJson $Ctx @{ ok = $true; target = "$($srv.host):$(Get-PmRdpPort $srv)" }
+            return
+        }
+        '^GET /api/servers/ports$' {
+            # Quick TCP reachability (RDP + WinRM) of every server, checked in parallel.
+            $servers = @(Get-PmServers)
+            $checks = foreach ($s in $servers) {
+                foreach ($kind in 'winrm', 'rdp') {
+                    $p = if ($kind -eq 'rdp') { Get-PmRdpPort $s } else { Get-PmWinRmPort $s }
+                    $c = New-Object Net.Sockets.TcpClient
+                    @{ id = $s.id; kind = $kind; port = $p; client = $c; task = $c.ConnectAsync($s.host, $p) }
+                }
+            }
+            $deadline = (Get-Date).AddSeconds(3)
+            foreach ($c in @($checks)) { $left = [int]($deadline - (Get-Date)).TotalMilliseconds; if ($left -gt 0) { try { [void]$c.task.Wait($left) } catch { } } }
+            $out = @{}
+            foreach ($s in $servers) { $out[$s.id] = @{} }
+            foreach ($c in @($checks)) {
+                $out[$c.id][$c.kind] = @{ port = $c.port; open = ($c.task.Status -eq 'RanToCompletion') }
+                $c.client.Dispose()
+            }
+            Send-PmJson $Ctx $out
+            return
+        }
 
         '^GET /api/backups$' { Send-PmJson $Ctx @(Get-PmBackups); return }
         '^PUT /api/backups/upload$' {

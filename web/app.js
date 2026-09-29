@@ -56,7 +56,7 @@
   };
 
   // ------------------------------------------------------------ state
-  const state = { servers: [], backups: [], installers: [], jobs: [], selectedJob: null, logSince: 0, jobTimer: null };
+  const state = { servers: [], backups: [], installers: [], jobs: [], ports: {}, selectedJob: null, logSince: 0, jobTimer: null };
 
   // ------------------------------------------------------------ navigation
   function show(view) {
@@ -97,9 +97,32 @@
     renderServers(); renderMigrateForm(); renderOverview();
   }
 
+  async function checkPorts(showToast) {
+    if (!state.servers.length) return;
+    try {
+      state.ports = await api('GET', '/api/servers/ports');
+      renderServers();
+      if (showToast) toast('Ports checked');
+    } catch (err) { toast(err.message, true); }
+  }
+  $('#checkPortsBtn').addEventListener('click', () => checkPorts(true));
+
+  function portBadges(s) {
+    const live = state.ports[s.id];
+    const last = s.lastStatus && s.lastStatus.ports;
+    const one = (label, info, fallbackPort) => {
+      if (!info) return `<span class="badge" title="not checked yet">${label} ${fallbackPort}</span>`;
+      return `<span class="badge ${info.open ? 'ok' : 'err'}" title="${info.open ? 'reachable' : 'not reachable'} from the manager">${label} ${esc(info.port)}</span>`;
+    };
+    const rdp = live ? live.rdp : last ? { port: last.rdpPort, open: last.rdp } : null;
+    const win = live ? live.winrm : last ? { port: last.winrmPort, open: last.winrm } : null;
+    const winDefault = s.port || (s.useSsl ? 5986 : 5985);
+    return `<div class="ports">${one('RDP', rdp, s.rdpPort || 3389)}${one('WinRM', win, winDefault)}</div>`;
+  }
+
   function renderServers() {
     const tb = $('#serversTable tbody');
-    if (!state.servers.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">No servers yet — add the source PRTG server and at least one target.</td></tr>'; return; }
+    if (!state.servers.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">No servers yet — add the source PRTG server and at least one target.</td></tr>'; return; }
     tb.innerHTML = state.servers.map((s) => {
       const st = s.lastStatus; const info = st && st.info;
       let test = '<span class="badge">never</span>';
@@ -110,8 +133,9 @@
       return `<tr>
         <td><b>${esc(s.name)}</b>${info ? `<span class="sub-text">${esc(info.OS)}</span>` : ''}</td>
         <td class="num">${esc(s.host)}${s.useSsl ? ' <span class="badge info">HTTPS</span>' : ''}</td>
-        <td>${esc(s.role)}</td><td>${cred}</td><td>${test}</td><td>${prtg}</td>
+        <td>${esc(s.role)}</td><td>${portBadges(s)}</td><td>${cred}</td><td>${test}</td><td>${prtg}</td>
         <td><div class="btn-group">
+          <button class="btn small" data-act="rdp" data-id="${esc(s.id)}" title="Open Remote Desktop to ${esc(s.host)}:${esc(s.rdpPort || 3389)}">RDP</button>
           <button class="btn small" data-act="test" data-id="${esc(s.id)}">Test</button>
           <button class="btn small" data-act="edit" data-id="${esc(s.id)}">Edit</button>
           <button class="btn small danger" data-act="del" data-id="${esc(s.id)}">Delete</button>
@@ -123,6 +147,9 @@
     const b = e.target.closest('button[data-act]'); if (!b) return;
     const s = state.servers.find((x) => x.id === b.dataset.id);
     if (b.dataset.act === 'test') startJob({ type: 'test', serverIds: [s.id] });
+    if (b.dataset.act === 'rdp') {
+      try { const r = await api('POST', `/api/servers/${encodeURIComponent(s.id)}/rdp`); toast(`Remote Desktop opened on the manager → ${r.target}`); } catch (err) { toast(err.message, true); }
+    }
     if (b.dataset.act === 'edit') openServerDialog(s);
     if (b.dataset.act === 'del' && confirm(`Delete server "${s.name}" and its saved credential?`)) {
       try { await api('DELETE', `/api/servers/${encodeURIComponent(s.id)}`); toast('Server deleted'); loadServers(); } catch (err) { toast(err.message, true); }
@@ -139,7 +166,7 @@
     $('#serverDialogTitle').textContent = s ? `Edit ${s.name}` : 'Add server';
     f.id.value = s ? s.id : '';
     if (s) {
-      f.name.value = s.name; f.host.value = s.host; f.role.value = s.role || 'both'; f.port.value = s.port || 0;
+      f.name.value = s.name; f.host.value = s.host; f.role.value = s.role || 'both'; f.port.value = s.port || 0; f.rdpPort.value = s.rdpPort || 3389;
       f.authentication.value = s.authentication || 'Default'; f.useSsl.checked = !!s.useSsl; f.skipCaCheck.checked = !!s.skipCaCheck; f.notes.value = s.notes || '';
     }
     $('#serverDialog').showModal();
@@ -149,11 +176,12 @@
     const f = $('#serverForm');
     const body = {
       id: f.id.value || undefined, name: f.name.value.trim(), host: f.host.value.trim(), role: f.role.value, port: Number(f.port.value) || 0,
+      rdpPort: Number(f.rdpPort.value) || 3389,
       authentication: f.authentication.value, useSsl: f.useSsl.checked, skipCaCheck: f.skipCaCheck.checked, notes: f.notes.value,
       username: f.username.value.trim() || undefined, password: f.password.value || undefined,
     };
     f.password.value = '';
-    try { await api('POST', '/api/servers', body); toast('Server saved'); loadServers(); } catch (err) { toast(err.message, true); }
+    try { await api('POST', '/api/servers', body); toast('Server saved'); await loadServers(); checkPorts(false); } catch (err) { toast(err.message, true); }
   });
 
   // ------------------------------------------------------------ migrate form
@@ -194,21 +222,27 @@
     const options = {
       IncludePrtg: f.IncludePrtg.checked, IncludeHistory: f.IncludeHistory.checked, IncludeVpn: f.IncludeVpn.checked, IncludeDesktop: f.IncludeDesktop.checked,
       ExtraPaths: f.ExtraPaths.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+      NoTouch: f.NoTouch.checked, CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked,
       StartServices: f.StartServices.checked, HealthTimeoutMinutes: Number(f.HealthTimeoutMinutes.value) || 15, ConnectVpn: f.ConnectVpn.checked,
       AllowDowngrade: f.AllowDowngrade.checked, InstallerFile: f.InstallerFile.value, InstallerArgs: f.InstallerArgs.value,
       RestorePrtg: true, RestoreVpn: true, RestoreDesktop: true, RestoreExtra: true,
     };
+    const src = state.servers.find((s) => s.id === f.sourceId.value).name;
+    const srcText = options.NoTouch ? 'The source is NOT touched (PRTG keeps running, VSS snapshot).' : null;
     if (targets.length) {
       options.SourceAfter = f.SourceAfter.value;
       const names = targets.map((id) => state.servers.find((s) => s.id === id).name).join(', ');
-      const src = state.servers.find((s) => s.id === f.sourceId.value).name;
-      if (!confirm(`Migrate ${src} → ${names}?\n\nPRTG will be stopped on the source (${options.SourceAfter}) and the data on each target will be replaced (a rollback copy is kept on the target).`)) return;
+      const srcLine = srcText || `PRTG on the source will be stopped (${options.SourceAfter}).`;
+      const lic = options.CopyLicense ? 'The source license IS copied.' : 'The source license is NOT copied (targets keep their own).';
+      if (!confirm(`Migrate ${src} → ${names}?\n\n${srcLine}\n${lic}\nThe PRTG data on each target is replaced (a rollback copy is kept on the target).\n\nPre-flight checks run first — nothing is changed if they fail.`)) return;
       startJob({ type: 'migrate', sourceId: f.sourceId.value, targetIds: targets, options });
     } else {
       options.SourceAfter = 'Restart';
+      if (!confirm(`Back up ${src}?\n\n${srcText || 'PRTG is stopped briefly for a consistent copy, then restarted and verified fully up.'}`)) return;
       startJob({ type: 'backup', sourceId: f.sourceId.value, options });
     }
   });
+  $('#migrateForm').NoTouch.addEventListener('change', (e) => { $('#sourceAfterBox').classList.toggle('disabled', e.target.checked); });
 
   $('#installerUpload').addEventListener('change', (e) => {
     const file = e.target.files[0]; if (!file) return;
@@ -270,7 +304,7 @@
     if (!targets.length) return toast('Select at least one target', true);
     startJob({
       type: 'restore', backupName: f.dataset.name, targetIds: targets,
-      options: { RestorePrtg: f.RestorePrtg.checked, RestoreVpn: f.RestoreVpn.checked, RestoreDesktop: f.RestoreDesktop.checked, RestoreExtra: f.RestoreExtra.checked, StartServices: f.StartServices.checked, InstallerFile: f.InstallerFile.value },
+      options: { CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked, RestorePrtg: f.RestorePrtg.checked, RestoreVpn: f.RestoreVpn.checked, RestoreDesktop: f.RestoreDesktop.checked, RestoreExtra: f.RestoreExtra.checked, StartServices: f.StartServices.checked, InstallerFile: f.InstallerFile.value },
     });
   });
 
@@ -386,7 +420,7 @@
         const rep = t.report || {};
         const b = (v) => `<span class="badge ${v === 'ok' ? 'ok' : v === 'failed' ? 'err' : v === 'skipped' ? '' : 'warn'}">${esc(v || '–')}</span>`;
         return `<div class="rt"><b>${esc(t.target)}</b> ${t.ok ? '<span class="badge ok">OK</span>' : '<span class="badge err">errors</span>'}
-          <div class="sub-text">PRTG ${b(rep.Prtg)} · VPN ${b(rep.Vpn)} · Desktop ${b(rep.Desktop)} · Extra ${b(rep.Extra)}</div>
+          <div class="sub-text">PRTG ${b(rep.Prtg)}${rep.Version ? ` ${esc(rep.Version)}` : ''} · License ${b(rep.License && rep.License.startsWith('copied') ? 'ok' : rep.License)} · VPN ${b(rep.Vpn)} · Desktop ${b(rep.Desktop)} · Extra ${b(rep.Extra)}</div>
           ${rep.WebUrl ? `<div class="sub-text">Web: ${esc(rep.WebUrl)}</div>` : ''}${t.error ? `<div class="sub-text" style="color:var(--err)">${esc(t.error)}</div>` : ''}</div>`;
       }).join('') + '</div>';
     }
@@ -398,6 +432,7 @@
     try {
       await loadInfo();
       await Promise.all([loadServers(), loadBackups(), loadInstallers(), loadJobs()]);
+      checkPorts(false);
     } catch (err) { if (err.message !== 'Unauthorized') toast(err.message, true); }
   }
   show(location.hash.slice(1) || 'overview');
