@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.2 — 2026-09-29
+
+### Security
+- **The dashboard API is protected again.** Version 1.6.0 removed the access token, so any program on the manager, and any web page open in its browser, could start jobs with the saved server credentials. Every API request now needs the token in `data\token.txt`.
+- **Nothing to type on the manager.** The page opened at `http://localhost:8765/` receives the token from the dashboard. It is only handed out to a browser on the manager itself that uses a local name.
+- **Requests from other web sites are refused**, with or without a token.
+- The token is accepted in the address for file downloads only (backup package, job log, diagnostics).
+- From another computer (`-ListenAll`) the link with the token is needed; the dashboard console prints it. `-NewToken` creates a new token.
+
+### Added
+- `Start-PrtgMover.ps1 -DataRoot <folder>` keeps `config\`, `data\`, `backups\` and `installers\` outside the program folder.
+
 ## 1.6.1 — 2026-09-29
 
 ### Added

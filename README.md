@@ -275,7 +275,7 @@ The manager keeps `<package>.zip.meta.json` next to each package (SHA-256 and ma
 ## Security
 
 - **Passwords are never written in plain text.** Credentials saved in the dashboard are encrypted with Windows DPAPI (`Export-Clixml`). Only the same Windows user on the same manager machine can decrypt them. `config\servers.json` holds no secrets.
-- **The dashboard listens on `localhost` by default** and does not ask for an access token.
+- **The dashboard listens on `localhost` by default.** Every API request needs an access token (`data\token.txt`). On the manager itself you never type it: the page opened at `http://localhost:8765/` receives the token from the dashboard. Requests from other web sites are refused, so a page open in your browser cannot start jobs. From another computer (`-ListenAll`) you need the link with the token that the dashboard console prints. `-NewToken` creates a new token.
 - **Restrict WinRM** to the manager's IP (`-ManagerAddress`), and use **HTTPS (5986)** whenever servers are reached over the internet. When the migration is done, you can remove the firewall rule or disable WinRM again.
 - **The RDP agent** only runs while you keep its window open, and it only accepts the functions PRTG Mover needs.
 - **Backups contain sensitive data**: the PRTG configuration (including encrypted device credentials), the license and the SSL private key. Store and share them like a password vault export.
