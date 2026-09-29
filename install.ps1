@@ -174,7 +174,9 @@ function Copy-Program {
 function Test-Installation {
     <# Every script must parse, and the dashboard must answer on a free port. Returns the version. #>
     param([string]$Path)
-    foreach ($f in (Get-ChildItem -LiteralPath $Path -Recurse -File -Include *.ps1, *.psm1 | Where-Object { $_.FullName -notmatch '\\(data|backups|installers)\\' })) {
+    # -Include is ignored together with -LiteralPath in Windows PowerShell 5.1, so filter by extension.
+    $dataPattern = '^' + [regex]::Escape($Path.TrimEnd('\')) + '\\(data|backups|installers)\\'
+    foreach ($f in (Get-ChildItem -LiteralPath $Path -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1' -and $_.FullName -notmatch $dataPattern })) {
         $errors = $null
         [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors)
         if ($errors) { throw "Script '$($f.FullName)' is damaged: $($errors[0].Message)" }
@@ -302,7 +304,7 @@ try {
     if (Test-Path -LiteralPath (Join-Path $InstallPath 'config\servers.json')) { $kept += 'server list' }
     if (Get-ChildItem -LiteralPath (Join-Path $InstallPath 'backups') -Filter '*.zip' -ErrorAction SilentlyContinue) { $kept += 'backups' }
     if ($kept.Count) { Write-Ok "your data was kept: $($kept -join ', ')" }
-    Get-ChildItem -LiteralPath $InstallPath -Recurse -File -Include *.ps1, *.psm1, *.cmd -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $InstallPath -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.ps1', '.psm1', '.cmd' } | Unblock-File -ErrorAction SilentlyContinue
     Write-Ok 'scripts unblocked'
 
     Write-Step 'Testing the installation'
