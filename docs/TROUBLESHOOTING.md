@@ -30,7 +30,7 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 | `\\tsclient\…` does not exist on the server | The Remote Desktop session was not opened with the dashboard's **RDP** button, or drive access was not allowed in the connection dialog. Close the session and open it with the **RDP** button. |
 | `Waiting for the agent…` although the agent runs | The Remote Desktop window was closed. The agent can only reach the manager while the session is connected. Minimizing the window is fine. |
 | `Agent … is not elevated` | Start PowerShell on the server with *Run as administrator* before pasting the agent command. |
-| `The client cannot connect to the destination…` | WinRM isn't enabled on the server, or a firewall blocks it. Run `tools\Enable-PrtgMoverRemoting.ps1` on the server and check TCP 5985/5986 from the manager with `Test-NetConnection <ip> -Port 5986`. |
+| `The client cannot connect to the destination…` | WinRM isn't enabled on the server, or a firewall blocks it. Run `tools\Enable-PrtgMoverRemoting.ps1 -Https` on the server and check the port from the manager with `Test-NetConnection <ip> -Port 5986`. The firewall rule only accepts the manager's address: when that address has changed, run the script again. |
 | `The SSL certificate is expired` right after enabling WinRM | The manager's clock is behind the server's clock, so the new certificate is not valid yet. The tool waits until it is valid (up to 40 minutes). Sync the Windows clock of the manager to end the wait. |
 | `The WinRM client cannot process the request… TrustedHosts` | Plain WinRM (HTTP) to an IP address or to a server outside the domain. Use HTTPS (`-Https`), or on the manager (elevated) run `tools\Setup-Manager.ps1 -TrustedHosts <ip>`. |
 | `Access is denied` | Wrong credential, or a local administrator without `LocalAccountTokenFilterPolicy=1` (the enable script sets it). Use the `HOST\user` format. |
@@ -65,6 +65,17 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 |---|---|
 | `Could not listen on http://+:8765/` | `-ListenAll` needs a URL ACL. Run `tools\Setup-Manager.ps1 -DashboardPort 8765` (elevated). |
 | Scripts are blocked | Run `Get-ChildItem -Recurse *.ps1,*.psm1 \| Unblock-File`, or start with `powershell -ExecutionPolicy Bypass -File …`. |
+
+## Installation
+
+| Symptom | Cause / fix |
+|---|---|
+| `Could not download PRTG Mover from GitHub` | The repository is private. Sign in with `git` or `gh auth login`, or download the ZIP in your browser, extract it and run `install.cmd` from that folder. |
+| `The dashboard is running from C:\PrtgMover` | An update can't replace files that are in use. Close the dashboard window and run the installer again. |
+| `Script '…' is damaged` | A file was not copied completely or was changed. Get the files again and run the installer once more. |
+| `The dashboard did not answer within 45 seconds` | Antivirus software may hold back the scripts. Start `Start-PrtgMover.cmd` in the installation folder by hand and read the message in its window. |
+| Port 8765 is used by another program | Install with `-Port <other port>`; the shortcut then uses that port. |
+| Where is my data after `-Uninstall`? | Still in the installation folder: `config\`, `data\`, `backups\`, `installers\`. Delete the folder yourself when you don't need it any more. |
 
 ## Rolling back a target
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.7.0 — 2026-09-29
+
+### Added
+- **Installer for the manager**: `install.cmd` (double-click) and `install.ps1`. It checks the computer, copies the program to `C:\PrtgMover` (or `-InstallPath`), unblocks the scripts, tests the installation (every script must be intact and the dashboard must answer), creates the shortcut *PRTG Mover* on the desktop and in the start menu, and starts the dashboard. Administrator rights are not needed.
+- Running the installer again updates or repairs the installation. `-Uninstall` removes the program and the shortcuts. The server list, saved credentials, jobs, logs, backup packages and PRTG installers are never touched.
+- The installer takes the program from its own folder, from `-Source` (folder or ZIP file) or from GitHub (git, GitHub CLI or a plain download).
+- `install.ps1 -TrustedHosts` prepares the manager for plain WinRM and asks for administrator rights for that step only.
+
+### Changed
+- **`tools\Enable-PrtgMoverRemoting.ps1`** (WinRM method, run on a server):
+  - finds the manager's address itself, from the Remote Desktop session it is run in. Without an address it stops instead of opening the firewall for everyone; `-AllowAnyAddress` has to be given for that.
+  - with `-Https` it opens only port 5986 and closes plain WinRM (port 5985) in the firewall, which Windows opens when remoting is enabled. `-KeepPlainWinRM` leaves it open.
+  - the certificate is valid from two days before its creation, so a manager whose clock is behind accepts it right away.
+  - checks the result (service, port, listener) and prints what to enter in the dashboard.
+
 ## 1.6.2 — 2026-09-29
 
 ### Changed

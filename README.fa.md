@@ -48,30 +48,46 @@
 
 ## نصب و راه‌اندازی
 
-### ۱. دریافت ابزار روی سیستم Manager
+### ۱. نصب روی سیستم Manager
+
+فایل‌ها را بگیرید (با `git clone` یا دانلود ZIP از GitHub و باز کردن آن) و روی **`install.cmd`** دوبار کلیک کنید. همین کار از داخل PowerShell:
 
 </div>
 
 ```powershell
-git clone https://github.com/Digitalvps-Ir/prtg-mover.git C:\PrtgMover
-cd C:\PrtgMover
+git clone https://github.com/Digitalvps-Ir/prtg-mover.git
+cd prtg-mover
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 <div dir="rtl">
 
-### ۲. اجرای داشبورد
+به دسترسی Administrator نیاز نیست. نصب‌کننده این کارها را انجام می‌دهد:
 
-</div>
+۱. ویندوز و PowerShell (نسخهٔ 5.1 یا بالاتر) را بررسی می‌کند.
+۲. برنامه را در `C:\PrtgMover` کپی می‌کند.
+۳. اسکریپت‌ها را Unblock و نصب را تست می‌کند: همهٔ اسکریپت‌ها باید سالم باشند و داشبورد باید جواب بدهد.
+۴. میانبر **PRTG Mover** را روی دسکتاپ و در منوی Start می‌سازد.
+۵. داشبورد را اجرا می‌کند. مرورگر با آدرس `http://localhost:8765/` باز می‌شود و پنجرهٔ کنسول لاگ زندهٔ همهٔ کارها را نشان می‌دهد.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1
-```
+| گزینه | کاربرد |
+|---|---|
+| `-InstallPath D:\Tools\PrtgMover` | نصب در پوشهٔ دیگر |
+| `-Source <پوشه یا zip>` | نصب از یک پوشه یا فایل ZIP دیگر |
+| `-TrustedHosts 10.0.0.10,10.0.0.20` | آماده‌سازی Manager برای سرورهایی که با WinRM ساده (HTTP) وصل می‌شوند. ویندوز برای این مرحله دسترسی Administrator می‌خواهد. |
+| `-Port 8080` | پورت داشبورد |
+| `-NoShortcut` ، `-NoStart` | میانبر نسازد، داشبورد را اجرا نکند |
+| `-Uninstall` | حذف میانبرها و فایل‌های برنامه |
 
-<div dir="rtl">
+**به‌روزرسانی یا تعمیر:** فایل‌های جدید را بگیرید و نصب‌کننده را دوباره اجرا کنید. قبلش پنجرهٔ داشبورد را ببندید.
 
-یا روی `Start-PrtgMover.cmd` دوبار کلیک کنید. مرورگر با آدرس `http://localhost:8765/` باز می‌شود. پنجرهٔ کنسول لاگ زندهٔ همهٔ کارها را نشان می‌دهد.
+**به دیتای شما دست زده نمی‌شود**، نه در به‌روزرسانی و نه با `-Uninstall`: لیست سرورها (`config\`)، یوزر و پسوردهای ذخیره‌شده، کارها و لاگ‌ها (`data\`)، بکاپ‌ها (`backups\`) و فایل‌های نصب PRTG (`installers\`) سر جایشان می‌مانند.
 
-### ۳. انتخاب روش اتصال
+اگر فقط فایل `install.ps1` را داشته باشید، برنامه را خودش از GitHub دانلود می‌کند. ریپو خصوصی است، پس این کار فقط روی سیستمی جواب می‌دهد که `git` یا GitHub CLI در آن لاگین باشد.
+
+بدون نصب‌کننده هم می‌شود: با `powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1` یا دوبار کلیک روی `Start-PrtgMover.cmd` داشبورد از همان پوشه اجرا می‌شود.
+
+### ۲. انتخاب روش اتصال
 
 **روش RDP** به هیچ آماده‌سازی نیاز ندارد.
 
@@ -80,12 +96,19 @@ powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1
 </div>
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Enable-PrtgMoverRemoting.ps1 -ManagerAddress <IP-Manager> -Https
+powershell -ExecutionPolicy Bypass -File .\Enable-PrtgMoverRemoting.ps1 -Https
 ```
 
 <div dir="rtl">
 
-این اسکریپت WinRM را با HTTPS (پورت 5986) فعال می‌کند و فایروال را **فقط برای IP سیستم Manager** باز می‌کند. در داشبورد، برای این سرور تیک *HTTPS* و *Skip certificate checks* را بزنید.
+این اسکریپت:
+
+- WinRM را با HTTPS (پورت 5986) فعال می‌کند.
+- فایروال را برای پورت 5986 **فقط برای IP سیستم Manager** باز می‌کند. این IP را از همان اتصال Remote Desktop که با آن وارد سرور شده‌اید برمی‌دارد. با `-ManagerAddress <IP>` می‌شود آن را دستی داد.
+- WinRM ساده (پورت 5985) را در فایروال می‌بندد. ویندوز هنگام فعال شدن Remoting این پورت را باز می‌کند. با `-KeepPlainWinRM` باز می‌ماند.
+- نتیجه را بررسی می‌کند و می‌نویسد در داشبورد چه چیزی وارد کنید.
+
+در داشبورد، برای این سرور تیک *HTTPS* و *Skip certificate checks* را بزنید. اگر IP سیستم Manager عوض شد، اسکریپت را دوباره اجرا کنید.
 
 ## انتقال قدم‌به‌قدم
 
