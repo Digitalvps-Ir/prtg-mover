@@ -216,8 +216,10 @@ function Get-PmAgentCommand {
 function Get-PmAgentStatus {
     <# Heartbeat of the agent (fresh = written in the last 30 s). #>
     param([Parameter(Mandatory)][string]$ServerId)
-    $f = Join-Path (Get-PmPath Data) "agent\$ServerId\heartbeat.json"
-    if (-not (Test-Path -LiteralPath $f)) { return [pscustomobject]@{ connected = $false } }
+    # heartbeat.json, or heartbeat.json.tmp when a redirected drive refused the rename - use the newer one.
+    $dir = Join-Path (Get-PmPath Data) "agent\$ServerId"
+    $f = Get-ChildItem -LiteralPath $dir -Filter 'heartbeat.json*' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName
+    if (-not $f) { return [pscustomobject]@{ connected = $false } }
     try {
         # The agent rewrites the file every 5 s - retry until a complete JSON document is read.
         $hb = $null
@@ -813,6 +815,61 @@ function ConvertTo-PmTsClientPath {
     return (Join-Path (Get-PmTsClientRoot) (Get-PmManagerRelative $LocalPath))
 }
 
+function Find-PmResumeStage {
+    <#
+        Walks the resume chain (job -> resumedFrom -> ...) and returns the newest staging copy
+        left by an earlier run: @{ Path; JobId; Complete = manifest.json present }.
+    #>
+    param($Job)
+    $id = if ($Job) { $Job.resumedFrom } else { $null }
+    $seen = @{}
+    while ($id -and -not $seen.ContainsKey($id)) {
+        $seen[$id] = $true
+        $p = Join-Path (Get-PmPath Data) "staging\$id"
+        if (Test-Path -LiteralPath $p) {
+            return [pscustomobject]@{ Path = $p; JobId = $id; Complete = (Test-Path -LiteralPath (Join-Path $p 'manifest.json')) }
+        }
+        $rec = Join-Path (Get-PmPath Jobs) "$id.json"
+        $id = $null
+        if (Test-Path -LiteralPath $rec) { try { $id = (Get-Content -LiteralPath $rec -Raw -Encoding UTF8 | ConvertFrom-Json).resumedFrom } catch { } }
+    }
+    return $null
+}
+
+function New-PmPackageFromStage {
+    <# Builds backups\PRTG_<computer>_<ts>.zip (+ .meta.json) from a complete staging folder on the manager. #>
+    param([Parameter(Mandatory)][string]$StageDir, $Job, [string]$SourceName)
+    $manifest = Get-Content -LiteralPath (Join-Path $StageDir 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $zipName = 'PRTG_{0}_{1}.zip' -f $manifest.source.computer, (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $local = Join-Path (Get-PmPath Backups) $zipName
+    Add-PmJobLog -Job $Job -Level STEP -Message ("Compressing the staged copy ({0:N2} GB) into {1} on the manager..." -f ($manifest.stagingBytes / 1GB), $zipName)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [IO.Compression.ZipFile]::CreateFromDirectory($StageDir, $local, [IO.Compression.CompressionLevel]::Optimal, $false)
+    $hash = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash
+    Add-PmJobLog -Job $Job -Level OK -Message ("Package ready: {0} ({1:N1} MB, SHA-256 {2}, {3:N0} s)" -f $zipName, ((Get-Item -LiteralPath $local).Length / 1MB), $hash, $sw.Elapsed.TotalSeconds)
+    if (-not $SourceName) { $SourceName = $manifest.source.computer }
+    [pscustomobject]@{ source = $SourceName; sha256 = $hash; manifest = $manifest } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$local.meta.json" -Encoding UTF8
+    Write-PmAudit -Action 'backup.created' -Data @{ job = $(if ($Job) { $Job.id }); package = $zipName; sha256 = $hash }
+    return $local
+}
+
+function Use-PmCompletedStage {
+    <#
+        Resume helper: if an earlier run of this job chain already finished copying from the
+        source (staging with manifest.json), adopt it - the source is not contacted again.
+        Returns @{ Zip; StageDir } or $null.
+    #>
+    param($Job, [string]$SourceName)
+    $rs = Find-PmResumeStage -Job $Job
+    if (-not $rs -or -not $rs.Complete) { return $null }
+    $dest = Join-Path (Get-PmPath Data) "staging\$($Job.id)"
+    Move-Item -LiteralPath $rs.Path -Destination $dest
+    Add-PmJobLog -Job $Job -Level OK -Message "RESUME: the copy made by job $($rs.JobId) is complete - adopting it, the source is not contacted again."
+    $zip = New-PmPackageFromStage -StageDir $dest -Job $Job -SourceName $SourceName
+    return [pscustomobject]@{ Zip = $zip; StageDir = $dest }
+}
+
 function Invoke-PmBackupFlow {
     <#
         Returns [pscustomobject]@{ Zip = <package on the manager>; StageDir = <extracted copy on the manager or $null> }.
@@ -835,10 +892,10 @@ function Invoke-PmBackupFlow {
             $stageLocal = Join-Path (Get-PmPath Data) "staging\$jobId"
             # Resume: continue the partial copy of the interrupted run instead of starting from zero
             # (robocopy then only transfers what is missing or changed).
-            $prevStage = if ($Job -and $Job.resumedFrom) { Join-Path (Get-PmPath Data) "staging\$($Job.resumedFrom)" } else { $null }
-            if ($prevStage -and (Test-Path -LiteralPath $prevStage) -and -not (Test-Path -LiteralPath $stageLocal)) {
-                Move-Item -LiteralPath $prevStage -Destination $stageLocal
-                Add-PmJobLog -Job $Job -Level OK -Message ("Reusing the partial staging copy of {0} ({1:N2} GB already transferred)." -f $Job.resumedFrom, ((Get-ChildItem -LiteralPath $stageLocal -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB))
+            $prev = Find-PmResumeStage -Job $Job
+            if ($prev -and -not (Test-Path -LiteralPath $stageLocal)) {
+                Move-Item -LiteralPath $prev.Path -Destination $stageLocal
+                Add-PmJobLog -Job $Job -Level OK -Message ("Reusing the partial staging copy of {0} ({1:N2} GB already transferred) - only the rest is copied." -f $prev.JobId, ((Get-ChildItem -LiteralPath $stageLocal -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1GB))
             }
             New-Item -ItemType Directory -Force -Path $stageLocal | Out-Null
             $params.StageDir = ConvertTo-PmTsClientPath $stageLocal
@@ -1055,7 +1112,8 @@ function Invoke-PmJob {
                 $srv = Get-PmServer -Id $Params.SourceId
                 if (-not $options.ContainsKey('SourceAfter')) { $options.SourceAfter = 'Restart' }
                 [void](Invoke-PmPreflight -Source $srv -Credentials $creds -Options $options -Job $Job)
-                $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job
+                $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name
+                if (-not $b) { $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job }
                 Set-PmCheckpoint -Job $Job -Backup (Split-Path $b.Zip -Leaf)
                 if ($b.StageDir) { Remove-Item -LiteralPath $b.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
                 $Job.result = [pscustomobject]@{ backup = (Split-Path $b.Zip -Leaf) }
@@ -1084,7 +1142,8 @@ function Invoke-PmJob {
                     $srv = Get-PmServer -Id $Params.SourceId
                     [void](Invoke-PmPreflight -Source $srv -Targets $targets -Credentials $creds -Options $options -Job $Job)
                     if ($options.NoTouch) { Add-PmJobLog -Job $Job -Level WARN -Message 'No-touch mode: the source keeps running. Two PRTG cores with the same configuration will monitor (and alert) in parallel until you shut the old one down.' }
-                    $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job -ProgressBase 0 -ProgressSpan 40
+                    $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name
+                    if (-not $b) { $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job -ProgressBase 0 -ProgressSpan 40 }
                     $file = $b.Zip; $stage = $b.StageDir
                     Set-PmCheckpoint -Job $Job -Backup (Split-Path $file -Leaf) -StageDir $stage
                 }

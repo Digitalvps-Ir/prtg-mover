@@ -208,6 +208,23 @@ Describe 'Resume' {
         $new.status | Should -Be 'failed'   # closed port -> the test fails, but the job ran
     }
 
+    It 'adopts a completed staging copy from an earlier run in the resume chain' {
+        # chain: C (new) -> B (no staging) -> A (complete staging)
+        $a = New-PmJobObject -Type 'migrate' -Summary 'A'; $a.status = 'interrupted'; Save-PmJobRecord -Job $a
+        $b = New-PmJobObject -Type 'migrate' -Summary 'B'; $b.status = 'interrupted'; $b.resumedFrom = $a.id; Save-PmJobRecord -Job $b
+        $stageA = Join-Path $mgr "data\staging\$($a.id)"
+        New-Item -ItemType Directory -Force -Path (Join-Path $stageA 'prtg\data') | Out-Null
+        'cfg' | Set-Content (Join-Path $stageA 'prtg\data\PRTG Configuration.dat')
+        @{ tool = 'prtg-mover'; source = @{ computer = 'OLDSRV' }; stagingBytes = 10; prtg = @{ included = $true } } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $stageA 'manifest.json')
+        $c = New-PmJobObject -Type 'migrate' -Summary 'C'; $c.resumedFrom = $b.id
+        $r = Use-PmCompletedStage -Job $c -SourceName 'OLD'
+        $r | Should -Not -BeNullOrEmpty
+        Test-Path $r.Zip | Should -BeTrue
+        $r.StageDir | Should -Be (Join-Path $mgr "data\staging\$($c.id)")
+        Test-Path $stageA | Should -BeFalse
+        (Read-PmBackupManifest -ZipPath $r.Zip).source.computer | Should -Be 'OLDSRV'
+    }
+
     It 'writes an audit trail and a diagnostics bundle without secrets' {
         Test-Path (Join-Path $mgr 'data\logs\audit.log') | Should -BeTrue
         $zip = New-PmDiagnosticsBundle

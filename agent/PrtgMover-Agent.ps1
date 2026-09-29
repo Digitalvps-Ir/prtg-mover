@@ -48,7 +48,7 @@ $vf = Join-Path $Root 'VERSION'; if (Test-Path $vf) { $version = ([IO.File]::Rea
 function Write-Heartbeat {
     param([string]$State = 'idle', [string]$Task = '')
     $hb = [ordered]@{ computer = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; isAdmin = $isAdmin; pid = $PID; version = $version; state = $State; task = $Task; time = (Get-Date).ToUniversalTime().ToString('o') }
-    try { $hbf = Join-Path $Dir 'heartbeat.json'; ConvertTo-Json -InputObject $hb -Compress | Set-Content -LiteralPath "$hbf.tmp" -Encoding UTF8; Move-Item -LiteralPath "$hbf.tmp" -Destination $hbf -Force } catch { }
+    try { [IO.File]::WriteAllText((Join-Path $Dir 'heartbeat.json'), (ConvertTo-Json -InputObject $hb -Compress), [Text.Encoding]::UTF8) } catch { }
 }
 
 function Resolve-ManagerPath {
@@ -64,7 +64,7 @@ $hbPs = [powershell]::Create()
         param($Dir, $Hb, $Admin, $Version, $AgentPid)
         while (-not $Hb.Stop) {
             $o = [ordered]@{ computer = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; isAdmin = $Admin; pid = $AgentPid; version = $Version; state = $Hb.State; task = $Hb.Task; time = (Get-Date).ToUniversalTime().ToString('o') }
-            try { $hbf = Join-Path $Dir 'heartbeat.json'; ConvertTo-Json -InputObject $o -Compress | Set-Content -LiteralPath "$hbf.tmp" -Encoding UTF8; Move-Item -LiteralPath "$hbf.tmp" -Destination $hbf -Force } catch { }
+            try { [IO.File]::WriteAllText((Join-Path $Dir 'heartbeat.json'), (ConvertTo-Json -InputObject $o -Compress), [Text.Encoding]::UTF8) } catch { }
             Start-Sleep -Seconds 5
         }
     }).AddArgument($Dir).AddArgument($hbState).AddArgument($isAdmin).AddArgument($version).AddArgument($PID)
