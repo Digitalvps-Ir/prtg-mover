@@ -157,36 +157,62 @@ Tested with PRTG 25.4 on Windows Server 2016 (source) and Windows Server 2022 (t
 
 ## Installation
 
-### 1. Get PRTG Mover on the manager
+### 1. Install PRTG Mover on the manager
+
+Get the files (clone the repository, or download the ZIP from GitHub and extract it), then double-click **`install.cmd`**. The same from a PowerShell window:
 
 ```powershell
-git clone https://github.com/Digitalvps-Ir/prtg-mover.git C:\PrtgMover
-cd C:\PrtgMover
+git clone https://github.com/Digitalvps-Ir/prtg-mover.git
+cd prtg-mover
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-(Or download the ZIP from GitHub and extract it.)
+Administrator rights are not needed. The installer
 
-### 2. Start the dashboard
+1. checks Windows and PowerShell (5.1 or newer),
+2. copies the program to `C:\PrtgMover`,
+3. unblocks the scripts and tests the installation: every script must be intact and the dashboard must answer,
+4. creates the shortcut **PRTG Mover** on the desktop and in the start menu,
+5. starts the dashboard. Your browser opens `http://localhost:8765/`, and the console window shows the live log of every job.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1
-```
+| Option | Meaning |
+|---|---|
+| `-InstallPath D:\Tools\PrtgMover` | Install into another folder. |
+| `-Source <folder or zip>` | Install from that folder or ZIP file instead of the installer's own folder. |
+| `-TrustedHosts 10.0.0.10,10.0.0.20` | Also prepare the manager for servers that are reached over plain WinRM (HTTP). Windows asks for administrator rights for this step. |
+| `-Port 8080` | Port of the dashboard. |
+| `-NoShortcut`, `-NoStart` | Create no shortcut, do not start the dashboard. |
+| `-Uninstall` | Remove the shortcuts and the program files. |
 
-You can also double-click `Start-PrtgMover.cmd`. Your browser opens `http://localhost:8765/`. The console window shows the live log of every job.
+**Update or repair:** get the new files and run the installer again. Close the dashboard window first.
 
-### 3. Choose the connection method
+**Your data is never touched**, neither by an update nor by `-Uninstall`: the server list (`config\`), saved credentials, jobs and logs (`data\`), backup packages (`backups\`) and PRTG installers (`installers\`) stay where they are.
+
+`install.ps1` on its own, without the other files, downloads the program from GitHub. The repository is private, so that only works on a computer where `git` or the GitHub CLI is signed in.
+
+Without the installer: `powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1` (or a double-click on `Start-PrtgMover.cmd`) starts the dashboard right from the folder the files are in.
+
+### 2. Choose the connection method
 
 **RDP (default)** needs no preparation. Continue with the quick start.
 
 **WinRM** needs PowerShell remoting on every server. Copy `tools\Enable-PrtgMoverRemoting.ps1` to the server and run it once in an **elevated** PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\Enable-PrtgMoverRemoting.ps1 -ManagerAddress <manager-ip> -Https
+powershell -ExecutionPolicy Bypass -File .\Enable-PrtgMoverRemoting.ps1 -Https
 ```
 
-This enables WinRM with an HTTPS listener (self-signed certificate, port 5986), allows remote administration with local administrator accounts, and opens the firewall **only for the manager's IP**. In the dashboard, tick *HTTPS* and *Skip certificate checks* for such a server.
+The script
 
-Without `-Https` the script enables plain WinRM on port 5985. The manager then has to trust the server:
+- enables WinRM with an HTTPS listener (self-signed certificate, port 5986),
+- allows remote administration with local administrator accounts,
+- opens the firewall for port 5986 **only for the manager's address**. It takes the address from the Remote Desktop session you are working in; `-ManagerAddress <ip>` sets it by hand,
+- closes plain WinRM (port 5985) in the firewall, which Windows opens when remoting is enabled (`-KeepPlainWinRM` leaves it open),
+- checks the result and prints what to enter in the dashboard.
+
+In the dashboard, tick *HTTPS* and *Skip certificate checks* for such a server. The script can be run again at any time, for example when the manager's address has changed.
+
+Without `-Https` the script enables plain WinRM on port 5985. The manager then has to trust the server (`install.ps1 -TrustedHosts …` does the same):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\Setup-Manager.ps1 -TrustedHosts 10.0.0.10,10.0.0.20
@@ -299,6 +325,7 @@ The manager keeps `<package>.zip.meta.json` next to each package (SHA-256 and ma
 ## Project layout
 
 ```
+install.ps1 / .cmd               installs, updates or removes PRTG Mover on the manager
 Start-PrtgMover.ps1 / .cmd       dashboard (HttpListener) + REST API
 cli\Invoke-PrtgMover.ps1         command-line front end
 src\PrtgMover.psm1               manager engine: inventory, credentials, sessions, transfers, jobs
