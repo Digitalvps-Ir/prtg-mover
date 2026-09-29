@@ -488,6 +488,17 @@ Describe 'Manager module' {
         $saved.transport | Should -Be 'winrm'
         (Get-PmJobServer -Server $saved -Options @{ Transfer = 'wireguard' }).transport | Should -Be 'winrm'
     }
+
+    It 'stores WireGuard and IPIP as the server connection method' {
+        $s = Set-PmServer -Name 'TUN' -HostName '10.0.0.30' -Transport wireguard
+        (Get-PmServer -Id $s.id).transport | Should -Be 'wireguard'
+        $wg = [pscustomobject]@{ transport = 'wireguard' }
+        $ip = [pscustomobject]@{ transport = 'ipip' }
+        $rdp = [pscustomobject]@{ transport = 'rdp' }
+        Resolve-PmTunnelFromServers -Servers @($wg, $rdp) | Should -Be 'wireguard'
+        Resolve-PmTunnelFromServers -Servers @($rdp) | Should -Be ''
+        { Resolve-PmTunnelFromServers -Servers @($wg, $ip) } | Should -Throw
+    }
 }
 
 Describe 'WireGuard tunnel config' {
