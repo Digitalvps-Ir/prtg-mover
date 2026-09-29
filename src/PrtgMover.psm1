@@ -14,7 +14,7 @@ $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
 $script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram', 'IncludeLogs', 'IncludeAutoBackups'
-$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage'
+$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage', 'TargetAddress'
 
 function Get-PmOsCaption {
     <# Windows caption when CIM exists; otherwise the runtime OS description. #>
@@ -811,6 +811,7 @@ function Invoke-PmTestFlow {
                 $(if ($r.Prtg.Installed) { 'yes' } else { 'no' }), $r.Prtg.Version, $r.PrtgDataGB, $r.Prtg.CoreStatus, @($r.VpnAllUsers).Count, $r.RdpPort) -Computer $r.Computer
         foreach ($d in @($r.Disks)) { Add-PmJobLog -Job $Job -Message ("Disk {0} {1} GB free of {2} GB" -f $d.Drive, $d.FreeGB, $d.SizeGB) -Computer $r.Computer }
         if ($r.Prtg.Installed -and $r.PrtgConfigStats) { Add-PmJobLog -Job $Job -Message "PRTG configuration: $($r.PrtgConfigStats)" -Computer $r.Computer }
+        if ($r.Prtg.Installed) { Add-PmJobLog -Job $Job -Message "PRTG listens on: $(if (@($r.Prtg.ListenEndpoints).Count) { @($r.Prtg.ListenEndpoints) -join ', ' } else { 'nothing (core not running)' }) | server addresses: $(@($r.Prtg.LocalAddresses) -join ', ')" -Computer $r.Computer }
         if (-not $r.IsAdmin) { Add-PmJobLog -Job $Job -Level WARN -Message 'Session is NOT elevated - an administrator is required.' }
         if ($r.RdpPort -and [int]$r.RdpPort -ne (Get-PmRdpPort $Server)) { Add-PmJobLog -Job $Job -Level WARN -Message "The server's RDP service listens on port $($r.RdpPort) but the inventory says $(Get-PmRdpPort $Server) - edit the server." }
     }
@@ -1366,6 +1367,7 @@ function Invoke-PmRestoreFlow {
         $init = Invoke-PmRemote -Session $s -Function 'Initialize-PmRemoteWorkRoot' -Job $Job
         $params = ConvertTo-PmHashtable -InputObject $Options -Keys $script:PmRestoreKeys
         $params.JobId = $jobId
+        $params.TargetAddress = [string]$Server.host
         $streams = if ([int]$Options.TransferStreams -gt 0) { [math]::Min(8, [int]$Options.TransferStreams) } else { 4 }
         $chunkBytes = if ([int]$Options.TransferChunkMB -gt 0) { [int64]$Options.TransferChunkMB * 1MB } else { [int64]256MB }
 
@@ -1407,6 +1409,22 @@ function Invoke-PmRestoreFlow {
         Write-PmAudit -Action 'restore.finished' -Data @{ job = $jobId; server = $Server.name; package = (Split-Path $BackupPath -Leaf); prtg = $r.Report.Prtg; errors = @($r.Report.Errors).Count }
         return $r.Report
     } finally { if ($s) { Close-PmSession $s } }
+}
+
+function Invoke-PmRebindFlow {
+    <#
+        Binds the web server of an already migrated PRTG to the server's own address (it kept
+        the source's address and only answers on 127.0.0.1), restarts PRTG and verifies it.
+    #>
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, $Job)
+    if ((Get-PmTransport $Server) -eq 'rdp') { throw "$($Server.name): this action needs the WinRM connection method." }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $r = Invoke-PmRemote -Session $s -Function 'Repair-PmPrtgBinding' -Parameters @{ TargetAddress = [string]$Server.host } -Job $Job -ProgressBase 0 -ProgressSpan 100
+        Write-PmAudit -Action 'prtg.rebind' -Data @{ server = $Server.name; changed = $r.Changed; before = $r.Before; after = $r.After }
+        return [pscustomobject]@{ target = $Server.name; ok = $true; changed = $r.Changed; before = $r.Before; after = $r.After; listens = @($r.ListenEndpoints) }
+    } finally { Close-PmSession $s }
 }
 
 # ======================================================================= jobs
@@ -1649,6 +1667,15 @@ function Invoke-PmJob {
                 }
                 $Job.result = $results
                 if (@($results | Where-Object { -not $_.ok }).Count -gt 0) { throw 'One or more servers failed the test (see the lines above).' }
+            }
+            'rebind' {
+                # Fix the web server binding of an already migrated PRTG (it kept the source's IP addresses).
+                $results = @()
+                foreach ($id in @($Params.ServerIds)) {
+                    $srv = Get-PmServer -Id $id
+                    $results += Invoke-PmRebindFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Job $Job
+                }
+                $Job.result = $results
             }
             'backup' {
                 $srv = Get-PmJobServer -Server (Get-PmServer -Id $Params.SourceId) -Options $options

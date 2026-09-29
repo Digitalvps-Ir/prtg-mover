@@ -8,6 +8,23 @@
 - **IPIP** (protocol 4) does the same on its own network, `10.66.67.0/24`, using Wintun. IP protocol 4 must be allowed between the two public addresses. It does not replace the default route.
 - **WinRM on the tunnel.** After the tunnel is up, the source opens WinRM to the target's tunnel address (`10.66.66.x:5985` or `10.66.67.x:5985`) and sends the files there. A 32 MB probe reports MB/s first, the same point-to-point shape as a bandwidth test. TCP 5985 is allowed only from the tunnel network, not from the public address.
 
+## 1.5.2 — 2026-09-29
+
+### Added
+- Command line: `-Action FixBinding -Target <server>` binds the web server of a migrated PRTG to the server's own address.
+
+### Changed
+- README (English and Persian), architecture and troubleshooting guides rewritten for the current behaviour: connection methods, source untouched by default, program clone, compressed parallel transfer, resume, logs and audit.
+- The addresses of a server are read without Windows-only cmdlets when those are missing, so the test suite keeps working under PowerShell 7.
+
+## 1.5.1 — 2026-09-29
+
+### Fixed
+- After a migration PRTG only answered on `127.0.0.1`, because the web server was still bound to the source's IP address. Restore now binds it to the target's own address.
+- **Fix PRTG IP** (job type `rebind`) repairs a server that was already migrated. The binding is changed while PRTG is stopped, because the core writes its settings back when it stops.
+- The connectivity test shows the addresses PRTG listens on, and restore warns when PRTG is only reachable locally.
+- A 32-bit overflow in the progress line stopped a transfer after 2 GB on the wire. Progress reporting can no longer stop a transfer.
+
 ## 1.5.0 — 2026-09-29
 
 ### Added

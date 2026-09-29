@@ -308,10 +308,28 @@ function Invoke-PmReg {
 
 # ---------------------------------------------------------------- PRTG discovery / control
 
+function Get-PmLocalIPv4 {
+    <# IPv4 addresses of this machine (loopback included, link-local excluded). Works without the NetTCPIP module. #>
+    $list = @()
+    if (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue) {
+        try { $list = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { [string]$_.IPAddress }) } catch { $list = @() }
+    }
+    if (-not $list.Count) {
+        try {
+            foreach ($nic in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+                foreach ($a in $nic.GetIPProperties().UnicastAddresses) {
+                    if ($a.Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { $list += $a.Address.ToString() }
+                }
+            }
+        } catch { }
+    }
+    return @($list | Where-Object { $_ -and $_ -notlike '169.254.*' } | Select-Object -Unique)
+}
+
 function Get-PmPrtgInfo {
     $info = [ordered]@{
         Installed = $false; Version = $null; ProgramPath = $null; DataPath = $null
-        RegistryKeys = @(); CoreStatus = $null; ProbeStatus = $null; ListenPorts = @()
+        RegistryKeys = @(); CoreStatus = $null; ProbeStatus = $null; ListenPorts = @(); ListenEndpoints = @(); LocalAddresses = @()
     }
     $svc = $null
     if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
@@ -346,9 +364,13 @@ function Get-PmPrtgInfo {
 
     $proc = Get-Process -Name 'PRTG Server' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($proc) {
-        $info.ListenPorts = @(Get-NetTCPConnection -State Listen -OwningProcess $proc.Id -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
+        $listen = @()
+        if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) { $listen = @(Get-NetTCPConnection -State Listen -OwningProcess $proc.Id -ErrorAction SilentlyContinue) }
+        $info.ListenPorts = @($listen | Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
+        # address:port pairs show whether the web server is bound to all addresses or only to specific ones
+        $info.ListenEndpoints = @($listen | Sort-Object LocalPort, LocalAddress | ForEach-Object { '{0}:{1}' -f $_.LocalAddress, $_.LocalPort } | Select-Object -Unique)
     }
+    $info.LocalAddresses = @(Get-PmLocalIPv4 | Where-Object { $_ -notlike '127.*' })
     return [pscustomobject]$info
 }
 
@@ -540,6 +562,84 @@ function Get-PmLicenseFiles {
     param([string]$DataPath)
     if (-not (Test-Path -LiteralPath $DataPath)) { return @() }
     @(Get-ChildItem -LiteralPath $DataPath -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'licen' })
+}
+
+# ---------------------------------------------------------------- web server binding
+
+function Get-PmReboundIpList {
+    <# "a,b" -> the same list with addresses that do not exist locally replaced by $Own; 127.0.0.1 is always kept. #>
+    param([string]$Current, [string[]]$Local = @(), [string]$Own, [switch]$AddOwn)
+    $new = @()
+    foreach ($ip in ($Current -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        if ($ip -eq '127.0.0.1' -or $Local -contains $ip) { $new += $ip } elseif ($Own) { $new += $Own }
+    }
+    # -AddOwn: PRTG itself drops addresses it cannot bind at start-up, leaving only 127.0.0.1.
+    if ($AddOwn -and $Own -and -not @($new | Where-Object { $_ -ne '127.0.0.1' }).Count) { $new = @($Own) + $new }
+    if ($new -notcontains '127.0.0.1') { $new += '127.0.0.1' }
+    return (@($new | Select-Object -Unique) -join ',')
+}
+
+function Set-PmPrtgWebBinding {
+    <#
+        The PRTG web server can be bound to specific IP addresses (registry: Server\Webserver,
+        UseIPs = owioSpecIPs, IPs = "a,b"). After a migration those are the SOURCE's addresses;
+        PRTG then only listens on 127.0.0.1. Addresses that do not exist on this server are
+        replaced by this server's own address. Nothing is changed when every address exists.
+    #>
+    param([string]$TargetAddress, [bool]$AddOwn = $false, [bool]$CheckOnly = $false)
+    $local = @(Get-PmLocalIPv4)
+    $own = if ($TargetAddress -and $local -contains $TargetAddress) { $TargetAddress }
+    else { $local | Where-Object { $_ -ne '127.0.0.1' -and $_ -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)' } | Select-Object -First 1 }
+    if (-not $own) { $own = $local | Where-Object { $_ -ne '127.0.0.1' } | Select-Object -First 1 }
+    $changed = $false; $before = $null; $after = $null
+    foreach ($key in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Webserver', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Webserver') {
+        if (-not (Test-Path $key)) { continue }
+        $p = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+        if ($p.UseIPs -ne 'owioSpecIPs' -or -not $p.IPs) { continue }
+        $before = [string]$p.IPs
+        $after = Get-PmReboundIpList -Current $before -Local $local -Own $own -AddOwn:$AddOwn
+        if ($after -ne $before) { if (-not $CheckOnly) { Set-ItemProperty -Path $key -Name 'IPs' -Value $after }; $changed = $true }
+    }
+    if ($CheckOnly) { return [pscustomobject]@{ PmType = 'binding'; Changed = $changed; Before = $before; After = $after } }
+    if ($changed) { Write-PmLog "PRTG web server binding changed from '$before' to '$after' (addresses of this server)." 'OK' }
+    elseif ($before) { Write-PmLog "PRTG web server binding is valid for this server ($before)." 'OK' }
+    else { Write-PmLog 'PRTG web server listens on all addresses (no specific binding).' 'OK' }
+    [pscustomobject]@{ PmType = 'binding'; Changed = $changed; Before = $before; After = $after }
+}
+
+function Repair-PmPrtgBinding {
+    <# Fixes the web server binding of an already migrated PRTG, restarts it and verifies it is fully up. #>
+    param([string]$TargetAddress, [int]$HealthTimeoutMinutes = 15)
+    $ErrorActionPreference = 'Stop'
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server.' }
+    Write-PmLog "PRTG currently listens on: $(@($prtg.ListenEndpoints) -join ', ')"
+    Write-PmProgress 10 'Adjusting web server binding'
+    $bx = @{ B = (Set-PmPrtgWebBinding -TargetAddress $TargetAddress -AddOwn $true -CheckOnly $true) }
+    $health = $null
+    if (-not $bx.B.Changed) { Write-PmLog "PRTG web server binding needs no change ($($bx.B.Before))." 'OK' }
+    if ($bx.B.Changed) {
+        # Order matters: the core writes its settings back to the registry when it stops,
+        # so the binding must be changed while PRTG is stopped.
+        Write-PmProgress 20 'Stopping PRTG'
+        Write-PmLog 'Stopping PRTG (the binding can only be changed while the core is stopped)...' 'STEP'
+        Stop-PmPrtgServices
+        Write-PmProgress 40 'Adjusting web server binding'
+        Set-PmPrtgWebBinding -TargetAddress $TargetAddress -AddOwn $true | ForEach-Object { if ($_.PmType -eq 'binding') { $bx.B = $_ } else { $_ } }
+        Write-PmProgress 50 'Starting PRTG'
+        $box = @{}
+        Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
+        $health = $box.Health
+        if (-not $health.Healthy) { throw "PRTG did not come up completely after the restart ($($health.Message))." }
+    }
+    $after = Get-PmPrtgInfo
+    $outside = @($after.ListenEndpoints | Where-Object { $_ -notmatch '^(127\.0\.0\.1|::1):' })
+    $reg = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Webserver' -ErrorAction SilentlyContinue)
+    Write-PmLog "Registry after start: UseIPs=$($reg.UseIPs) IPs=$($reg.IPs) Ports=$($reg.Ports)" 'DEBUG'
+    if ($outside.Count) { Write-PmLog "PRTG now listens on: $(@($after.ListenEndpoints) -join ', ')" 'OK' }
+    else { Write-PmLog "PRTG still only listens on this server itself: $(@($after.ListenEndpoints) -join ', ') (registry IPs=$($reg.IPs)). Set the web server IP in the PRTG Administration Tool on the server." 'ERROR' }
+    Write-PmProgress 100 'Done'
+    New-PmResult @{ Changed = $bx.B.Changed; Before = $bx.B.Before; After = $bx.B.After; ListenEndpoints = @($after.ListenEndpoints); Core = $after.CoreStatus; Probe = $after.ProbeStatus }
 }
 
 # ---------------------------------------------------------------- firewall
@@ -947,7 +1047,9 @@ function Invoke-PmRemoteRestore {
         [string]$LogDir,
         # The staged package is local on this server: move folders into place instead of copying (saves disk space).
         [bool]$MoveFromStage = $false,
-        [bool]$CleanupStage = $false
+        [bool]$CleanupStage = $false,
+        # Address of this server as the manager knows it (used for the PRTG web server binding).
+        [string]$TargetAddress
     )
     $ErrorActionPreference = 'Stop'
     if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
@@ -1134,6 +1236,9 @@ function Invoke-PmRemoteRestore {
                 Write-PmLog "Registry Datapath adjusted to $dataPath" 'OK'
             }
 
+            # ---- web server binding: the source's IP addresses do not exist here
+            Set-PmPrtgWebBinding -TargetAddress $TargetAddress | Where-Object { $_.PmType -ne 'binding' }
+
             # ---- license
             if ($CopyLicense) {
                 $report.License = 'copied-from-source'
@@ -1175,6 +1280,10 @@ function Invoke-PmRemoteRestore {
                     $report.WebUrl = $health.Url
                     $report.Prtg = 'ok'
                     Write-PmLog "PRTG $($health.Version) is fully UP on $env:COMPUTERNAME : $($health.Url) (core $($health.Core), probe $($health.Probe))" 'OK'
+                    $ep = @((Get-PmPrtgInfo).ListenEndpoints)
+                    $outside = @($ep | Where-Object { $_ -notmatch '^(127\.0\.0\.1|::1):' })
+                    if ($outside.Count) { Write-PmLog "PRTG listens on: $($ep -join ', ')" 'OK' }
+                    else { Write-PmLog "PRTG only listens on this server itself ($($ep -join ', ')) - it is not reachable from the network. Check the web server IP setting in the PRTG Administration Tool." 'WARN' }
                 } else {
                     $report.Prtg = 'unhealthy'
                     $report.Errors += "PRTG did not come up completely within $HealthTimeoutMinutes min ($($health.Message))."
