@@ -30,8 +30,11 @@ $Req = Join-Path $Dir 'requests'
 $Resp = Join-Path $Dir 'responses'
 New-Item -ItemType Directory -Force -Path $Req, $Resp | Out-Null
 
-$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-$isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$isAdmin = $false
+try {
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { $isAdmin = $false }
 if (-not $isAdmin -and -not $AllowNonAdmin) {
     Write-Host 'The agent must run in an ELEVATED PowerShell (Run as Administrator).' -ForegroundColor Red
     Read-Host 'Press Enter to close'
@@ -45,9 +48,10 @@ $script:PayloadLoaded = (Get-Item -LiteralPath $PayloadFile).LastWriteTimeUtc
 $version = 'dev'
 $vf = Join-Path $Root 'VERSION'; if (Test-Path $vf) { $version = ([IO.File]::ReadAllText($vf)).Trim() }
 
+$computerName = Get-PmComputerName
 function Write-Heartbeat {
     param([string]$State = 'idle', [string]$Task = '')
-    $hb = [ordered]@{ computer = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; isAdmin = $isAdmin; pid = $PID; version = $version; state = $State; task = $Task; time = (Get-Date).ToUniversalTime().ToString('o') }
+    $hb = [ordered]@{ computer = $computerName; user = "$env:USERDOMAIN\$env:USERNAME"; isAdmin = $isAdmin; pid = $PID; version = $version; state = $State; task = $Task; time = (Get-Date).ToUniversalTime().ToString('o') }
     try { [IO.File]::WriteAllText((Join-Path $Dir 'heartbeat.json'), (ConvertTo-Json -InputObject $hb -Compress), [Text.Encoding]::UTF8) } catch { }
 }
 
@@ -61,20 +65,20 @@ function Resolve-ManagerPath {
 $hbState = [hashtable]::Synchronized(@{ State = 'idle'; Task = ''; Stop = $false })
 $hbPs = [powershell]::Create()
 [void]$hbPs.AddScript({
-        param($Dir, $Hb, $Admin, $Version, $AgentPid)
+        param($Dir, $Hb, $Admin, $Version, $AgentPid, $Computer)
         while (-not $Hb.Stop) {
-            $o = [ordered]@{ computer = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; isAdmin = $Admin; pid = $AgentPid; version = $Version; state = $Hb.State; task = $Hb.Task; time = (Get-Date).ToUniversalTime().ToString('o') }
+            $o = [ordered]@{ computer = $Computer; user = "$env:USERDOMAIN\$env:USERNAME"; isAdmin = $Admin; pid = $AgentPid; version = $Version; state = $Hb.State; task = $Hb.Task; time = (Get-Date).ToUniversalTime().ToString('o') }
             try { [IO.File]::WriteAllText((Join-Path $Dir 'heartbeat.json'), (ConvertTo-Json -InputObject $o -Compress), [Text.Encoding]::UTF8) } catch { }
             Start-Sleep -Seconds 5
         }
-    }).AddArgument($Dir).AddArgument($hbState).AddArgument($isAdmin).AddArgument($version).AddArgument($PID)
+    }).AddArgument($Dir).AddArgument($hbState).AddArgument($isAdmin).AddArgument($version).AddArgument($PID).AddArgument($computerName)
 $hbAsync = $hbPs.BeginInvoke()
 Write-Heartbeat
 
 Clear-Host
 Write-Host ''
 Write-Host "  PRTG Mover agent $version" -ForegroundColor Cyan
-Write-Host "  Server : $env:COMPUTERNAME  (inventory id $ServerId)"
+Write-Host "  Server : $computerName  (inventory id $ServerId)"
 Write-Host "  Manager: $Root"
 Write-Host '  Status : connected - waiting for jobs from the dashboard. Keep this window open.' -ForegroundColor Green
 Write-Host ''
@@ -83,10 +87,10 @@ Write-Host ''
 $AgentLog = Join-Path $Dir 'agent.log'
 function Write-AgentLog {
     param([string]$Text)
-    $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $env:COMPUTERNAME, $Text
+    $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $computerName, $Text
     for ($i = 0; $i -lt 20; $i++) { try { [IO.File]::AppendAllText($AgentLog, $line + "`r`n", [Text.Encoding]::UTF8); break } catch { Start-Sleep -Milliseconds 50 } }
 }
-Write-AgentLog "Agent $version started. User=$env:USERDOMAIN\$env:USERNAME Admin=$isAdmin PID=$PID PS=$($PSVersionTable.PSVersion) OS=$((Get-CimInstance Win32_OperatingSystem).Caption) Root=$Root"
+Write-AgentLog "Agent $version started. User=$env:USERDOMAIN\$env:USERNAME Admin=$isAdmin PID=$PID PS=$($PSVersionTable.PSVersion) OS=$(Get-PmOsCaption) Root=$Root"
 
 # Requests left behind by a previous agent (RDP dropped mid-call) are parked, never executed twice.
 Get-ChildItem -LiteralPath $Req -Filter '*.working' -File -ErrorAction SilentlyContinue | ForEach-Object {
@@ -103,7 +107,7 @@ try {
         if (-not $reachable) {
             if ($linkUp) {
                 $linkUp = $false
-                $Host.UI.RawUI.WindowTitle = 'PRTG Mover agent - WAITING for the RDP connection'
+                try { $Host.UI.RawUI.WindowTitle = 'PRTG Mover agent - WAITING for the RDP connection' } catch { }
                 Write-Host ("[{0}] Link to the manager lost (RDP window closed or network drop). Still running - reconnect RDP and the job continues automatically." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Yellow
             }
             $lastWork = Get-Date
@@ -115,7 +119,7 @@ try {
             Write-AgentLog 'Link to the manager restored.'
             Write-Host ("[{0}] Link to the manager restored." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Green
         }
-        $Host.UI.RawUI.WindowTitle = "PRTG Mover agent - connected ($ServerId)"
+        try { $Host.UI.RawUI.WindowTitle = "PRTG Mover agent - connected ($ServerId)" } catch { }
         $next = Get-ChildItem -LiteralPath $Req -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -First 1
         if (-not $next) { Start-Sleep -Milliseconds 700; continue }
 

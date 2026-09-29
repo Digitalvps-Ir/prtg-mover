@@ -24,15 +24,83 @@ $PmProgramFolders = @(
 
 function Get-PmWorkRoot {
     <# Folder for PRTG Mover's own temporary files on this server. #>
-    if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\') }
-    return (Join-Path $env:SystemDrive 'PrtgMover')
+    if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\').TrimEnd('/') }
+    if ($env:SystemDrive) { return (Join-Path $env:SystemDrive 'PrtgMover') }
+    # PowerShell 7 on Linux has no SystemDrive. Keep the same folder name under temp.
+    return (Join-Path ([IO.Path]::GetTempPath()) 'PrtgMover')
+}
+
+function Get-PmComputerName {
+    if ($env:COMPUTERNAME) { return [string]$env:COMPUTERNAME }
+    $n = [Environment]::MachineName
+    if ($n) { return [string]$n }
+    return 'localhost'
+}
+
+function Test-PmIsAdmin {
+    <# True when the process is elevated. False on platforms without a Windows identity. #>
+    try {
+        $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+        return [bool]$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Get-PmCurrentUserName {
+    try { return [string][Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { return "$env:USERDOMAIN\$env:USERNAME" }
+}
+
+function Get-PmOsCaption {
+    <# Windows caption when CIM exists; otherwise the runtime OS description. #>
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try {
+            $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+            if ($os.Caption) { return [string]$os.Caption }
+        } catch { }
+    }
+    return [Environment]::OSVersion.VersionString
+}
+
+function Get-PmLogicalDisk {
+    <#
+        Free space for a path. On Windows this is the Win32_LogicalDisk for the drive letter.
+        Without CIM (PowerShell 7 on Linux) it uses the .NET volume that contains the path.
+    #>
+    param([string]$Path)
+    $qualifier = ''
+    if ($Path) {
+        try { $qualifier = [string](Split-Path -Path $Path -Qualifier -ErrorAction Stop) } catch { $qualifier = '' }
+    }
+    if (-not $qualifier -and $env:SystemDrive) { $qualifier = $env:SystemDrive }
+    if ($qualifier -and (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+        try {
+            $disk = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $qualifier) -ErrorAction Stop
+            if ($disk) { return $disk }
+        } catch { }
+    }
+    $probe = $Path
+    if (-not $probe) { $probe = (Get-Location).Path }
+    try { $probe = [IO.Path]::GetFullPath($probe) } catch { }
+    $match = $null
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if (-not $d.IsReady) { continue }
+        if ($probe.StartsWith($d.Name, [StringComparison]::OrdinalIgnoreCase)) {
+            if (-not $match -or $d.Name.Length -gt $match.Name.Length) { $match = $d }
+        }
+    }
+    if (-not $match) {
+        foreach ($d in [IO.DriveInfo]::GetDrives()) {
+            if ($d.IsReady -and ($d.Name -eq '/' -or $d.Name -eq '\')) { $match = $d; break }
+        }
+    }
+    if (-not $match) { return $null }
+    return [pscustomobject]@{ DeviceID = $match.Name; FreeSpace = [int64]$match.AvailableFreeSpace; Size = [int64]$match.TotalSize }
 }
 
 # ---------------------------------------------------------------- output helpers
 
 function Write-PmLog {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'STEP', 'DEBUG')][string]$Level = 'INFO')
-    [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME }
+    [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = (Get-PmComputerName) }
 }
 
 function Format-PmError {
@@ -77,6 +145,17 @@ function Invoke-PmRobocopy {
         [switch]$Mirror
     )
     if (-not (Test-Path -LiteralPath $Source)) { return -1 }
+    if (-not (Get-Command robocopy.exe -ErrorAction SilentlyContinue)) {
+        # Same copy, used when robocopy is not installed (PowerShell 7 on Linux).
+        try {
+            Copy-PmTreeFallback -Source $Source -Destination $Destination -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
+            $global:PmLastRobocopy = "copy `"$Source`" -> `"$Destination`" (robocopy not installed)"
+            return 1
+        } catch {
+            $global:PmLastRobocopy = "copy `"$Source`" -> `"$Destination`" failed: $($_.Exception.Message)"
+            return 8
+        }
+    }
     # Redirected RDP drives (\\tsclient) do not support all directory attributes.
     $dcopy = if ($Destination.StartsWith('\\') -or $Source.StartsWith('\\')) { '/DCOPY:T' } else { '/DCOPY:DAT' }
     $rcArgs = @($Source.TrimEnd('\'), $Destination.TrimEnd('\'), '/COPY:DAT', $dcopy, '/R:2', '/W:2', '/MT:8', '/XJ', '/NP', '/NFL', '/NDL')
@@ -96,6 +175,29 @@ function Get-PmRobocopyErrors {
     if (-not $global:PmRobocopyLog -or -not (Test-Path -LiteralPath $global:PmRobocopyLog)) { return '' }
     $lines = @(Get-Content -LiteralPath $global:PmRobocopyLog -Tail 400 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'ERROR|Access is denied|cannot|failed' } | Select-Object -Last 5)
     return ($lines -join ' | ')
+}
+
+function Copy-PmTreeFallback {
+    <# Directory copy used only when robocopy.exe is absent. Honours the same exclude lists. #>
+    param([string]$Source, [string]$Destination, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @())
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $blocked = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') })
+    foreach ($item in @(Get-ChildItem -LiteralPath $Source -Force -ErrorAction SilentlyContinue)) {
+        $norm = $item.FullName.Replace('/', '\')
+        if ($item.PSIsContainer) {
+            $skip = $false
+            foreach ($b in $blocked) {
+                if ($norm.Equals($b, [StringComparison]::OrdinalIgnoreCase) -or $norm.StartsWith($b + '\', [StringComparison]::OrdinalIgnoreCase)) { $skip = $true; break }
+            }
+            if ($skip) { continue }
+            Copy-PmTreeFallback -Source $item.FullName -Destination (Join-Path $Destination $item.Name) -ExcludeDirs $ExcludeDirs -ExcludeFiles $ExcludeFiles
+        } else {
+            $skipFile = $false
+            foreach ($pat in @($ExcludeFiles)) { if ($pat -and $item.Name -like $pat) { $skipFile = $true; break } }
+            if ($skipFile) { continue }
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $Destination $item.Name) -Force
+        }
+    }
 }
 
 function Test-PmRobocopyOk { param([int]$Code) return ($Code -ge 0 -and $Code -lt 8) }
@@ -118,6 +220,7 @@ function Get-PmFileEncoding {
 
 function Get-PmUserProfiles {
     <# Real (non-special) local user profiles: name + path. #>
+    if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) { return @() }
     Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
         Where-Object { -not $_.Special -and $_.LocalPath -and (Test-Path -LiteralPath $_.LocalPath) } |
         ForEach-Object { [pscustomobject]@{ Name = (Split-Path $_.LocalPath -Leaf); Path = $_.LocalPath } }
@@ -196,7 +299,10 @@ function Invoke-PmReg {
     <# Runs reg.exe without letting its stderr chatter turn into PowerShell errors. Returns the exit code. #>
     param([Parameter(Mandatory)][ValidateSet('export', 'import')][string]$Verb, [Parameter(Mandatory)][string]$File, [string]$Key)
     $argLine = if ($Verb -eq 'export') { "export `"$Key`" `"$File`" /y" } else { "import `"$File`"" }
-    $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\reg.exe') -ArgumentList $argLine -Wait -PassThru -WindowStyle Hidden
+    $sp = @{ FilePath = (Join-Path $env:SystemRoot 'System32\reg.exe'); ArgumentList = $argLine; Wait = $true; PassThru = $true }
+    # -WindowStyle exists on Windows PowerShell 5.1. PowerShell 7 rejects it.
+    if ($PSVersionTable.PSEdition -eq 'Desktop') { $sp.WindowStyle = 'Hidden' }
+    $p = Start-Process @sp
     return $p.ExitCode
 }
 
@@ -207,7 +313,10 @@ function Get-PmPrtgInfo {
         Installed = $false; Version = $null; ProgramPath = $null; DataPath = $null
         RegistryKeys = @(); CoreStatus = $null; ProbeStatus = $null; ListenPorts = @()
     }
-    $svc = Get-CimInstance Win32_Service -Filter "Name='$PmCoreService'" -ErrorAction SilentlyContinue
+    $svc = $null
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        $svc = Get-CimInstance Win32_Service -Filter "Name='$PmCoreService'" -ErrorAction SilentlyContinue
+    }
     if ($svc) {
         $info.Installed = $true
         $exe = $svc.PathName
@@ -219,7 +328,10 @@ function Get-PmPrtgInfo {
         if (Test-Path -LiteralPath $exe) { $info.Version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion }
         $info.CoreStatus = [string]$svc.State
     }
-    $probe = Get-Service -Name $PmProbeService -ErrorAction SilentlyContinue
+    $probe = $null
+    if (Get-Command Get-Service -ErrorAction SilentlyContinue) {
+        $probe = Get-Service -Name $PmProbeService -ErrorAction SilentlyContinue
+    }
     if ($probe) { $info.ProbeStatus = [string]$probe.Status }
 
     foreach ($k in 'HKLM:\SOFTWARE\WOW6432Node\Paessler', 'HKLM:\SOFTWARE\Paessler') {
@@ -229,8 +341,8 @@ function Get-PmPrtgInfo {
     foreach ($core in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Core', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Core') {
         if (-not $dp -and (Test-Path $core)) { $dp = (Get-ItemProperty -Path $core -ErrorAction SilentlyContinue).Datapath }
     }
-    if (-not $dp) { $dp = Join-Path $env:ProgramData 'Paessler\PRTG Network Monitor' }
-    $info.DataPath = $dp.TrimEnd('\')
+    if (-not $dp -and $env:ProgramData) { $dp = Join-Path $env:ProgramData 'Paessler\PRTG Network Monitor' }
+    $info.DataPath = if ($dp) { $dp.TrimEnd('\').TrimEnd('/') } else { $null }
 
     $proc = Get-Process -Name 'PRTG Server' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($proc) {
@@ -445,8 +557,13 @@ function Set-PmPrtgFirewall {
 # ---------------------------------------------------------------- system info (Test)
 
 function Get-PmSystemInfo {
-    $os = Get-CimInstance Win32_OperatingSystem
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    $osCaption = Get-PmOsCaption
+    $osVersion = [Environment]::OSVersion.Version.ToString()
+    $isAdmin = Test-PmIsAdmin
+    $userName = Get-PmCurrentUserName
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        try { $osVersion = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Version } catch { }
+    }
     $vpn = @()
     try { $vpn = @(Get-VpnConnection -AllUserConnection -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Server = $_.ServerAddress; Type = [string]$_.TunnelType; Status = [string]$_.ConnectionStatus } }) } catch { }
     $prtg = Get-PmPrtgInfo
@@ -455,15 +572,21 @@ function Get-PmSystemInfo {
         $dataSize = Get-PmDirectorySize -Path $prtg.DataPath
         $stats = Get-PmPrtgConfigStats -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat')
     }
-    $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
-            [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    $disks = @()
+    if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+        $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue | ForEach-Object {
+                [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    } else {
+        $disks = @(Get-PmLogicalDisk -Path (Get-PmWorkRoot) | Where-Object { $_ } | ForEach-Object {
+                [pscustomobject]@{ Drive = $_.DeviceID; SizeGB = [math]::Round($_.Size / 1GB, 1); FreeGB = [math]::Round($_.FreeSpace / 1GB, 1) } })
+    }
 
     New-PmResult @{
         Computer     = $env:COMPUTERNAME
-        OS           = $os.Caption
-        OSVersion    = $os.Version
-        IsAdmin      = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        User         = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        OS           = $osCaption
+        OSVersion    = $osVersion
+        IsAdmin      = $isAdmin
+        User         = $userName
         Prtg         = $prtg
         PrtgDataGB   = [math]::Round($dataSize / 1GB, 2)
         PrtgConfigStats = $stats
@@ -514,7 +637,7 @@ function Invoke-PmRemoteBackup {
     $manifest = [ordered]@{
         tool = 'prtg-mover'; formatVersion = 1; jobId = $JobId
         createdUtc = (Get-Date).ToUniversalTime().ToString('o')
-        source = [ordered]@{ computer = $env:COMPUTERNAME; os = (Get-CimInstance Win32_OperatingSystem).Caption }
+        source = [ordered]@{ computer = $env:COMPUTERNAME; os = (Get-PmOsCaption) }
         prtg = [ordered]@{ included = $false }
         vpn = [ordered]@{ included = $false; allUsers = @(); users = @{} }
         desktop = [ordered]@{ included = $false; users = @() }
@@ -621,7 +744,10 @@ function Invoke-PmRemoteBackup {
                     $svcDir = Join-Path $stage 'prtg\services'
                     New-Item -ItemType Directory -Force -Path $svcDir | Out-Null
                     foreach ($n in $PmCoreService, $PmProbeService) {
-                        $w = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+                        $w = $null
+                        if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+                            $w = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+                        }
                         if (-not $w) { continue }
                         [void](Invoke-PmReg -Verb export -Key "HKLM\SYSTEM\CurrentControlSet\Services\$n" -File (Join-Path $svcDir "$n.reg"))
                         $services += [ordered]@{ name = $w.Name; displayName = $w.DisplayName; pathName = $w.PathName; startMode = $w.StartMode; startName = $w.StartName; description = $w.Description }
@@ -834,11 +960,12 @@ function Invoke-PmRemoteRestore {
         if (-not (Test-Path -LiteralPath (Join-Path $stage 'manifest.json'))) { throw "Staged package not found at $stage" }
         $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
         $need = [int64]$manifest.stagingBytes
-        $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+        $drive = if ($env:SystemDrive) { Get-PmLogicalDisk -Path ($env:SystemDrive + '\') } else { Get-PmLogicalDisk -Path $stage }
         # Local stage + move: the data already occupies the disk, only a margin is needed.
         $required = if ($MoveFromStage) { [int64]1GB } else { [int64]($need * 1.1 + 1GB) }
         if ($drive -and $drive.FreeSpace -lt $required) { throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB)) }
-        Write-PmLog ("Reading the staged package from {0}. Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK'
+        if ($drive) { Write-PmLog ("Reading the staged package from {0}. Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK' }
+        else { Write-PmLog "Reading the staged package from $stage. Disk free space could not be read." 'WARN' }
     }
     if (-not $direct -and $ExpectedSha256) {
         Write-PmProgress 2 'Verifying package checksum'
@@ -851,7 +978,7 @@ function Invoke-PmRemoteRestore {
     $need = 0
     $zr = [IO.Compression.ZipFile]::OpenRead($ZipPath)
     try { foreach ($e in $zr.Entries) { $need += $e.Length } } finally { $zr.Dispose() }
-    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $drive = Get-PmLogicalDisk -Path $WorkRoot
     $required = [int64]($need * 2 + 1GB)   # extracted staging + restored data + margin
     if ($drive -and $drive.FreeSpace -lt $required) {
         throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB))
@@ -1142,14 +1269,15 @@ function Get-PmPullList {
     param([Parameter(Mandatory)][string]$Source, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @(), [switch]$Raw)
     $list = New-Object System.Collections.ArrayList
     if (Test-Path -LiteralPath $Source) {
-        $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\')
-        $xd = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' })
+        $root = (Get-Item -LiteralPath $Source).FullName.TrimEnd('\').TrimEnd('/')
+        $xd = @($ExcludeDirs | Where-Object { $_ } | ForEach-Object { $_.Replace('/', '\').TrimEnd('\') + '\' })
         foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
-            $full = $f.FullName
+            $full = $f.FullName.Replace('/', '\')
             if (@($xd | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
             if (@($ExcludeFiles | Where-Object { $f.Name -like $_ }).Count) { continue }
             if ($f.Name -in 'desktop.ini', 'Thumbs.db') { continue }   # Windows shell junk
-            [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($root.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
+            $relRoot = $root.Replace('/', '\')
+            [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($relRoot.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
         }
     }
     if ($Raw) { return $list }
@@ -1261,14 +1389,13 @@ function Initialize-PmRemoteWorkRoot {
     param([string]$WorkRoot)
     if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
     New-Item -ItemType Directory -Force -Path (Join-Path $WorkRoot 'in') | Out-Null
-    $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
+    $drive = Get-PmLogicalDisk -Path $WorkRoot
     $prtg = Get-PmPrtgInfo
     $dataBytes = 0
     if ($prtg.Installed) { $dataBytes = Get-PmDirectorySize -Path $prtg.DataPath }
-    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     New-PmResult @{
         WorkRoot = $WorkRoot; Inbox = (Join-Path $WorkRoot 'in'); Prtg = $prtg; Computer = $env:COMPUTERNAME
-        FreeBytes = [int64]$drive.FreeSpace; PrtgDataBytes = [int64]$dataBytes
-        IsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        FreeBytes = $(if ($drive) { [int64]$drive.FreeSpace } else { [int64]0 }); PrtgDataBytes = [int64]$dataBytes
+        IsAdmin = (Test-PmIsAdmin)
     }
 }
