@@ -1,0 +1,24 @@
+[
+  {
+    "id": "prtgold01",
+    "name": "PRTG-OLD",
+    "host": "10.0.0.10",
+    "port": 0,
+    "useSsl": true,
+    "skipCaCheck": true,
+    "authentication": "Default",
+    "role": "source",
+    "notes": "Current PRTG core"
+  },
+  {
+    "id": "prtgnew01",
+    "name": "PRTG-NEW",
+    "host": "10.0.0.20",
+    "port": 0,
+    "useSsl": true,
+    "skipCaCheck": true,
+    "authentication": "Default",
+    "role": "target",
+    "notes": "New PRTG core"
+  }
+]
