@@ -219,7 +219,13 @@ function Get-PmAgentStatus {
     $f = Join-Path (Get-PmPath Data) "agent\$ServerId\heartbeat.json"
     if (-not (Test-Path -LiteralPath $f)) { return [pscustomobject]@{ connected = $false } }
     try {
-        $hb = [IO.File]::ReadAllText($f) | ConvertFrom-Json
+        # The agent rewrites the file every 5 s - retry until a complete JSON document is read.
+        $hb = $null
+        for ($i = 0; $i -lt 10 -and -not ($hb -and $hb.computer); $i++) {
+            try { $hb = [IO.File]::ReadAllText($f) | ConvertFrom-Json } catch { $hb = $null }
+            if (-not ($hb -and $hb.computer)) { Start-Sleep -Milliseconds 150 }
+        }
+        if (-not ($hb -and $hb.computer)) { return [pscustomobject]@{ connected = $false; unreadable = $true } }
         # Age from the manager's own file timestamp - the server clock may be skewed.
         $age = ((Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $f).LastWriteTimeUtc).TotalSeconds
         [pscustomobject]@{ connected = ($age -lt 30); ageSeconds = [int]$age; computer = $hb.computer; user = $hb.user; isAdmin = $hb.isAdmin; state = $hb.state; task = $hb.task; version = $hb.version }
