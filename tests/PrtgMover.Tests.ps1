@@ -481,4 +481,79 @@ Describe 'Manager module' {
         Save-PmJobRecord -Job $job
         (Get-PmJob -Id $job.id).summary | Should -Be 'unit'
     }
+
+    It 'forces RDP or WinRM for one job without changing the saved server' {
+        $saved = [pscustomobject]@{ id = 's1'; name = 'S'; host = '10.0.0.9'; transport = 'winrm' }
+        (Get-PmJobServer -Server $saved -Options @{ Transfer = 'rdp' }).transport | Should -Be 'rdp'
+        $saved.transport | Should -Be 'winrm'
+        (Get-PmJobServer -Server $saved -Options @{ Transfer = 'wireguard' }).transport | Should -Be 'winrm'
+    }
+}
+
+Describe 'WireGuard tunnel config' {
+    It 'gives the source .1 and each target the next address' {
+        $one = Get-PmTunnelAddresses -TargetCount 1
+        $one.Source | Should -Be '10.66.66.1'
+        @($one.Targets) | Should -Be @('10.66.66.2')
+        $two = Get-PmTunnelAddresses -TargetCount 2
+        @($two.Targets) | Should -Be @('10.66.66.2', '10.66.66.3')
+    }
+
+    It 'builds a split tunnel and refuses a default route' {
+        $text = New-PmWireGuardConfigText -PrivateKey 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=' -Address '10.66.66.1/24' -ListenPort 51820 -Peers @(
+            [pscustomobject]@{ PublicKey = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb='; TunnelIp = '10.66.66.2'; PublicIp = '203.0.113.8' }
+        )
+        $text | Should -Match 'AllowedIPs = 10.66.66.2/32'
+        $text | Should -Match 'Endpoint = 203.0.113.8:51820'
+        $text | Should -Match 'ListenPort = 51820'
+        Test-PmTunnelConfigSafe $text | Should -BeTrue
+        { New-PmWireGuardConfigText -PrivateKey 'k' -Address '10.66.66.1/24' -ListenPort 51820 -Peers @([pscustomobject]@{ PublicKey = 'p'; TunnelIp = '0.0.0.0'; PublicIp = '203.0.113.8' }) } | Should -Throw
+        { New-PmWireGuardConfigText -PrivateKey 'k' -Address '0.0.0.0/0' -ListenPort 51820 -Peers @([pscustomobject]@{ PublicKey = 'p'; TunnelIp = '10.66.66.2'; PublicIp = '203.0.113.8' }) } | Should -Throw
+        Test-PmTunnelConfigSafe "AllowedIPs = 0.0.0.0/0" | Should -BeFalse
+    }
+
+    It 'strips private keys before a status line can be logged' {
+        $safe = Hide-PmTunnelSecret "interface: prtg`n  private key: SECRET`n  public key: OK`n"
+        $safe | Should -Not -Match 'SECRET'
+        $safe | Should -Match 'public key: OK'
+    }
+
+    It 'rejects WireGuard when there is no second server' {
+        { Assert-PmTransferSelection -Transfer 'wireguard' -JobType 'backup' -TargetCount 0 } | Should -Throw
+        { Assert-PmTransferSelection -Transfer 'wireguard' -JobType 'migrate' -TargetCount 0 } | Should -Throw
+        { Assert-PmTransferSelection -Transfer 'wireguard' -JobType 'migrate' -TargetCount 1 } | Should -Not -Throw
+        { Assert-PmTransferSelection -Transfer 'rdp' -JobType 'backup' -TargetCount 0 } | Should -Not -Throw
+        { Assert-PmTransferSelection -Transfer 'nope' -JobType 'migrate' -TargetCount 1 } | Should -Throw
+    }
+
+    It 'only allows the tunnel file share on 10.66.66.x' {
+        { Connect-PmUncShare -RemoteName '\\203.0.113.8\C$' -UserName '.\Administrator' -Password 'x' } | Should -Throw
+    }
+
+    It 'keeps IPIP on its own network and still refuses a public share' {
+        $a = Get-PmTunnelAddresses -TargetCount 2 -Kind ipip
+        $a.Source | Should -Be '10.66.67.1'
+        $a.Network | Should -Be '10.66.67.0/24'
+        @($a.Targets) | Should -Be @('10.66.67.2', '10.66.67.3')
+        (Get-PmTunnelAddresses -TargetCount 1).Network | Should -Be '10.66.66.0/24'
+        Test-PmIpipHost '10.66.67.2' | Should -BeTrue
+        Test-PmIpipHost '10.66.66.2' | Should -BeFalse
+        Test-PmTunnelShare '\\10.66.67.2\C$' | Should -BeTrue
+        Test-PmTunnelShare '\\10.66.66.1\C$' | Should -BeTrue
+        Test-PmTunnelShare '\\203.0.113.8\C$' | Should -BeFalse
+        { Assert-PmTransferSelection -Transfer 'ipip' -JobType 'backup' -TargetCount 0 } | Should -Throw
+        { Assert-PmTransferSelection -Transfer 'ipip' -JobType 'migrate' -TargetCount 1 } | Should -Not -Throw
+    }
+
+    It 'only allows WinRM to a tunnel address' {
+        Test-PmTunnelPeer '10.66.66.2' | Should -BeTrue
+        Test-PmTunnelPeer '10.66.67.1' | Should -BeTrue
+        Test-PmTunnelPeer '203.0.113.8' | Should -BeFalse
+        Test-PmTunnelPeer '0.0.0.0' | Should -BeFalse
+        { Enable-PmTunnelWinRm -TunnelNetwork '0.0.0.0/0' } | Should -Throw
+        { Enable-PmTunnelWinRm -TunnelNetwork '203.0.113.0/24' } | Should -Throw
+        { Measure-PmTunnelWinRm -PeerTunnelIp '203.0.113.8' -UserName '.\Administrator' -Password 'x' } | Should -Throw
+        { Send-PmTunnelWinRmCopy -PeerTunnelIp '10.66.66.2' -UserName '.\Administrator' -Password 'x' -Destination 'D:\data' } | Should -Throw
+        { Send-PmTunnelWinRmCopy -PeerTunnelIp '203.0.113.8' -UserName '.\Administrator' -Password 'x' -Destination 'C:\PrtgMover\tunnel\job' } | Should -Throw
+    }
 }

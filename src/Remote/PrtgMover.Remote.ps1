@@ -811,7 +811,9 @@ function Invoke-PmRemoteBackup {
         [string]$StageDir,
         [string]$LogDir,
         # WinRM pull mode: big folders are NOT copied here - the manager pulls them straight from the snapshot.
-        [bool]$PullMode = $false
+        [bool]$PullMode = $false,
+        # Kept so an older caller can still ask for a direct stage. Tunnel jobs no longer use it.
+        [bool]$TunnelCopy = $false
     )
     $ErrorActionPreference = 'Stop'
     $sourceHealth = $null
@@ -823,7 +825,8 @@ function Invoke-PmRemoteBackup {
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     if (-not $direct) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
     if ($LogDir) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null; $global:PmRobocopyLog = Join-Path $LogDir "robocopy-$JobId-$env:COMPUTERNAME.log" } else { $global:PmRobocopyLog = $null }
-    Write-PmLog "Mode: $(if ($direct) { 'direct staging on the manager (no disk space used on this server)' } else { 'local staging + zip' }). Robocopy log: $(if ($global:PmRobocopyLog) { $global:PmRobocopyLog } else { 'off' })" 'DEBUG'
+    $modeText = if ($TunnelCopy) { 'direct copy to the other server over the tunnel (this manager is not in the path)' } elseif ($direct) { 'direct staging on the manager (no disk space used on this server)' } else { 'local staging + zip' }
+    Write-PmLog "Mode: $modeText. Robocopy log: $(if ($global:PmRobocopyLog) { $global:PmRobocopyLog } else { 'off' })" 'DEBUG'
 
     $manifest = [ordered]@{
         tool = 'prtg-mover'; formatVersion = 1; jobId = $JobId
@@ -1087,9 +1090,10 @@ function Invoke-PmRemoteBackup {
         return (New-PmResult @{ StageDir = $stage; PullItems = @($pullItems); ShadowId = $(if ($shadow) { $shadow.Id }); ShadowLink = $(if ($shadow) { $shadow.Link }); Manifest = ($manifest | ConvertTo-Json -Depth 8); SourceHealth = $sourceHealth })
     }
     if ($direct) {
-        Write-PmLog ("Staging complete on the manager ({0:N2} GB). The manager builds the package." -f ($manifest.stagingBytes / 1GB)) 'OK'
+        if ($TunnelCopy) { Write-PmLog ("Copy complete on the other server ({0:N2} GB). Nothing was stored on the manager." -f ($manifest.stagingBytes / 1GB)) 'OK' }
+        else { Write-PmLog ("Staging complete on the manager ({0:N2} GB). The manager builds the package." -f ($manifest.stagingBytes / 1GB)) 'OK' }
         Write-PmProgress 80 'Staging done'
-        return (New-PmResult @{ StageDir = $stage; Manifest = ($manifest | ConvertTo-Json -Depth 8); SourceHealth = $sourceHealth })
+        return (New-PmResult @{ StageDir = $stage; Manifest = ($manifest | ConvertTo-Json -Depth 8); SourceHealth = $sourceHealth; TunnelCopy = [bool]$TunnelCopy })
     }
     $zipName = 'PRTG_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss')
     $zipPath = Join-Path $outDir $zipName
@@ -1609,4 +1613,620 @@ function Initialize-PmRemoteWorkRoot {
         FreeBytes = $(if ($drive) { [int64]$drive.FreeSpace } else { [int64]0 }); PrtgDataBytes = [int64]$dataBytes
         IsAdmin = (Test-PmIsAdmin)
     }
+}
+
+# ---------------------------------------------------------------- tunnels (WireGuard now, IPIP uses the same address plan)
+
+function Test-PmIPv4Address {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $parsed = $null
+    if (-not [Net.IPAddress]::TryParse($Value, [ref]$parsed)) { return $false }
+    if ($parsed.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { return $false }
+    return $Value -match '^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+function Test-PmTunnelHost {
+    <# A single host on the PRTG Mover tunnel network (never a default route). #>
+    param([string]$Ip)
+    if (-not (Test-PmIPv4Address $Ip)) { return $false }
+    if ($Ip -notmatch '^10\.66\.66\.(\d+)$') { return $false }
+    $n = [int]$Matches[1]
+    return ($n -ge 1 -and $n -le 254)
+}
+
+function Get-PmTunnelAddresses {
+    <# WireGuard uses 10.66.66.0/24. IPIP uses 10.66.67.0/24. Source is always .1. Split tunnel only. #>
+    param(
+        [Parameter(Mandatory)][int]$TargetCount,
+        [ValidateSet('wireguard', 'ipip')][string]$Kind = 'wireguard'
+    )
+    if ($TargetCount -lt 1 -or $TargetCount -gt 250) { throw 'A tunnel needs between 1 and 250 target servers.' }
+    $octet = if ($Kind -eq 'ipip') { 67 } else { 66 }
+    $targets = New-Object System.Collections.Generic.List[string]
+    foreach ($n in (2..($TargetCount + 1))) { $targets.Add("10.66.$octet.$n") }
+    [pscustomobject]@{
+        Source = "10.66.$octet.1"; Targets = $targets; Prefix = 24
+        Port = $(if ($Kind -eq 'wireguard') { 51820 } else { 0 })
+        Network = "10.66.$octet.0/24"; Kind = $Kind
+    }
+}
+
+function Test-PmIpipHost {
+    param([string]$Ip)
+    if (-not (Test-PmIPv4Address $Ip)) { return $false }
+    if ($Ip -notmatch '^10\.66\.67\.(\d+)$') { return $false }
+    $n = [int]$Matches[1]
+    return ($n -ge 1 -and $n -le 254)
+}
+
+function Test-PmTunnelShare {
+    <# Admin share on either tunnel network, never a public address. #>
+    param([string]$RemoteName)
+    return [bool]($RemoteName -match '^\\\\10\.66\.6[67]\.\d+\\[^\\]+$')
+}
+
+function New-PmWireGuardConfigText {
+    <#
+        Split tunnel: AllowedIPs is only the other server's tunnel address (/32).
+        A full tunnel (0.0.0.0/0) is refused - it would replace the server's default route.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PrivateKey,
+        [Parameter(Mandatory)][string]$Address,
+        [Parameter(Mandatory)][int]$ListenPort,
+        [Parameter(Mandatory)][object[]]$Peers
+    )
+    if ($Address -notmatch '^(10\.66\.66\.\d+)/24$') { throw "Tunnel address '$Address' must be 10.66.66.x/24." }
+    if (-not (Test-PmTunnelHost $Matches[1])) { throw "Tunnel address '$Address' is outside 10.66.66.1-254." }
+    if ($ListenPort -lt 1 -or $ListenPort -gt 65535) { throw "Listen port $ListenPort is not valid." }
+    if (@($Peers).Count -lt 1) { throw 'A WireGuard config needs the other server as a peer.' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('[Interface]')
+    [void]$sb.AppendLine("PrivateKey = $PrivateKey")
+    [void]$sb.AppendLine("Address = $Address")
+    [void]$sb.AppendLine("ListenPort = $ListenPort")
+    [void]$sb.AppendLine('')
+    foreach ($p in @($Peers)) {
+        $pub = [string]$p.PublicKey
+        $tip = [string]$p.TunnelIp
+        $eip = [string]$p.PublicIp
+        if ([string]::IsNullOrWhiteSpace($pub)) { throw 'WireGuard peer is missing a public key.' }
+        if (-not (Test-PmTunnelHost $tip)) { throw "Refusing peer '$tip'. AllowedIPs must be that server's tunnel address only, never 0.0.0.0/0." }
+        if ([string]::IsNullOrWhiteSpace($eip) -or $eip -notmatch '^[A-Za-z0-9\.\-]+$') { throw 'WireGuard peer endpoint is missing.' }
+        if ($eip -eq '0.0.0.0') { throw 'Refusing a full tunnel. The endpoint must be the other server.' }
+        [void]$sb.AppendLine('[Peer]')
+        [void]$sb.AppendLine("PublicKey = $pub")
+        [void]$sb.AppendLine("AllowedIPs = $tip/32")
+        [void]$sb.AppendLine("Endpoint = ${eip}:${ListenPort}")
+        [void]$sb.AppendLine('PersistentKeepalive = 25')
+        [void]$sb.AppendLine('')
+    }
+    $text = $sb.ToString().Trim() + "`r`n"
+    if (-not (Test-PmTunnelConfigSafe $text)) { throw 'Refusing a WireGuard config that would change the default route.' }
+    return $text
+}
+
+function Test-PmTunnelConfigSafe {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    if ($Text -match '(?i)(^|[^\d])0\.0\.0\.0/0([^0-9]|$)') { return $false }
+    if ($Text -match '::/0') { return $false }
+    return $Text -match 'AllowedIPs = 10\.66\.66\.\d+/32'
+}
+
+function Hide-PmTunnelSecret {
+    <# Drops WireGuard 'private key' lines before anything is logged or returned. #>
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    return (($Text -split "`r?`n") | Where-Object { $_ -notmatch '(?i)private\s*key' }) -join "`n"
+}
+
+function Get-PmWireGuardKeyDir { return 'C:\ProgramData\PrtgMover\wireguard' }
+
+function Install-PmWireGuard {
+    <# Installs the signed WireGuard MSI if needed and returns only the public key. #>
+    $ErrorActionPreference = 'Stop'
+    if (-not [Environment]::Is64BitOperatingSystem) { throw 'WireGuard needs 64-bit Windows.' }
+    $wg = 'C:\Program Files\WireGuard\wg.exe'
+    if (-not (Test-Path -LiteralPath $wg)) {
+        Write-PmLog 'Installing WireGuard (split tunnel only; the default route is not changed).' 'STEP'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $msi = Join-Path $env:TEMP 'wireguard-amd64-1.1.msi'
+        $url = 'https://download.wireguard.com/windows-client/wireguard-amd64-1.1.msi'
+        $expected = '6DAA5D37A9E2950DFB8C48B95AB8E562CB2BAD1C785D020F38F97BEA4C6A5566'
+        $ProgressPreference = 'SilentlyContinue'
+        (New-Object System.Net.WebClient).DownloadFile($url, $msi)
+        $hash = (Get-FileHash -LiteralPath $msi -Algorithm SHA256).Hash
+        if ($hash -ne $expected) { Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue; throw "WireGuard installer hash mismatch ($hash)." }
+        $p = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList @('/i', $msi, '/qn', '/norestart', 'DO_NOT_LAUNCH=1') -Wait -PassThru
+        Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "WireGuard install failed (msiexec $($p.ExitCode))." }
+        if (-not (Test-Path -LiteralPath $wg)) { throw 'WireGuard installed but wg.exe is missing.' }
+        Write-PmLog 'WireGuard installed.' 'OK'
+    } else {
+        Write-PmLog 'WireGuard is already installed.' 'OK'
+    }
+    $keyDir = Get-PmWireGuardKeyDir
+    New-Item -ItemType Directory -Force -Path $keyDir | Out-Null
+    $privFile = Join-Path $keyDir 'private.key'
+    if (-not (Test-Path -LiteralPath $privFile)) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $wg
+        $psi.Arguments = 'genkey'
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $proc = [Diagnostics.Process]::Start($psi)
+        $priv = $proc.StandardOutput.ReadToEnd().Trim()
+        $genErr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+        if ($proc.ExitCode -ne 0 -or $priv.Length -lt 40) { throw "WireGuard key generation failed. $genErr" }
+        [IO.File]::WriteAllText($privFile, $priv)
+        & icacls.exe $privFile /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+    }
+    $priv = [IO.File]::ReadAllText($privFile).Trim()
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $wg
+    $psi.Arguments = 'pubkey'
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $proc = [Diagnostics.Process]::Start($psi)
+    $proc.StandardInput.Write($priv)
+    $proc.StandardInput.Close()
+    $pub = $proc.StandardOutput.ReadToEnd().Trim()
+    $pubErr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0 -or $pub.Length -lt 40) { throw "WireGuard public key failed. $pubErr" }
+    New-PmResult @{ PublicKey = $pub; Computer = $env:COMPUTERNAME; Installed = $true }
+}
+
+function Enable-PmWireGuardEndpoint {
+    param(
+        [Parameter(Mandatory)][string]$Address,
+        [int]$ListenPort = 51820,
+        [Parameter(Mandatory)][object[]]$Peers
+    )
+    $ErrorActionPreference = 'Stop'
+    $privFile = Join-Path (Get-PmWireGuardKeyDir) 'private.key'
+    if (-not (Test-Path -LiteralPath $privFile)) { throw 'WireGuard private key is missing. Install WireGuard on this server first.' }
+    $priv = [IO.File]::ReadAllText($privFile).Trim()
+    $text = New-PmWireGuardConfigText -PrivateKey $priv -Address $Address -ListenPort $ListenPort -Peers $Peers
+    $hopBefore = ''
+    $before = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric, InterfaceMetric)
+    if ($before.Count) { $hopBefore = [string]$before[0].NextHop }
+
+    $keyDir = Get-PmWireGuardKeyDir
+    $conf = Join-Path $keyDir 'prtg.conf'
+    $utf8 = New-Object System.Text.UTF8Encoding $false
+    [IO.File]::WriteAllText($conf, $text, $utf8)
+    & icacls.exe $conf /inheritance:r /grant:r 'SYSTEM:(F)' 'Administrators:(F)' | Out-Null
+    & icacls.exe $keyDir /inheritance:r /grant:r 'SYSTEM:(OI)(CI)(F)' 'Administrators:(OI)(CI)(F)' | Out-Null
+
+    $peerIps = @($Peers | ForEach-Object { [string]$_.PublicIp } | Where-Object { $_ })
+    foreach ($name in @('PrtgMover-WireGuard', 'PrtgMover-Tunnel-ICMP', 'PrtgMover-Tunnel-SMB')) {
+        if (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -Name $name }
+    }
+    New-NetFirewallRule -Name 'PrtgMover-WireGuard' -DisplayName 'PRTG Mover WireGuard' -Enabled True -Direction Inbound -Action Allow -Protocol UDP -LocalPort $ListenPort -RemoteAddress $peerIps -Profile Any | Out-Null
+    New-NetFirewallRule -Name 'PrtgMover-Tunnel-ICMP' -DisplayName 'PRTG Mover tunnel ICMP' -Enabled True -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -RemoteAddress '10.66.66.0/24' -Profile Any | Out-Null
+
+    $ui = 'C:\Program Files\WireGuard\wireguard.exe'
+    if (Get-Service -Name 'WireGuardTunnel$prtg' -ErrorAction SilentlyContinue) {
+        $rm = Start-Process -FilePath $ui -ArgumentList @('/uninstalltunnelservice', 'prtg') -Wait -PassThru -WindowStyle Hidden
+        if ($rm.ExitCode -ne 0) { throw "Could not update the WireGuard tunnel (exit $($rm.ExitCode))." }
+        Start-Sleep -Seconds 2
+    }
+    $p = Start-Process -FilePath $ui -ArgumentList @('/installtunnelservice', $conf) -Wait -PassThru -WindowStyle Hidden
+    if ($p.ExitCode -ne 0) { throw "WireGuard tunnel did not start (exit $($p.ExitCode))." }
+    Start-Sleep -Seconds 2
+    $after = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric, InterfaceMetric)
+    $hopAfter = if ($after.Count) { [string]$after[0].NextHop } else { '' }
+    if ($hopBefore -and $hopAfter -and $hopBefore -ne $hopAfter) {
+        Start-Process -FilePath $ui -ArgumentList @('/uninstalltunnelservice', 'prtg') -Wait -WindowStyle Hidden | Out-Null
+        throw "WireGuard changed the default gateway from $hopBefore to $hopAfter. The tunnel was removed."
+    }
+    $svc = Get-Service -Name 'WireGuardTunnel$prtg' -ErrorAction SilentlyContinue
+    Write-PmLog "WireGuard is up on $Address (UDP $ListenPort, only the other server). Default gateway is still $hopAfter." 'OK'
+    New-PmResult @{ Computer = $env:COMPUTERNAME; Address = $Address; Port = $ListenPort; Service = $(if ($svc) { [string]$svc.Status } else { 'missing' }); Gateway = $hopAfter }
+}
+
+function Test-PmWireGuardLink {
+    param([Parameter(Mandatory)][string]$PeerTunnelIp)
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-PmTunnelHost $PeerTunnelIp)) { throw "Refusing to probe '$PeerTunnelIp'." }
+    $raw = @(& 'C:\Program Files\WireGuard\wg.exe' show prtg 2>&1 | ForEach-Object { "$_" })
+    $safe = Hide-PmTunnelSecret ($raw -join "`n")
+    $handshake = $safe -match 'latest handshake'
+    & ping.exe -n 2 -w 1000 $PeerTunnelIp | Out-Null
+    $pingOk = ($LASTEXITCODE -eq 0)
+    if ($pingOk) { Write-PmLog "Tunnel reachability: $PeerTunnelIp answers ($(if ($handshake) { 'handshake ok' } else { 'ping ok' }))." 'OK' }
+    else { Write-PmLog "Tunnel reachability: $PeerTunnelIp did not answer ping." 'WARN' }
+    New-PmResult @{ Peer = $PeerTunnelIp; PingOk = [bool]$pingOk; Handshake = [bool]$handshake }
+}
+
+function Connect-PmUncShare {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Passed once over the already-authenticated remoting session so the source can sign in to the target admin share. Never logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Required by WNetAddConnection2 for the tunnel file copy.')]
+    param(
+        [Parameter(Mandatory)][string]$RemoteName,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-PmTunnelShare $RemoteName)) { throw 'The file share must be on the tunnel network (10.66.66.x or 10.66.67.x), not a public address.' }
+    if (-not ('PmNetUse' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class PmNetUse {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct NETRESOURCE {
+        public int dwScope;
+        public int dwType;
+        public int dwDisplayType;
+        public int dwUsage;
+        public string lpLocalName;
+        public string lpRemoteName;
+        public string lpComment;
+        public string lpProvider;
+    }
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    public static extern int WNetAddConnection2(ref NETRESOURCE nr, string password, string username, int flags);
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    public static extern int WNetCancelConnection2(string name, int flags, bool force);
+}
+'@
+    }
+    $nr = New-Object PmNetUse+NETRESOURCE
+    $nr.dwType = 1
+    $nr.lpRemoteName = $RemoteName
+    [void][PmNetUse]::WNetCancelConnection2($RemoteName, 0, $true)
+    $code = [PmNetUse]::WNetAddConnection2([ref]$nr, $Password, $UserName, 0)
+    if ($code -ne 0) { throw "Could not sign in to $RemoteName (Windows error $code)." }
+    Write-PmLog "Signed in to $RemoteName for the tunnel copy." 'OK'
+    New-PmResult @{ RemoteName = $RemoteName; Ok = $true }
+}
+
+function Disconnect-PmUncShare {
+    param([Parameter(Mandatory)][string]$RemoteName)
+    if ('PmNetUse' -as [type]) { [void][PmNetUse]::WNetCancelConnection2($RemoteName, 0, $true) }
+    New-PmResult @{ RemoteName = $RemoteName; Ok = $true }
+}
+
+function Test-PmTunnelPeer {
+    <# WinRM on the tunnel may only dial 10.66.66.x or 10.66.67.x. #>
+    param([string]$Ip)
+    return ((Test-PmTunnelHost $Ip) -or (Test-PmIpipHost $Ip))
+}
+
+function Enable-PmTunnelWinRm {
+    <#
+        WinRM listens for the other server. TCP 5985 is allowed only from the tunnel
+        network, never from the public address. Same point-to-point shape as a
+        bandwidth test aimed at the tunnel address.
+    #>
+    param([Parameter(Mandatory)][string]$TunnelNetwork)
+    if ($TunnelNetwork -notin @('10.66.66.0/24', '10.66.67.0/24')) {
+        throw "WinRM on the tunnel only accepts 10.66.66.0/24 or 10.66.67.0/24, not '$TunnelNetwork'."
+    }
+    $ErrorActionPreference = 'Stop'
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+    Set-Service WinRM -StartupType Automatic
+    Start-Service WinRM
+    New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -Value 1 -PropertyType DWord -Force | Out-Null
+    Set-Item WSMan:\localhost\MaxEnvelopeSizekb 8192
+    Set-Item WSMan:\localhost\Shell\MaxMemoryPerShellMB 4096
+    $name = 'PrtgMover-Tunnel-WinRM'
+    if (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -Name $name }
+    New-NetFirewallRule -Name $name -DisplayName 'PRTG Mover tunnel WinRM' -Enabled True -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5985 -RemoteAddress $TunnelNetwork -Profile Any | Out-Null
+    Write-PmLog "WinRM TCP 5985 is open only from $TunnelNetwork (not from the public address)." 'OK'
+    New-PmResult @{ Port = 5985; Network = $TunnelNetwork }
+}
+
+function Open-PmTunnelWinRmSession {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Passed once over the already-authenticated command channel so this server can sign in to the peer over the tunnel. Never logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'The peer is a tunnel address. The password is turned into a PSCredential and is not logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'The peer password arrives once on the command channel and is wrapped only to build a PSCredential. It is not logged or stored.')]
+    param(
+        [Parameter(Mandatory)][string]$PeerTunnelIp,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password
+    )
+    if (-not (Test-PmTunnelPeer $PeerTunnelIp)) { throw "Refusing WinRM to '$PeerTunnelIp'. The session must use the tunnel address (10.66.66.x or 10.66.67.x)." }
+    $item = Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue
+    $cur = if ($item) { [string]$item.Value } else { '' }
+    $parts = @($cur -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -ne '*' })
+    if ($parts -notcontains $PeerTunnelIp) {
+        $parts += $PeerTunnelIp
+        Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value ($parts -join ',') -Force
+    }
+    $secure = ConvertTo-SecureString $Password -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($UserName, $secure)
+    $opt = New-PSSessionOption -OpenTimeout 60000 -OperationTimeout 14400000 -IdleTimeout 14400000
+    New-PSSession -ComputerName $PeerTunnelIp -Port 5985 -Credential $cred -Authentication Negotiate -SessionOption $opt -ErrorAction Stop
+}
+
+function Measure-PmTunnelWinRm {
+    <#
+        Sends 32 MB to the peer's tunnel address over WinRM and reports MB/s.
+        The bytes take the tunnel path, the same way a point-to-point bandwidth test would.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Used only to open the tunnel WinRM session. Never logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Required to sign in to the peer tunnel address.')]
+    param(
+        [Parameter(Mandatory)][string]$PeerTunnelIp,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-PmTunnelPeer $PeerTunnelIp)) { throw "Refusing WinRM to '$PeerTunnelIp'. The session must use the tunnel address (10.66.66.x or 10.66.67.x)." }
+    $session = Open-PmTunnelWinRmSession -PeerTunnelIp $PeerTunnelIp -UserName $UserName -Password $Password
+    $local = Join-Path ([IO.Path]::GetTempPath()) 'prtg-mover-winrm-probe.bin'
+    try {
+        $remoteDir = 'C:\PrtgMover\tunnel\probe'
+        Invoke-Command -Session $session -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $remoteDir
+        $remote = Join-Path $remoteDir 'probe.bin'
+        $fs = [IO.File]::Open($local, [IO.FileMode]::Create, [IO.FileAccess]::Write)
+        try {
+            $buf = New-Object byte[] 1048576
+            for ($i = 0; $i -lt $buf.Length; $i++) { $buf[$i] = [byte]($i -band 255) }
+            for ($n = 0; $n -lt 32; $n++) { $fs.Write($buf, 0, $buf.Length) }
+        } finally { $fs.Dispose() }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        Copy-Item -ToSession $session -LiteralPath $local -Destination $remote -Force
+        $sw.Stop()
+        Invoke-Command -Session $session -ScriptBlock { param($p) Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } -ArgumentList $remote
+        $rate = 32 / [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
+        Write-PmLog ("WinRM {0}:5985  32 MB in {1:N2} s ({2:N1} MB/s). Point to point on the tunnel, the same shape as a bandwidth test." -f $PeerTunnelIp, $sw.Elapsed.TotalSeconds, $rate) 'OK'
+        New-PmResult @{ Peer = $PeerTunnelIp; Port = 5985; Megabytes = 32; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 2); MegabytesPerSecond = [math]::Round($rate, 1) }
+    } finally {
+        Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue
+        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+    }
+}
+
+function Send-PmTunnelWinRmBatch {
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Destination,
+        [Parameter(Mandatory)][string[]]$Files
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $chunk = Join-Path ([IO.Path]::GetTempPath()) ('pm-tunnel-{0}.zip' -f [guid]::NewGuid().ToString('N'))
+    $remoteChunk = 'C:\PrtgMover\tunnel\chunks\{0}.zip' -f [guid]::NewGuid().ToString('N')
+    $zip = [IO.Compression.ZipFile]::Open($chunk, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($rel in $Files) {
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $Source $rel), $rel.Replace('\', '/'), [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $zip.Dispose() }
+    try {
+        Invoke-Command -Session $Session -ScriptBlock { param($p) New-Item -ItemType Directory -Force -Path (Split-Path $p -Parent) | Out-Null } -ArgumentList $remoteChunk
+        Copy-Item -ToSession $Session -LiteralPath $chunk -Destination $remoteChunk -Force
+        $size = [int64](Get-Item -LiteralPath $chunk).Length
+        Invoke-Command -Session $Session -ScriptBlock {
+            param($ChunkPath, $Dest)
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $opened = [IO.Compression.ZipFile]::OpenRead($ChunkPath)
+            try {
+                foreach ($e in $opened.Entries) {
+                    if (-not $e.Name) { continue }
+                    $target = Join-Path $Dest ($e.FullName.Replace('/', '\'))
+                    $dir = Split-Path $target -Parent
+                    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+                    [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+                }
+            } finally { $opened.Dispose() }
+            Remove-Item -LiteralPath $ChunkPath -Force -ErrorAction SilentlyContinue
+        } -ArgumentList $remoteChunk, $Destination
+        New-PmResult @{ WireBytes = $size; Count = $Files.Count }
+    } finally {
+        Remove-Item -LiteralPath $chunk -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Send-PmTunnelWinRmCopy {
+    <# Pushes the staged files to the other server over WinRM, using only its tunnel address. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Used only to open the tunnel WinRM session. Never logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Required to sign in to the peer tunnel address.')]
+    param(
+        [Parameter(Mandatory)][string]$PeerTunnelIp,
+        [Parameter(Mandatory)][string]$UserName,
+        [Parameter(Mandatory)][string]$Password,
+        [Parameter(Mandatory)][string]$Destination,
+        [string]$StageDir,
+        [object[]]$PullItems = @()
+    )
+    $ErrorActionPreference = 'Stop'
+    if ($Destination -notmatch '^C:\\PrtgMover\\tunnel(\\|$)') { throw "Refusing to write WinRM data to '$Destination'." }
+    if (-not (Test-PmTunnelPeer $PeerTunnelIp)) { throw "Refusing WinRM to '$PeerTunnelIp'. The session must use the tunnel address (10.66.66.x or 10.66.67.x)." }
+    $session = Open-PmTunnelWinRmSession -PeerTunnelIp $PeerTunnelIp -UserName $UserName -Password $Password
+    $wire = [int64]0
+    $fileCount = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        Invoke-Command -Session $session -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $Destination
+        $roots = New-Object System.Collections.Generic.List[object]
+        if ($StageDir -and (Test-Path -LiteralPath $StageDir)) {
+            $roots.Add([pscustomobject]@{ Source = $StageDir; Target = ''; ExcludeDirs = @(); ExcludeFiles = @() })
+        }
+        foreach ($pi in @($PullItems)) {
+            $src = [string]$pi.Source
+            if (-not $src) { continue }
+            $roots.Add([pscustomobject]@{ Source = $src; Target = [string]$pi.Target; ExcludeDirs = @($pi.ExcludeDirs); ExcludeFiles = @($pi.ExcludeFiles) })
+        }
+        foreach ($root in $roots) {
+            $list = @(Get-PmPullList -Source $root.Source -ExcludeDirs @($root.ExcludeDirs) -ExcludeFiles @($root.ExcludeFiles) -Raw)
+            $destRoot = if ($root.Target) { Join-Path $Destination $root.Target } else { $Destination }
+            Invoke-Command -Session $session -ScriptBlock { param($d) New-Item -ItemType Directory -Force -Path $d | Out-Null } -ArgumentList $destRoot
+            $batch = New-Object System.Collections.Generic.List[string]
+            $batchBytes = [int64]0
+            foreach ($f in $list) {
+                $batch.Add([string]$f.Rel)
+                $batchBytes += [int64]$f.Size
+                if ($batchBytes -ge 256MB) {
+                    $sent = Send-PmTunnelWinRmBatch -Session $session -Source $root.Source -Destination $destRoot -Files @($batch)
+                    $wire += [int64]$sent.WireBytes
+                    $fileCount += [int]$sent.Count
+                    $batch.Clear()
+                    $batchBytes = 0
+                    $rate = ($wire / 1MB) / [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
+                    Write-PmLog ("WinRM {0}:5985  {1:N1} MB on the wire so far ({2:N1} MB/s)." -f $PeerTunnelIp, ($wire / 1MB), $rate) 'INFO'
+                }
+            }
+            if ($batch.Count -gt 0) {
+                $sent = Send-PmTunnelWinRmBatch -Session $session -Source $root.Source -Destination $destRoot -Files @($batch)
+                $wire += [int64]$sent.WireBytes
+                $fileCount += [int]$sent.Count
+            }
+        }
+        $sw.Stop()
+        $rate = ($wire / 1MB) / [math]::Max(0.001, $sw.Elapsed.TotalSeconds)
+        Write-PmLog ("WinRM copy to {0}:5985 finished: {1} file(s), {2:N1} MB on the wire, {3:N1} MB/s." -f $PeerTunnelIp, $fileCount, ($wire / 1MB), $rate) 'OK'
+        New-PmResult @{ Files = $fileCount; WireBytes = $wire; MegabytesPerSecond = [math]::Round($rate, 1); Destination = $Destination }
+    } finally {
+        if ($session) { Remove-PSSession $session -ErrorAction SilentlyContinue }
+    }
+}
+
+function Test-PmTunnelPing {
+    param([Parameter(Mandatory)][string]$PeerTunnelIp)
+    $ErrorActionPreference = 'Stop'
+    $onTunnel = (Test-PmTunnelHost $PeerTunnelIp) -or (Test-PmIpipHost $PeerTunnelIp)
+    if (-not $onTunnel) { throw "Refusing to probe '$PeerTunnelIp'." }
+    & ping.exe -n 2 -w 1000 $PeerTunnelIp | Out-Null
+    $pingOk = ($LASTEXITCODE -eq 0)
+    if ($pingOk) { Write-PmLog "Tunnel reachability: $PeerTunnelIp answers." 'OK' }
+    else { Write-PmLog "Tunnel reachability: $PeerTunnelIp did not answer ping." 'WARN' }
+    New-PmResult @{ Peer = $PeerTunnelIp; PingOk = [bool]$pingOk }
+}
+
+function Get-PmOutboundAddress {
+    param([Parameter(Mandatory)][string]$Peer)
+    $client = New-Object System.Net.Sockets.UdpClient
+    try {
+        $client.Connect($Peer, 9)
+        return [string]$client.Client.LocalEndPoint.Address
+    } finally { $client.Dispose() }
+}
+
+function Install-PmIpip {
+    <# Downloads the official Wintun build and compiles the IPIP tunnel program. #>
+    param([Parameter(Mandatory)][string]$Code)
+    $ErrorActionPreference = 'Stop'
+    if (-not [Environment]::Is64BitOperatingSystem) { throw 'IPIP needs 64-bit Windows.' }
+    if ($Code -notmatch 'class IpipTunnel') { throw 'IPIP source was not sent by the manager.' }
+    $dir = 'C:\ProgramData\PrtgMover\ipip'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $zipHash = '07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51'
+    $dllHash = 'E5DA8447DC2C320EDC0FC52FA01885C103DE8C118481F683643CACC3220DAFCE'
+    $dll = Join-Path $dir 'wintun.dll'
+    if (-not (Test-Path -LiteralPath $dll) -or (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash -ne $dllHash) {
+        Write-PmLog 'Downloading Wintun for the IPIP tunnel.' 'STEP'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $zip = Join-Path $env:TEMP 'wintun-0.14.1.zip'
+        $ProgressPreference = 'SilentlyContinue'
+        (New-Object System.Net.WebClient).DownloadFile('https://www.wintun.net/builds/wintun-0.14.1.zip', $zip)
+        if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $zipHash) {
+            Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+            throw 'Wintun download hash mismatch.'
+        }
+        $unpack = Join-Path $env:TEMP 'wintun-unpack'
+        if (Test-Path -LiteralPath $unpack) { Remove-Item -LiteralPath $unpack -Recurse -Force }
+        Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
+        Copy-Item -LiteralPath (Join-Path $unpack 'wintun\bin\amd64\wintun.dll') -Destination $dll -Force
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+        if ((Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash -ne $dllHash) { throw 'wintun.dll hash mismatch.' }
+        Write-PmLog 'Wintun is in place.' 'OK'
+    }
+    $cs = Join-Path $dir 'IpipTunnel.cs'
+    $exe = Join-Path $dir 'IpipTunnel.exe'
+    [IO.File]::WriteAllText($cs, $Code)
+    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if (-not (Test-Path -LiteralPath $csc)) { throw 'The .NET Framework compiler (csc.exe) is missing on this server.' }
+    Get-Process -Name 'IpipTunnel' -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 1
+    $build = Start-Process -FilePath $csc -ArgumentList @('/nologo', '/platform:x64', '/optimize+', "/out:$exe", $cs) -Wait -PassThru -RedirectStandardOutput (Join-Path $dir 'build.out') -RedirectStandardError (Join-Path $dir 'build.err')
+    if ($build.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $exe)) {
+        $err = ''
+        if (Test-Path -LiteralPath (Join-Path $dir 'build.err')) { $err = (Get-Content -LiteralPath (Join-Path $dir 'build.err') -Raw -ErrorAction SilentlyContinue) }
+        throw "IPIP program did not compile. $err"
+    }
+    Write-PmLog 'IPIP tunnel program is compiled.' 'OK'
+    New-PmResult @{ Installed = $true; Computer = $env:COMPUTERNAME }
+}
+
+function Enable-PmIpipEndpoint {
+    param(
+        [Parameter(Mandatory)][string]$LocalTunnel,
+        [Parameter(Mandatory)][object[]]$Peers
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-PmIpipHost $LocalTunnel)) { throw "IPIP address '$LocalTunnel' must be 10.66.67.1-254." }
+    $dir = 'C:\ProgramData\PrtgMover\ipip'
+    $exe = Join-Path $dir 'IpipTunnel.exe'
+    if (-not (Test-Path -LiteralPath $exe)) { throw 'IPIP is not installed on this server yet.' }
+    $peerIps = @()
+    $lines = New-Object System.Collections.Generic.List[string]
+    $firstPeer = $null
+    foreach ($p in @($Peers)) {
+        $tip = [string]$p.TunnelIp
+        $eip = [string]$p.PublicIp
+        if (-not (Test-PmIpipHost $tip)) { throw "Refusing IPIP peer '$tip'. The tunnel only carries 10.66.67.0/24." }
+        if (-not (Test-PmIPv4Address $eip)) {
+            $resolved = @([Net.Dns]::GetHostAddresses($eip) | Where-Object { $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork } | Select-Object -First 1)
+            if ($resolved) { $eip = [string]$resolved[0] }
+        }
+        if (-not (Test-PmIPv4Address $eip)) { throw "IPIP peer endpoint '$($p.PublicIp)' must be an IPv4 address." }
+        if (-not $firstPeer) { $firstPeer = $eip }
+        $peerIps += $eip
+        $lines.Add("peer=$tip,$eip")
+    }
+    if (-not $firstPeer) { throw 'IPIP needs the other server as a peer.' }
+    $localPublic = Get-PmOutboundAddress -Peer $firstPeer
+    $cfg = Join-Path $dir 'tunnel.txt'
+    $text = "localTunnel=$LocalTunnel`r`nlocalPublic=$localPublic`r`n" + ($lines -join "`r`n") + "`r`n"
+    [IO.File]::WriteAllText($cfg, $text)
+
+    $hopBefore = ''
+    $before = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric, InterfaceMetric)
+    if ($before.Count) { $hopBefore = [string]$before[0].NextHop }
+
+    foreach ($name in @('PrtgMover-IPIP', 'PrtgMover-IPIP-ICMP', 'PrtgMover-IPIP-SMB')) {
+        if (Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -Name $name }
+    }
+    New-NetFirewallRule -Name 'PrtgMover-IPIP' -DisplayName 'PRTG Mover IPIP' -Enabled True -Direction Inbound -Action Allow -Protocol 4 -RemoteAddress $peerIps -Profile Any | Out-Null
+    New-NetFirewallRule -Name 'PrtgMover-IPIP-ICMP' -DisplayName 'PRTG Mover IPIP ICMP' -Enabled True -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -RemoteAddress '10.66.67.0/24' -Profile Any | Out-Null
+
+    $task = 'PRTG Mover IPIP'
+    Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    Get-Process -Name 'IpipTunnel' -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Seconds 2
+    $action = New-ScheduledTaskAction -Execute $exe -Argument "`"$cfg`""
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
+    Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $task
+    $ready = Join-Path $dir 'ready.txt'
+    $deadline = (Get-Date).AddSeconds(40)
+    while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $ready)) { Start-Sleep -Seconds 1 }
+    if (-not (Test-Path -LiteralPath $ready)) {
+        $tail = ''
+        $log = Join-Path $dir 'tunnel.log'
+        if (Test-Path -LiteralPath $log) { $tail = (Get-Content -LiteralPath $log -Tail 15 -ErrorAction SilentlyContinue) -join ' | ' }
+        throw "IPIP tunnel did not start. $tail"
+    }
+    Start-Sleep -Seconds 1
+    $after = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric, InterfaceMetric)
+    $hopAfter = if ($after.Count) { [string]$after[0].NextHop } else { '' }
+    if ($hopBefore -and $hopAfter -and $hopBefore -ne $hopAfter) {
+        Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+        Get-Process -Name 'IpipTunnel' -ErrorAction SilentlyContinue | Stop-Process -Force
+        throw "IPIP changed the default gateway from $hopBefore to $hopAfter. The tunnel was stopped."
+    }
+    Write-PmLog "IPIP is up on $LocalTunnel via $localPublic (protocol 4, only the other server). Default gateway is still $hopAfter." 'OK'
+    New-PmResult @{ Computer = $env:COMPUTERNAME; Address = $LocalTunnel; Public = $localPublic; Gateway = $hopAfter }
 }

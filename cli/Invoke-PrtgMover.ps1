@@ -52,7 +52,8 @@ param(
     [switch]$NoLicense,
     [switch]$NoFirewall,
     [switch]$SkipPreflight,
-    [int]$KeepLast = 0
+    [int]$KeepLast = 0,
+    [ValidateSet('rdp', 'winrm', 'wireguard', 'ipip')][string]$Transfer
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,6 +78,7 @@ $options = @{
     RestorePrtg = -not $NoPrtg; RestoreVpn = -not $NoVpn; RestoreDesktop = -not $NoDesktop; RestoreExtra = $true
     NoTouch = -not $AllowSourceStop; IncludeProgram = -not $NoProgramClone; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
 }
+if ($Transfer) { $options.Transfer = $Transfer }
 if ($InstallerFile) { $options.InstallerFile = $InstallerFile }
 
 $job = New-PmJobObject -Type $Action.ToLower() -Summary "CLI $Action" -Console
@@ -128,11 +130,18 @@ try {
             $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'KeepStopped' }
             $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
             $creds = @{}; if ($Credential) { foreach ($x in @($srv) + $targets) { $creds[$x.id] = $Credential } }
+            if ($Transfer -in 'rdp', 'winrm') {
+                $srv = Copy-PmServerTransport -Server $srv -Transport $Transfer
+                $targets = @($targets | ForEach-Object { Copy-PmServerTransport -Server $_ -Transport $Transfer })
+            }
             if (-not $SkipPreflight) { [void](Invoke-PmPreflight -Source $srv -Targets $targets -Credentials $creds -Options $options -Job $job) }
+            if ($Transfer -in 'wireguard', 'ipip') {
+                [void](Invoke-PmDirectTunnelMigrate -Source $srv -Targets $targets -Options $options -Credentials $creds -Job $job)
+                break
+            }
             $bk = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
             $file = $bk.Zip
-            foreach ($ref in $Target) {
-                $t = Resolve-CliServer $ref
+            foreach ($t in $targets) {
                 $rep = Invoke-PmRestoreFlow -Server $t -Credential (Get-CliCredential $t) -BackupPath $file -StageDir $bk.StageDir -Options $options -Job $job
                 if (@($rep.Errors).Count) { $exit = 2 }
             }

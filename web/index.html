@@ -101,7 +101,16 @@
           <label class="field"><span>Extra paths on the source (one per line, optional)</span><textarea name="ExtraPaths" rows="3" placeholder="D:\Scripts&#10;C:\Tools\prtg-helper.ps1"></textarea></label>
         </div>
         <div class="card">
-          <h2>4 · Source server</h2>
+          <h2>Transfer</h2>
+          <label class="field"><span>How the files move</span><select name="transfer">
+            <option value="">Each server's saved method (RDP or WinRM)</option>
+            <option value="rdp">RDP — through this computer</option>
+            <option value="winrm">WinRM — through this computer</option>
+            <option value="wireguard">WireGuard — tunnel between the two Windows servers</option>
+            <option value="ipip">IPIP — tunnel between the two Windows servers</option>
+          </select></label>
+          <p class="hint" id="transferHint">RDP and WinRM copy the files through this computer. WireGuard and IPIP build a tunnel between the two servers, then WinRM (TCP 5985) carries the files from one tunnel address to the other. This computer sends commands and does not keep the backup.</p>
+          <h2 class="mt">4 · Source server</h2>
           <label class="check notouch"><input type="checkbox" name="NoTouch" checked> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
           <div id="sourceAfterBox" class="disabled">
             <div class="segmented" id="sourceAfter">

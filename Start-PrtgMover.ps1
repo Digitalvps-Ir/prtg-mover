@@ -329,6 +329,13 @@ function Invoke-PmRoute {
             }
             if ($b.type -in 'restore', 'migrate' -and @($params.TargetIds).Count -eq 0) { Send-PmJson $Ctx @{ error = 'Select at least one target server.' } 400; return }
             if ($b.type -eq 'migrate' -and $params.TargetIds -contains $params.SourceId) { Send-PmJson $Ctx @{ error = 'Source and target must be different servers.' } 400; return }
+            $xfer = ''
+            if ($b.options) { $xfer = [string]$b.options.transfer }
+            try { Assert-PmTransferSelection -Transfer $xfer -JobType ([string]$b.type) -TargetCount @(@($params.TargetIds) | Where-Object { $_ }).Count }
+            catch { Send-PmJson $Ctx @{ error = "$_" } 400; return }
+            if ($xfer -eq 'wireguard') { $summary += ' via WireGuard (server to server)' }
+            elseif ($xfer -eq 'ipip') { $summary += ' via IPIP (server to server)' }
+            elseif ($xfer -in 'rdp', 'winrm') { $summary += " via $($xfer.ToUpper())" }
             $job = Start-PmJob -Type $b.type -Params $params -Summary $summary
             Send-PmJson $Ctx @{ id = $job.id }
             return

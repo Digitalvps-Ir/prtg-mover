@@ -63,7 +63,16 @@ Each server uses **one** connection method, chosen in *Servers → Edit → Conn
 
 Both methods run exactly the same payload (`src\Remote\PrtgMover.Remote.ps1`) with the same checks and logs.
 
-**Testing**: each server has a **Test RDP** button (RDP port, plus a full system check if the agent is running) and a **Test WinRM** button (WinRM login and a full system check). **Test all** tries both. The results are kept per method, and a server shows **PASS** when at least one method works.
+On **Backup & Migrate**, *How the files move* can override that for one job:
+
+| Choice | Where the files go |
+|---|---|
+| Each server's saved method | Through this computer, using RDP or WinRM as saved on the server |
+| RDP / WinRM | Through this computer, forcing that method for this job |
+| **WireGuard** | Directly between the two Windows servers on `10.66.66.0/24`. The files move over WinRM to the other server's tunnel address (TCP 5985), and a short probe reports MB/s. This computer sends commands only and does not keep the backup. Needs a target. UDP 51820 must be open between the two public addresses. |
+| **IPIP** | Same direct copy over WinRM to the tunnel address, on `10.66.67.0/24` (IP protocol 4). Needs a target. Protocol 4 must be open between the two public addresses. |
+
+**Testing**: each server has a **Test RDP** button (RDP port, plus a full system check if the agent is running) and a **Test WinRM** button (WinRM login and a full system check). **Test all** tries both. The results are kept per method, and a server shows **PASS** when at least one method works. The row shows the result of each method.
 
 ## Options at a glance
 
