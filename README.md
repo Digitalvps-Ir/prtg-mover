@@ -172,7 +172,7 @@ cd C:\PrtgMover
 powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1
 ```
 
-You can also double-click `Start-PrtgMover.cmd`. Your browser opens `http://localhost:8765/?token=…`. The token is stored in `data\token.txt`. The console window shows the live log of every job.
+You can also double-click `Start-PrtgMover.cmd`. Your browser opens `http://localhost:8765/`. The console window shows the live log of every job.
 
 ### 3. Choose the connection method
 
@@ -272,7 +272,7 @@ The manager keeps `<package>.zip.meta.json` next to each package (SHA-256 and ma
 ## Security
 
 - **Passwords are never written in plain text.** Credentials saved in the dashboard are encrypted with Windows DPAPI (`Export-Clixml`). Only the same Windows user on the same manager machine can decrypt them. `config\servers.json` holds no secrets.
-- **The dashboard needs a token**, and it listens on `localhost` by default.
+- **The dashboard listens on `localhost` by default** and does not ask for an access token.
 - **Restrict WinRM** to the manager's IP (`-ManagerAddress`), and use **HTTPS (5986)** whenever servers are reached over the internet. When the migration is done, you can remove the firewall rule or disable WinRM again.
 - **The RDP agent** only runs while you keep its window open, and it only accepts the functions PRTG Mover needs.
 - **Backups contain sensitive data**: the PRTG configuration (including encrypted device credentials), the license and the SSL private key. Store and share them like a password vault export.

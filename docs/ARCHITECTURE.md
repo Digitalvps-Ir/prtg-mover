@@ -4,7 +4,7 @@
 
 | Component | File | Runs on | Responsibility |
 |---|---|---|---|
-| Dashboard / API | `Start-PrtgMover.ps1` | manager | `System.Net.HttpListener` on `localhost:8765`, token auth, static UI, REST API, streaming uploads and downloads on a separate runspace pool |
+| Dashboard / API | `Start-PrtgMover.ps1` | manager | `System.Net.HttpListener` on `localhost:8765`, static UI, REST API, streaming uploads and downloads on a separate runspace pool |
 | Engine | `src/PrtgMover.psm1` | manager | server inventory, DPAPI credentials, sessions for every connection method, file transfers, backup / restore / migrate flows, job runner (runspace pool), logs and audit trail |
 | Payload | `src/Remote/PrtgMover.Remote.ps1` | source / target | PRTG discovery, VSS snapshots, registry export and import, program clone, web server binding, VPN phonebook merge, health check |
 | RDP agent | `agent/PrtgMover-Agent.ps1` | source / target | runs the payload inside a Remote Desktop session and talks to the manager through the redirected drive |
@@ -101,7 +101,6 @@ Every job record stores its parameters (without one-time credentials) and a chec
 | `data\agent\<id>\` | agent heartbeat, requests, responses, agent log |
 | `data\staging\<job>\` | staging copy during a migration (removed afterwards) |
 | `data\chunks\` | transfer chunks (temporary) |
-| `data\token.txt` | dashboard token |
 | `backups\*.zip` + `*.meta.json` | packages and their metadata |
 | `installers\` | uploaded PRTG installers |
 

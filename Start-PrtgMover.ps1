@@ -7,8 +7,7 @@
     manage servers, run connectivity tests, back up / migrate / restore PRTG servers,
     and download or upload backup packages.
 
-    Access is protected by a random token (stored in data\token.txt). The browser is
-    opened automatically with the token in the URL.
+    The dashboard listens on localhost and does not ask for an access token.
 
 .PARAMETER Port
     TCP port of the dashboard. Default 8765.
@@ -22,7 +21,7 @@
     Do not open the browser automatically.
 
 .PARAMETER NewToken
-    Generate a new access token (invalidates old dashboard links).
+    Kept so older start commands still run. The dashboard no longer uses a token.
 
 .EXAMPLE
     .\Start-PrtgMover.ps1
@@ -49,14 +48,8 @@ $Version = 'dev'
 $versionFile = Join-Path $Root 'VERSION'
 if (Test-Path $versionFile) { $Version = ([IO.File]::ReadAllText($versionFile)).Trim() }
 
-# ------------------------------------------------------------------ token
-$tokenFile = Join-Path (Get-PmPath Data) 'token.txt'
-if ($NewToken -or -not (Test-Path $tokenFile)) {
-    $bytes = New-Object byte[] 24
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    ([BitConverter]::ToString($bytes) -replace '-', '').ToLower() | Set-Content -Path $tokenFile -Encoding ASCII
-}
-$Token = (Get-Content $tokenFile -Raw).Trim()
+# The dashboard does not use an access token. Remove a token left by an older version.
+Remove-Item -LiteralPath (Join-Path (Get-PmPath Data) 'token.txt') -Force -ErrorAction SilentlyContinue
 
 # ------------------------------------------------------------------ helpers
 function Send-PmResponse {
@@ -88,9 +81,7 @@ function Read-PmBody {
 
 function Test-PmAuth {
     param($Ctx)
-    $t = $Ctx.Request.Headers['X-PM-Token']
-    if (-not $t) { $t = $Ctx.Request.QueryString['token'] }
-    return ($t -and $t -eq $Token)
+    return $true
 }
 
 function Get-PmServerView {
@@ -197,7 +188,7 @@ function Invoke-PmRoute {
         return
     }
 
-    if (-not (Test-PmAuth $Ctx)) { Send-PmJson $Ctx @{ error = 'Unauthorized - open the dashboard link printed in the console (it contains the token).' } 401; return }
+    if (-not (Test-PmAuth $Ctx)) { Send-PmJson $Ctx @{ error = 'Unauthorized' } 401; return }
 
     $seg = @($path.Substring(1).Split('/') | ForEach-Object { [uri]::UnescapeDataString($_) })   # api, resource, id, action
 
@@ -402,11 +393,11 @@ catch {
     exit 1
 }
 
-$url = "http://localhost:$Port/?token=$Token"
+$url = "http://localhost:$Port/"
 Write-Host ''
 Write-Host "  PRTG Mover $Version - dashboard running" -ForegroundColor Cyan
 Write-Host "  URL   : $url" -ForegroundColor Green
-if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/?token=$Token  (plain HTTP - trusted networks only)" -ForegroundColor Yellow }
+if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/  (plain HTTP - trusted networks only)" -ForegroundColor Yellow }
 Write-Host "  Data  : $Root"
 Write-Host '  Stop  : Ctrl+C'
 Write-Host "  Logs  : $(Join-Path (Get-PmPath Data) 'logs')  (manager, audit, robocopy) + data\jobs + data\agent\<id>\agent.log"

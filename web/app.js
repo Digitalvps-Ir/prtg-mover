@@ -2,17 +2,6 @@
 (() => {
   'use strict';
 
-  // ------------------------------------------------------------ token
-  const store = {
-    get(k) { try { return sessionStorage.getItem(k) || localStorage.getItem(k); } catch { return null; } },
-    set(k, v) { try { sessionStorage.setItem(k, v); localStorage.setItem(k, v); } catch { /* storage blocked */ } },
-  };
-  let token = new URLSearchParams(location.search).get('token') || store.get('pm_token') || '';
-  if (new URLSearchParams(location.search).has('token')) {
-    store.set('pm_token', token);
-    history.replaceState(null, '', location.pathname + location.hash);
-  }
-
   // ------------------------------------------------------------ helpers
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -31,24 +20,15 @@
   }
 
   async function api(method, path, body) {
-    const opts = { method, headers: { 'X-PM-Token': token } };
+    const opts = { method, headers: {} };
     if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
     const res = await fetch(path, opts);
-    if (res.status === 401) { askToken(); throw new Error('Unauthorized'); }
+    if (res.status === 401) throw new Error('Unauthorized');
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
     return data;
   }
 
-  function askToken() {
-    const d = $('#tokenDialog');
-    if (!d.open) d.showModal();
-  }
-  $('#tokenForm').addEventListener('submit', () => {
-    token = $('#tokenForm').token.value.trim();
-    store.set('pm_token', token);
-    refreshAll();
-  });
 
   const statusBadge = (s) => {
     const map = { succeeded: 'ok', failed: 'err', running: 'info', queued: '', cancelled: 'warn', interrupted: 'warn' };
@@ -85,7 +65,7 @@
     } catch (err) { toast(err.message, true); }
   }
   $('#refreshLogs').addEventListener('click', loadLogs);
-  $('#diagBtn2').addEventListener('click', () => { toast('Building diagnostics bundle…'); location.href = `/api/diagnostics?token=${encodeURIComponent(token)}`; });
+  $('#diagBtn2').addEventListener('click', () => { toast('Building diagnostics bundle…'); location.href = '/api/diagnostics'; });
 
   // ------------------------------------------------------------ agents in the sidebar
   function renderSideAgents() {
@@ -414,7 +394,7 @@
       if (m.vpn && m.vpn.included) parts.push(`<span class="badge">VPN ×${arr(m.vpn.allUsers).length}</span>`);
       if (m.desktop && m.desktop.included) parts.push(`<span class="badge">Desktop ×${arr(m.desktop.users).length}</span>`);
       if (arr(m.extra).length) parts.push(`<span class="badge">Extra ×${arr(m.extra).length}</span>`);
-      const dl = `/api/backups/${encodeURIComponent(b.name)}/download?token=${encodeURIComponent(token)}`;
+      const dl = `/api/backups/${encodeURIComponent(b.name)}/download`;
       return `<tr>
         <td><b>${esc(b.name)}</b>${b.sha256 ? `<span class="sub-text" title="SHA256">${esc(b.sha256.slice(0, 16))}…</span>` : ''}</td>
         <td>${esc(b.source || (m.source && m.source.computer) || '–')}</td>
@@ -461,7 +441,6 @@
     return new Promise((resolve, reject) => {
       const x = new XMLHttpRequest();
       x.open('PUT', url);
-      x.setRequestHeader('X-PM-Token', token);
       x.upload.onprogress = (ev) => { if (ev.lengthComputable) onProgress(Math.round((ev.loaded / ev.total) * 100)); };
       x.onload = () => { let d = {}; try { d = JSON.parse(x.responseText); } catch { /* empty */ } x.status < 300 ? resolve(d) : reject(new Error(d.error || `HTTP ${x.status}`)); };
       x.onerror = () => reject(new Error('Upload failed'));
@@ -503,7 +482,7 @@
   }
   $('#diagBtn').addEventListener('click', () => {
     toast('Building diagnostics bundle…');
-    location.href = `/api/diagnostics?token=${encodeURIComponent(token)}`;
+    location.href = '/api/diagnostics';
   });
   $('#jobsList').addEventListener('click', (e) => { const it = e.target.closest('[data-job]'); if (it) selectJob(it.dataset.job); });
 
@@ -547,7 +526,7 @@
     const resumeTitle = cp.backup ? `Continue: package ${cp.backup} is reused${doneTargets ? `, ${doneTargets} finished target(s) skipped` : ''}. Server IPs are re-read from the inventory.` : 'Run again with the same settings (server IPs are re-read from the inventory).';
     $('#jobActions').innerHTML = (active ? '<button class="btn small danger" id="cancelJob">Cancel</button>' : '')
       + (j.resumable ? `<button class="btn small primary" id="resumeJob" title="${esc(resumeTitle)}">${cp.backup ? 'Resume' : 'Retry'}</button>` : '')
-      + `<a class="btn small" href="/api/jobs/${encodeURIComponent(j.id)}/log?token=${encodeURIComponent(token)}">Download log</a>`;
+      + `<a class="btn small" href="/api/jobs/${encodeURIComponent(j.id)}/log">Download log</a>`;
     const cb = $('#cancelJob');
     if (cb) cb.onclick = async () => { if (confirm('Cancel this job?')) { await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/cancel`); pollJob(); } };
     const rb = $('#resumeJob');
@@ -599,7 +578,7 @@
     if (!r || j.type === 'test') { el.innerHTML = ''; return; }
     let html = '';
     if (r.backup) {
-      html += `<p style="margin:12px 0 0">Package: <b>${esc(r.backup)}</b> <a class="btn small" href="/api/backups/${encodeURIComponent(r.backup)}/download?token=${encodeURIComponent(token)}">Download</a></p>`;
+      html += `<p style="margin:12px 0 0">Package: <b>${esc(r.backup)}</b> <a class="btn small" href="/api/backups/${encodeURIComponent(r.backup)}/download">Download</a></p>`;
     }
     const targets = arr(r.targets || (Array.isArray(r) ? r : null));
     if (targets.length) {
@@ -623,8 +602,8 @@
     } catch (err) { if (err.message !== 'Unauthorized') toast(err.message, true); }
   }
   show(location.hash.slice(1) || 'overview');
-  if (!token) askToken(); else refreshAll();
-  setInterval(() => { if (token && document.visibilityState === 'visible') loadJobs().catch(() => {}); }, 5000);
+  refreshAll();
+  setInterval(() => { if (document.visibilityState === 'visible') loadJobs().catch(() => {}); }, 5000);
   // agent status / test results change in the background - refresh the server views every 10 s (not while a dialog is open)
-  setInterval(() => { if (token && document.visibilityState === 'visible' && !document.querySelector('dialog[open]')) loadServers().catch(() => {}); }, 10000);
+  setInterval(() => { if (document.visibilityState === 'visible' && !document.querySelector('dialog[open]')) loadServers().catch(() => {}); }, 10000);
 })();

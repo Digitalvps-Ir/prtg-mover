@@ -69,7 +69,7 @@ powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1
 
 <div dir="rtl">
 
-یا روی `Start-PrtgMover.cmd` دوبار کلیک کنید. مرورگر با آدرس `http://localhost:8765/?token=…` باز می‌شود. پنجرهٔ کنسول لاگ زندهٔ همهٔ کارها را نشان می‌دهد.
+یا روی `Start-PrtgMover.cmd` دوبار کلیک کنید. مرورگر با آدرس `http://localhost:8765/` باز می‌شود. پنجرهٔ کنسول لاگ زندهٔ همهٔ کارها را نشان می‌دهد.
 
 ### ۳. انتخاب روش اتصال
 
