@@ -27,7 +27,8 @@ Describe 'RAS phonebook handling' {
     }
 
     It 'returns an empty list for a missing file' {
-        @(Get-PmPbkEntries -Path (Join-Path $Work 'missing.pbk')).Count | Should -Be 0
+        # The function returns the list itself (comma operator), so count the list, not a wrapper array.
+        (Get-PmPbkEntries -Path (Join-Path $Work 'missing.pbk')).Count | Should -Be 0
     }
 
     It 'creates the target phonebook when it does not exist' {

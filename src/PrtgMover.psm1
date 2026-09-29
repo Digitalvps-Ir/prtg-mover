@@ -64,7 +64,8 @@ function Get-PmServers {
     if (-not (Test-Path -LiteralPath $file)) { return @() }
     $raw = Get-Content -LiteralPath $file -Raw -Encoding UTF8
     if ([string]::IsNullOrWhiteSpace($raw)) { return @() }
-    return @($raw | ConvertFrom-Json)
+    # PS 5.1 emits a JSON array as ONE object - ForEach-Object unrolls it into its elements.
+    return @($raw | ConvertFrom-Json | ForEach-Object { $_ })
 }
 
 function Get-PmServer {
@@ -133,8 +134,18 @@ function Remove-PmCredential {
 }
 
 function New-PmCredential {
+    <#
+        Builds a PSCredential from the dashboard form. The password arrives once over the
+        token-protected localhost API; it is turned into a SecureString immediately and
+        only ever persisted DPAPI-encrypted (Save-PmCredential).
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Entry point for the web form; converted to SecureString immediately.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Entry point for the web form; converted to SecureString immediately.')]
     param([Parameter(Mandatory)][string]$UserName, [Parameter(Mandatory)][string]$Password)
-    New-Object System.Management.Automation.PSCredential($UserName, (ConvertTo-SecureString $Password -AsPlainText -Force))
+    $secure = New-Object System.Security.SecureString
+    foreach ($ch in $Password.ToCharArray()) { $secure.AppendChar($ch) }
+    $secure.MakeReadOnly()
+    New-Object System.Management.Automation.PSCredential($UserName, $secure)
 }
 
 # ======================================================================= network / RDP
