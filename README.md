@@ -201,13 +201,13 @@ If a job fails, fix the cause shown in the log and press **Resume**.
 | Page | Purpose |
 |---|---|
 | **Overview** | Counters, recent jobs and a short summary of the process. |
-| **Servers** | Inventory with connection method, RDP and WinRM port, live reachability badges (**Check ports**) and agent status. Buttons per server: **RDP** (opens Remote Desktop and copies the agent command), **Test RDP**, **Test WinRM**, **Fix PRTG IP**, Edit, Delete. |
+| **Servers** | Inventory with connection method, RDP and WinRM port, live reachability badges (**Check ports**), agent status, PRTG version and **license state**. Buttons per server: **RDP** (opens Remote Desktop and copies the agent command), **Test RDP**, **Test WinRM**, Edit, Delete. |
 | **Backup & Migrate** | One source → any number of targets, with all options and a plain-language summary of the job. |
 | **Backups** | The **package store on the manager**. **Download** a package, **restore** it to one or more servers at any time, **upload** a package made elsewhere, or delete it. |
 | **Jobs** | Phase stepper, progress, colour-coded live log, per-target result, **Resume / Retry**, Cancel, log download. *Show debug* adds the exact error position, stack and timings. |
 | **Logs & Audit** | Audit trail (who did what), the manager log of the day, and **Download diagnostics**: one zip with all logs and an environment report, without passwords. |
 
-**Fix PRTG IP** is for a server that was migrated by an older version: PRTG answers only on `127.0.0.1` because its web server is still bound to the old server's address. The button binds it to the server's own address and restarts PRTG there.
+**Make PRTG reachable** only appears when the test finds a PRTG that answers on `127.0.0.1` only, because its web server is still bound to another server's address. The button binds it to the server's own address and restarts PRTG there. Migrations do this automatically.
 
 The dashboard listens on `localhost` only. To reach it from another machine on a trusted management network, run `tools\Setup-Manager.ps1 -DashboardPort 8765` once, then `Start-PrtgMover.ps1 -ListenAll`.
 
@@ -273,7 +273,8 @@ The manager keeps `<package>.zip.meta.json` next to each package (SHA-256 and ma
 ## Limitations and after-migration checklist
 
 - **Two cores at once**: with *Don't touch the source* the old PRTG keeps running, so both servers monitor and send notifications until you stop the old one.
-- **License**: a PRTG license may only run on one core at a time. Stop the old core when the new one is verified. If PRTG asks for it, re-activate the license on the new server.
+- **License activation**: PRTG binds a license to the system it was activated on. The license key is copied, but on the new server PRTG reports *No License (System Changed)* and pauses the sensors until the license is activated there (*Setup → License Information*, or through Paessler if the server can't reach the activation service). PRTG Mover shows this state and the last activation error. It doesn't activate licenses, and it never changes the license on the source.
+- **License use**: check with your license terms how many cores may run at the same time, and stop the old core when the new one is verified.
 - **Devices that only allow the old IP**: if monitored devices restrict SNMP, WMI or API access to the old server's address, allow the new address there.
 - **Remote probes** connect to the core's IP or DNS name. If the new core has a different address, update the DNS record or change the core address on each remote probe (*PRTG Administration Tool → Probe settings*).
 - **Saved VPN passwords and machine certificates** are protected by Windows DPAPI and can't be moved. Enter the VPN credentials once on the new server, and import any IKEv2/SSTP certificates.

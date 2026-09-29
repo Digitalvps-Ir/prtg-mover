@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.5.3 — 2026-09-29
+
+### Added
+- **License state.** The server test and the restore read the license state from the PRTG core log (read-only) and show it: edition, sensor limit, sensors paused by the license, and the last activation error. License values are never shown, only fingerprints at debug level.
+- Servers page: badges *license ok* / *license: activation needed* and *not reachable from network*.
+
+### Changed
+- A restore no longer reports the license as fine just because the key was copied. PRTG binds a license to the system it was activated on, so the target reports *activation needed* until the license is activated there.
+- **Make PRTG reachable** (formerly *Fix PRTG IP*) is only shown for a server whose PRTG answers on `127.0.0.1` only. New migrations adjust the web server binding automatically.
+
 ## 1.5.2 — 2026-09-29
 
 ### Added

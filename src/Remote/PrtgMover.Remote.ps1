@@ -558,6 +558,95 @@ function Get-PmLicenseValues {
     return $out
 }
 
+function Get-PmShortHash {
+    <# First 10 hex digits of the SHA-256 of a text: lets two servers be compared without showing the value. #>
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (-join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Text)) | ForEach-Object { $_.ToString('x2') })).Substring(0, 10) } finally { $sha.Dispose() }
+}
+
+function Get-PmPrtgLicenseReport {
+    <#
+        READ-ONLY. What is known about the PRTG license on this server, without showing the key:
+          - the license related registry values as fingerprints (compare source and target)
+          - the system id fingerprint (PRTG licenses are activated per system id)
+          - the latest license / activation lines of the core log, with keys masked
+    #>
+    param([int]$Days = 4, [int]$MaxLines = 40)
+    $prtg = Get-PmPrtgInfo
+    $report = [ordered]@{ Installed = $prtg.Installed; Values = @(); SystemId = ''; AutoActivation = $null; LogFile = $null; LogLines = @() }
+    if (-not $prtg.Installed) { return [pscustomobject]$report }
+    $report.Values = @(Get-PmLicenseValues | ForEach-Object {
+            $v = if ($_.Value -is [byte[]]) { [Convert]::ToBase64String($_.Value) } else { [string]$_.Value }
+            '{0}={1}' -f $_.Name, $(if ($v) { "#$(Get-PmShortHash $v) ($($v.Length) chars)" } else { '<empty>' })
+        })
+    foreach ($core in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Core', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Core') {
+        if (-not (Test-Path $core)) { continue }
+        $p = Get-ItemProperty -Path $core -ErrorAction SilentlyContinue
+        if ($p.SystemId) { $report.SystemId = "#$(Get-PmShortHash ([string]$p.SystemId))" }
+        if ($null -ne $p.AutoActivation) { $report.AutoActivation = [int]$p.AutoActivation }
+        break
+    }
+    $logDir = Join-Path $prtg.DataPath 'Logs'
+    if (Test-Path -LiteralPath $logDir) {
+        $since = (Get-Date).AddDays(-$Days)
+        $files = @(Get-ChildItem -LiteralPath $logDir -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $since -and ($_.Name -match 'core' -or $_.DirectoryName -match '\\core$') } | Sort-Object LastWriteTime)
+        $hits = New-Object System.Collections.ArrayList
+        foreach ($lf in $files) {
+            try {
+                $fs = New-Object IO.FileStream($lf.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                # only the last 20 MB of a log are read
+                if ($fs.Length -gt 20MB) { [void]$fs.Seek(-20MB, [IO.SeekOrigin]::End) }
+                $sr = New-Object IO.StreamReader($fs)
+                try {
+                    while (-not $sr.EndOfStream) {
+                        $line = $sr.ReadLine()
+                        if ($line -match '(?i)licen|activat|edition|system ?id|trial|freeware|subscription|maintenance|sensor limit|exceed') { [void]$hits.Add(("{0}: {1}" -f $lf.Name, $line)) }
+                    }
+                } finally { $sr.Dispose(); $fs.Dispose() }
+                $report.LogFile = $lf.FullName
+            } catch { }
+        }
+        $report.LogLines = @($hits | Select-Object -Last $MaxLines | ForEach-Object {
+                $l = $_ -replace '[0-9A-Za-z]{6}(-[0-9A-Za-z]{6}){3,}', '<key>' -replace '(?i)SYSTEMID-[0-9A-Z-]+', 'SYSTEMID-<masked>'
+                if ($l.Length -gt 260) { $l.Substring(0, 260) + ' ...' } else { $l }
+            })
+    }
+    return [pscustomobject]$report
+}
+
+function ConvertTo-PmLicenseState {
+    <#
+        Turns the license lines of the PRTG core log into a short state:
+        Edition, Name, MaxSensors, NeedsActivation, LastError. Pure function (testable).
+    #>
+    param([string[]]$LogLines = @(), [string]$PausedByLicense)
+    $state = [ordered]@{ Known = $false; Edition = $null; Name = $null; MaxSensors = $null; NeedsActivation = $false; LastError = $null; PausedByLicense = $PausedByLicense }
+    $lic = @($LogLines | Where-Object { $_ -match 'licensed for "' } | Select-Object -Last 1)
+    if ($lic.Count -and $lic[0] -match '>\s*PRTG\s+(?<edition>.*?)\s*licensed for "(?<name>[^"]*)".*?Edt=(?<edt>-?\d+)\s+MaxS=(?<max>\d+)') {
+        $edition = $Matches.edition.Trim(); $name = $Matches.name; $edt = [int]$Matches.edt; $max = [int]$Matches.max
+        if ($edition -match '^\((?<inner>[^()]*)\)$') { $edition = $Matches.inner }
+        $state.Known = $true
+        $state.Edition = $edition
+        $state.Name = $name
+        $state.MaxSensors = $max
+        $state.NeedsActivation = ($edition -match '(?i)no license|system changed' -or $edt -lt 0 -or $max -eq 0)
+    }
+    $err = @($LogLines | Where-Object { $_ -match '(?i)activation done .*error|new activation required|activation failed' } | Select-Object -Last 1)
+    if ($err.Count) { $state.LastError = ($err[0] -replace '^.*?>\s*', '').Trim() }
+    return [pscustomobject]$state
+}
+
+function Get-PmPrtgLicenseState {
+    <# READ-ONLY. Short license state of the PRTG on this server (from the registry and the core log). #>
+    $rep = Get-PmPrtgLicenseReport -Days 3 -MaxLines 400
+    $paused = $null
+    $pv = @(Get-PmLicenseValues | Where-Object { $_.Name -eq 'SensorCountPausedByLicenseMax' } | Select-Object -First 1)
+    if ($pv.Count) { $paused = [string]$pv[0].Value }
+    return (ConvertTo-PmLicenseState -LogLines @($rep.LogLines) -PausedByLicense $paused)
+}
+
 function Get-PmLicenseFiles {
     param([string]$DataPath)
     if (-not (Test-Path -LiteralPath $DataPath)) { return @() }
@@ -690,6 +779,8 @@ function Get-PmSystemInfo {
         Prtg         = $prtg
         PrtgDataGB   = [math]::Round($dataSize / 1GB, 2)
         PrtgConfigStats = $stats
+        PrtgLicense  = $(if ($prtg.Installed) { try { Get-PmPrtgLicenseReport } catch { [pscustomobject]@{ Error = "$($_.Exception.Message)" } } })
+        PrtgLicenseState = $(if ($prtg.Installed) { try { Get-PmPrtgLicenseState } catch { $null } })
         VpnAllUsers  = $vpn
         Profiles     = @(Get-PmUserProfiles | Select-Object -ExpandProperty Name)
         Disks        = $disks
@@ -1275,6 +1366,17 @@ function Invoke-PmRemoteRestore {
                 if ($health.Healthy) {
                     $report.WebUrl = $health.Url
                     $report.Prtg = 'ok'
+                    try {
+                        $ls = Get-PmPrtgLicenseState
+                        if ($ls.Known -and $ls.NeedsActivation) {
+                            $report.License = 'needs-activation'
+                            Write-PmLog "LICENSE: PRTG on this server reports '$($ls.Edition)'. A PRTG license is bound to the system it was activated on, so it must be activated again for this server (PRTG > Setup > License Information). Until then PRTG pauses the sensors. The license on the source server is not affected by this." 'WARN'
+                            if ($ls.LastError) { Write-PmLog "LICENSE: last activation attempt: $($ls.LastError)" 'WARN' }
+                        } elseif ($ls.Known) {
+                            $report.License = "active ($($ls.Edition), $($ls.MaxSensors) sensors)"
+                            Write-PmLog "LICENSE: $($ls.Edition), $($ls.MaxSensors) sensors - active on this server." 'OK'
+                        }
+                    } catch { Write-PmLog "License state could not be read: $($_.Exception.Message)" 'DEBUG' }
                     Write-PmLog "PRTG $($health.Version) is fully UP on $env:COMPUTERNAME : $($health.Url) (core $($health.Core), probe $($health.Probe))" 'OK'
                     $ep = @((Get-PmPrtgInfo).ListenEndpoints)
                     $outside = @($ep | Where-Object { $_ -notmatch '^(127\.0\.0\.1|::1):' })
