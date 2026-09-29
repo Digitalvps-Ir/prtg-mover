@@ -39,7 +39,9 @@ if (-not $isAdmin -and -not $AllowNonAdmin) {
 }
 
 # Load the payload (same code the WinRM mode ships to the server).
-. ([scriptblock]::Create((Get-Content -LiteralPath (Join-Path $Root 'src\Remote\PrtgMover.Remote.ps1') -Raw -Encoding UTF8)))
+$PayloadFile = Join-Path $Root 'src\Remote\PrtgMover.Remote.ps1'
+. ([scriptblock]::Create((Get-Content -LiteralPath $PayloadFile -Raw -Encoding UTF8)))
+$script:PayloadLoaded = (Get-Item -LiteralPath $PayloadFile).LastWriteTimeUtc
 $version = 'dev'
 $vf = Join-Path $Root 'VERSION'; if (Test-Path $vf) { $version = ([IO.File]::ReadAllText($vf)).Trim() }
 
@@ -77,6 +79,21 @@ Write-Host "  Manager: $Root"
 Write-Host '  Status : connected - waiting for jobs from the dashboard. Keep this window open.' -ForegroundColor Green
 Write-Host ''
 
+# Full agent log on the manager's disk (data\agent\<id>\agent.log) - every request, log line and error with stack.
+$AgentLog = Join-Path $Dir 'agent.log'
+function Write-AgentLog {
+    param([string]$Text)
+    $line = '{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $env:COMPUTERNAME, $Text
+    for ($i = 0; $i -lt 20; $i++) { try { [IO.File]::AppendAllText($AgentLog, $line + "`r`n", [Text.Encoding]::UTF8); break } catch { Start-Sleep -Milliseconds 50 } }
+}
+Write-AgentLog "Agent $version started. User=$env:USERDOMAIN\$env:USERNAME Admin=$isAdmin PID=$PID PS=$($PSVersionTable.PSVersion) OS=$((Get-CimInstance Win32_OperatingSystem).Caption) Root=$Root"
+
+# Requests left behind by a previous agent (RDP dropped mid-call) are parked, never executed twice.
+Get-ChildItem -LiteralPath $Req -Filter '*.working' -File -ErrorAction SilentlyContinue | ForEach-Object {
+    Write-AgentLog "Orphaned request from a previous agent parked: $($_.Name)"
+    Move-Item -LiteralPath $_.FullName -Destination ($_.FullName + '.orphaned') -Force -ErrorAction SilentlyContinue
+}
+
 $lastWork = Get-Date
 try {
     while (((Get-Date) - $lastWork).TotalHours -lt $IdleHours) {
@@ -98,14 +115,27 @@ try {
                 } catch { Start-Sleep -Milliseconds 100 }
             }
             if ($o.PmType -eq 'log') {
-                $c = @{ WARN = 'Yellow'; ERROR = 'Red'; OK = 'Green'; STEP = 'Cyan' }[[string]$o.Level]; if (-not $c) { $c = 'Gray' }
-                Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $o.Message) -ForegroundColor $c
-            }
+                Write-AgentLog ("{0,-5} {1}" -f $o.Level, $o.Message)
+                if ($o.Level -ne 'DEBUG') {
+                    $c = @{ WARN = 'Yellow'; ERROR = 'Red'; OK = 'Green'; STEP = 'Cyan' }[[string]$o.Level]; if (-not $c) { $c = 'Gray' }
+                    Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $o.Message) -ForegroundColor $c
+                }
+            } elseif ($o.PmType -in 'error', 'result') { Write-AgentLog ("{0,-5} {1}" -f $o.PmType.ToUpper(), $(if ($o.PmType -eq 'error') { $o.Message } else { 'returned' })) }
+        }
+        # Pick up a newer payload from the manager without restarting the agent.
+        $payloadTime = (Get-Item -LiteralPath $PayloadFile).LastWriteTimeUtc
+        if ($payloadTime -ne $script:PayloadLoaded) {
+            . ([scriptblock]::Create((Get-Content -LiteralPath $PayloadFile -Raw -Encoding UTF8)))
+            $script:PayloadLoaded = $payloadTime
+            Write-AgentLog "Payload reloaded ($payloadTime)"
         }
         $params = @{}
         if ($request.params) { foreach ($p in $request.params.PSObject.Properties) { $v = $p.Value; if ($v -is [object[]]) { $v = [string[]]$v }; $params[$p.Name] = $v } }
         $hbState.State = 'busy'; $hbState.Task = $request.fn
         Write-Host ("[{0}] >> {1}" -f (Get-Date -Format 'HH:mm:ss'), $request.fn) -ForegroundColor Cyan
+        $safeParams = ($params.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value -join ',')" }) -join '; '
+        Write-AgentLog "REQUEST $($request.id) $($request.fn) ($safeParams)"
+        $sw = [Diagnostics.Stopwatch]::StartNew()
         try {
             switch ($request.fn) {
                 'Send-PmAgentFile' {
@@ -129,9 +159,13 @@ try {
                 }
             }
         } catch {
-            & $emit ([pscustomobject]@{ PmType = 'error'; Message = "$($_.Exception.Message)" })
-            Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+            $detail = Format-PmError $_
+            & $emit (Write-PmLog "Agent error in $($request.fn): $detail" 'DEBUG')
+            if ($_.ScriptStackTrace) { & $emit (Write-PmLog "Stack: $($_.ScriptStackTrace -replace '\r?\n', ' <- ')" 'DEBUG') }
+            & $emit ([pscustomobject]@{ PmType = 'error'; Message = $detail })
+            Write-Host "ERROR: $detail" -ForegroundColor Red
         } finally {
+            Write-AgentLog ("DONE    {0} {1} in {2:N1}s" -f $request.id, $request.fn, $sw.Elapsed.TotalSeconds)
             & $emit ([pscustomobject]@{ PmType = 'done' })
             Remove-Item -LiteralPath $working -Force -ErrorAction SilentlyContinue
             $hbState.State = 'idle'; $hbState.Task = ''

@@ -25,8 +25,27 @@ $PmProgramFolders = @(
 # ---------------------------------------------------------------- output helpers
 
 function Write-PmLog {
-    param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'STEP')][string]$Level = 'INFO')
+    param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'STEP', 'DEBUG')][string]$Level = 'INFO')
     [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = $env:COMPUTERNAME }
+}
+
+function Format-PmError {
+    <# One-line error with the exact script position - used in logs so a failure can be located immediately. #>
+    param($ErrorRecord)
+    $pos = ''
+    if ($ErrorRecord.InvocationInfo -and $ErrorRecord.InvocationInfo.ScriptLineNumber) {
+        $pos = " [line $($ErrorRecord.InvocationInfo.ScriptLineNumber): $($ErrorRecord.InvocationInfo.Line.Trim())]"
+    }
+    return "$($ErrorRecord.Exception.GetType().Name): $($ErrorRecord.Exception.Message)$pos"
+}
+
+function Write-PmErrorDetail {
+    <# Emits the full error (type, message, position, stack) as DEBUG log records. #>
+    param($ErrorRecord, [string]$Context)
+    Write-PmLog "$Context failed: $(Format-PmError $ErrorRecord)" 'DEBUG'
+    if ($ErrorRecord.ScriptStackTrace) { Write-PmLog "Stack: $($ErrorRecord.ScriptStackTrace -replace '\r?\n', ' <- ')" 'DEBUG' }
+    $inner = $ErrorRecord.Exception.InnerException
+    while ($inner) { Write-PmLog "Inner: $($inner.GetType().Name): $($inner.Message)" 'DEBUG'; $inner = $inner.InnerException }
 }
 
 function Write-PmProgress {
@@ -51,11 +70,24 @@ function Invoke-PmRobocopy {
         [switch]$Mirror
     )
     if (-not (Test-Path -LiteralPath $Source)) { return -1 }
-    $rcArgs = @($Source.TrimEnd('\'), $Destination.TrimEnd('\'), '/COPY:DAT', '/DCOPY:DAT', '/R:2', '/W:2', '/MT:8', '/XJ', '/NP', '/NFL', '/NDL', '/NJH', '/NJS')
+    # Redirected RDP drives (\\tsclient) do not support all directory attributes.
+    $dcopy = if ($Destination.StartsWith('\\') -or $Source.StartsWith('\\')) { '/DCOPY:T' } else { '/DCOPY:DAT' }
+    $rcArgs = @($Source.TrimEnd('\'), $Destination.TrimEnd('\'), '/COPY:DAT', $dcopy, '/R:2', '/W:2', '/MT:8', '/XJ', '/NP', '/NFL', '/NDL')
     if ($Mirror) { $rcArgs += '/MIR' } else { $rcArgs += '/E' }
     if ($ExcludeDirs.Count -gt 0) { $rcArgs += '/XD'; $rcArgs += $ExcludeDirs }
+    # Full robocopy log (summary + every error) for troubleshooting.
+    if ($global:PmRobocopyLog) { $rcArgs += "/LOG+:$global:PmRobocopyLog" }
     & robocopy.exe @rcArgs | Out-Null
-    return $LASTEXITCODE
+    $code = $LASTEXITCODE
+    $global:PmLastRobocopy = "robocopy `"$Source`" -> `"$Destination`" exit $code"
+    return $code
+}
+
+function Get-PmRobocopyErrors {
+    <# Last error lines of the robocopy log (for error messages). #>
+    if (-not $global:PmRobocopyLog -or -not (Test-Path -LiteralPath $global:PmRobocopyLog)) { return '' }
+    $lines = @(Get-Content -LiteralPath $global:PmRobocopyLog -Tail 400 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'ERROR|Access is denied|cannot|failed' } | Select-Object -Last 5)
+    return ($lines -join ' | ')
 }
 
 function Test-PmRobocopyOk { param([int]$Code) return ($Code -ge 0 -and $Code -lt 8) }
@@ -425,14 +457,21 @@ function Invoke-PmRemoteBackup {
         [ValidateSet('Restart', 'KeepStopped', 'Disable')][string]$SourceAfter = 'Restart',
         [bool]$NoTouch = $false,
         [int]$HealthTimeoutMinutes = 15,
-        [bool]$IncludeProgram = $true
+        [bool]$IncludeProgram = $true,
+        # Stage directly into this folder (e.g. the manager's disk via \\tsclient) and skip zipping on the source.
+        [string]$StageDir,
+        [string]$LogDir
     )
     $ErrorActionPreference = 'Stop'
     $sourceHealth = $null
     if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
-    $stage = Join-Path $WorkRoot "staging\$JobId"
+    $direct = [bool]$StageDir
+    $stage = if ($direct) { $StageDir } else { Join-Path $WorkRoot "staging\$JobId" }
     $outDir = Join-Path $WorkRoot 'out'
-    New-Item -ItemType Directory -Force -Path $stage, $outDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $stage | Out-Null
+    if (-not $direct) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }
+    if ($LogDir) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null; $global:PmRobocopyLog = Join-Path $LogDir "robocopy-$JobId-$env:COMPUTERNAME.log" } else { $global:PmRobocopyLog = $null }
+    Write-PmLog "Mode: $(if ($direct) { 'direct staging on the manager (no disk space used on this server)' } else { 'local staging + zip' }). Robocopy log: $(if ($global:PmRobocopyLog) { $global:PmRobocopyLog } else { 'off' })" 'DEBUG'
 
     $manifest = [ordered]@{
         tool = 'prtg-mover'; formatVersion = 1; jobId = $JobId
@@ -481,7 +520,7 @@ function Invoke-PmRemoteBackup {
                 $exclude = @()
                 if (-not $IncludeHistory) { $exclude = @((Join-Path $dataSource 'Monitoring Database'), (Join-Path $dataSource 'Logs')) }
                 $code = Invoke-PmRobocopy -Source $dataSource -Destination (Join-Path $stage 'prtg\data') -ExcludeDirs $exclude
-                if (-not (Test-PmRobocopyOk $code)) { throw "robocopy of PRTG data failed with exit code $code" }
+                if (-not (Test-PmRobocopyOk $code)) { throw "robocopy of PRTG data failed with exit code $code. $(Get-PmRobocopyErrors)" }
                 $cfg = Join-Path $stage 'prtg\data\PRTG Configuration.dat'
                 if (-not (Test-Path -LiteralPath $cfg)) { throw "'PRTG Configuration.dat' is missing from the copied data folder - aborting (backup would be unusable)." }
                 $cfgInfo = Get-Item -LiteralPath $cfg
@@ -648,9 +687,14 @@ function Invoke-PmRemoteBackup {
     }
 
     # ---- Manifest + archive
-    Write-PmProgress 70 'Packaging: compressing backup'
+    Write-PmProgress 70 'Packaging: writing manifest'
     $manifest.stagingBytes = Get-PmDirectorySize $stage
     $manifest | ConvertTo-Json -Depth 8 | Set-Content -Path (Join-Path $stage 'manifest.json') -Encoding UTF8
+    if ($direct) {
+        Write-PmLog ("Staging complete on the manager ({0:N2} GB). The manager builds the package." -f ($manifest.stagingBytes / 1GB)) 'OK'
+        Write-PmProgress 80 'Staging done'
+        return (New-PmResult @{ StageDir = $stage; Manifest = ($manifest | ConvertTo-Json -Depth 8); SourceHealth = $sourceHealth })
+    }
     $zipName = 'PRTG_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss')
     $zipPath = Join-Path $outDir $zipName
     Write-PmLog "Compressing to $zipPath ..." 'STEP'
@@ -673,7 +717,7 @@ function Invoke-PmRemoteBackup {
 function Invoke-PmRemoteRestore {
     param(
         [Parameter(Mandatory)][string]$JobId,
-        [Parameter(Mandatory)][string]$ZipPath,
+        [string]$ZipPath,
         [string]$WorkRoot,
         [bool]$RestorePrtg = $true,
         [bool]$RestoreVpn = $true,
@@ -688,24 +732,39 @@ function Invoke-PmRemoteRestore {
         [bool]$RemovePackage = $true,
         [bool]$CopyLicense = $true,
         [bool]$OpenFirewall = $true,
-        [string]$ExpectedSha256
+        [string]$ExpectedSha256,
+        # Read the extracted package directly from this folder (e.g. the manager via \\tsclient) instead of a zip.
+        [string]$StageDir,
+        [string]$LogDir
     )
     $ErrorActionPreference = 'Stop'
     if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
-    $stage = Join-Path $WorkRoot "restore\$JobId"
+    $direct = [bool]$StageDir
+    $stage = if ($direct) { $StageDir } else { Join-Path $WorkRoot "restore\$JobId" }
+    if ($LogDir) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null; $global:PmRobocopyLog = Join-Path $LogDir "robocopy-$JobId-$env:COMPUTERNAME.log" } else { $global:PmRobocopyLog = $null }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $report = [ordered]@{ Computer = $env:COMPUTERNAME; Prtg = 'skipped'; License = 'skipped'; Vpn = 'skipped'; Desktop = 'skipped'; Extra = 'skipped'; WebUrl = $null; Version = $null; Errors = @() }
 
     Write-PmLog "Restore started on $env:COMPUTERNAME" 'STEP'
 
     # ---- integrity + disk space pre-checks
-    if ($ExpectedSha256) {
+    if ($direct) {
+        if (-not (Test-Path -LiteralPath (Join-Path $stage 'manifest.json'))) { throw "Staged package not found at $stage" }
+        $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
+        $need = [int64]$manifest.stagingBytes
+        $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f $env:SystemDrive)
+        $required = [int64]($need * 1.1 + 1GB)
+        if ($drive -and $drive.FreeSpace -lt $required) { throw ("Not enough free space on {0}: {1:N1} GB free, {2:N1} GB required." -f $drive.DeviceID, ($drive.FreeSpace / 1GB), ($required / 1GB)) }
+        Write-PmLog ("Reading the package directly from the manager ({0}). Disk space OK: {1:N1} GB free, ~{2:N1} GB needed." -f $stage, ($drive.FreeSpace / 1GB), ($required / 1GB)) 'OK'
+    }
+    if (-not $direct -and $ExpectedSha256) {
         Write-PmProgress 2 'Verifying package checksum'
         $h = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash
         if ($h -ne $ExpectedSha256) { throw "Package checksum mismatch on target (expected $ExpectedSha256, got $h) - transfer corrupted." }
         Write-PmLog 'Package SHA-256 verified on target.' 'OK'
     }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
+    if (-not $direct) {
     $need = 0
     $zr = [IO.Compression.ZipFile]::OpenRead($ZipPath)
     try { foreach ($e in $zr.Entries) { $need += $e.Length } } finally { $zr.Dispose() }
@@ -721,6 +780,7 @@ function Invoke-PmRemoteRestore {
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $stage)
     $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
+    }
     Write-PmLog "Package from $($manifest.source.computer) created $($manifest.createdUtc)" 'OK'
 
     # ---- PRTG
@@ -896,7 +956,7 @@ function Invoke-PmRemoteRestore {
             } else { $report.Prtg = 'restored-not-started' }
         } catch {
             $report.Prtg = 'failed'; $report.Errors += "PRTG: $_"
-            Write-PmLog "PRTG restore failed: $_" 'ERROR'
+            Write-PmLog "PRTG restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'PRTG restore'
         }
     }
 
@@ -931,7 +991,7 @@ function Invoke-PmRemoteRestore {
                 }
             }
             $report.Vpn = 'ok'
-        } catch { $report.Vpn = 'failed'; $report.Errors += "VPN: $_"; Write-PmLog "VPN restore failed: $_" 'ERROR' }
+        } catch { $report.Vpn = 'failed'; $report.Errors += "VPN: $_"; Write-PmLog "VPN restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'VPN restore' }
     }
 
     # ---- Desktop
@@ -951,7 +1011,7 @@ function Invoke-PmRemoteRestore {
                 if (Test-PmRobocopyOk $code) { Write-PmLog "Desktop restored: $($uDir.Name) -> $dst" 'OK' } else { Write-PmLog "Desktop restore failed for $($uDir.Name) ($code)" 'WARN' }
             }
             $report.Desktop = 'ok'
-        } catch { $report.Desktop = 'failed'; $report.Errors += "Desktop: $_"; Write-PmLog "Desktop restore failed: $_" 'ERROR' }
+        } catch { $report.Desktop = 'failed'; $report.Errors += "Desktop: $_"; Write-PmLog "Desktop restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'Desktop restore' }
     }
 
     # ---- Extra
@@ -967,11 +1027,11 @@ function Invoke-PmRemoteRestore {
                 Write-PmLog "Extra restored: $($e.path)" 'OK'
             }
             $report.Extra = 'ok'
-        } catch { $report.Extra = 'failed'; $report.Errors += "Extra: $_"; Write-PmLog "Extra restore failed: $_" 'ERROR' }
+        } catch { $report.Extra = 'failed'; $report.Errors += "Extra: $_"; Write-PmLog "Extra restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'Extra restore' }
     }
 
-    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-    if ($RemovePackage) { Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue }
+    if (-not $direct) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($RemovePackage -and $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force -ErrorAction SilentlyContinue }
     Write-PmProgress 100 'Restore finished'
     Write-PmLog "Restore finished on $env:COMPUTERNAME" 'STEP'
     New-PmResult @{ Report = [pscustomobject]$report }
