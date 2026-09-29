@@ -362,6 +362,52 @@ Describe 'Connectivity tests keep each method separately' {
     }
 }
 
+Describe 'Connection method "local": PRTG Mover on the server itself' {
+    BeforeAll {
+        $script:LocalRoot = Join-Path $Work 'manager-local'
+        New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
+        Set-PmRoot -Path $LocalRoot
+        $script:Me = Set-PmServer -Name 'THIS' -HostName 'localhost' -Transport local -Role both
+        $script:OldTestFlag = $env:PRTGMOVER_TEST
+    }
+    AfterAll { $env:PRTGMOVER_TEST = $script:OldTestFlag }
+
+    It 'is stored as a connection method of its own' {
+        (Get-PmServer -Id $Me.id).transport | Should -Be 'local'
+        Get-PmTransport (Get-PmServer -Id $Me.id) | Should -Be 'local'
+    }
+
+    It 'tests this computer without any connection and records the result as "local"' {
+        $env:PRTGMOVER_TEST = '1'
+        $st = Invoke-PmTestFlow -Server (Get-PmServer -Id $Me.id)
+        $st.ok | Should -BeTrue
+        $st.methods.local.ok | Should -BeTrue
+        $st.info.Computer | Should -Be $env:COMPUTERNAME
+        $saved = Get-Content (Join-Path $LocalRoot "data\status\$($Me.id).json") -Raw | ConvertFrom-Json
+        $saved.lastMode | Should -Be 'local'
+        $saved.methods.local.ok | Should -BeTrue
+    }
+
+    It 'fails with a clear message when PRTG Mover has no administrator rights' -Skip:([bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $env:PRTGMOVER_TEST = $null
+        { Invoke-PmTestFlow -Server (Get-PmServer -Id $Me.id) } | Should -Throw '*Run as administrator*'
+        $saved = Get-Content (Join-Path $LocalRoot "data\status\$($Me.id).json") -Raw | ConvertFrom-Json
+        $saved.ok | Should -BeFalse
+    }
+
+    It 'backs up this computer into a package without any connection' {
+        $env:PRTGMOVER_TEST = '1'
+        $x = Join-Path $Work 'local-extra'
+        New-Item -ItemType Directory -Force -Path $x | Out-Null
+        'local' | Set-Content (Join-Path $x 'l.txt')
+        $job = New-PmJobObject -Type 'backup' -Summary 'local backup test'
+        $r = Invoke-PmBackupFlow -Server (Get-PmServer -Id $Me.id) -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($x); NoTouch = $true } -Job $job
+        Test-Path -LiteralPath $r.Zip | Should -BeTrue
+        $r.Zip | Should -BeLike "$LocalRoot\backups\*"
+        Test-PmStageComplete -StageDir $r.StageDir | Should -BeTrue
+    }
+}
+
 Describe 'Resume' {
     BeforeAll {
         $mgr = Join-Path $Work 'manager-resume'
@@ -530,6 +576,14 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
 
     It 'serves API requests without any check' {
         & $StatusOf POST "$Dash/api/servers" @{ 'Content-Type' = 'application/json'; 'Origin' = 'http://other.example' } '{"name":"T1","host":"192.0.2.10","role":"target"}' | Should -Be 200
+    }
+
+    It 'accepts this computer as a server with the connection method "local"' {
+        $r = Invoke-RestMethod -Method Post -Uri "$Dash/api/servers" -ContentType 'application/json' -Body '{"name":"ME","host":"something-else","role":"both","transport":"local","username":"x","password":"y"}'
+        $r.transport | Should -Be 'local'
+        $r.host | Should -Be 'localhost'
+        Test-Path (Join-Path $DashData "data\credentials\$($r.id).cred.xml") | Should -BeFalse
+        (Invoke-RestMethod "$Dash/api/info").PSObject.Properties.Name | Should -Contain 'elevated'
     }
 
     It 'a second start on the same port ends without an error and leaves the dashboard running' {

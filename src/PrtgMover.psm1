@@ -759,6 +759,46 @@ function New-PmDiagnosticsBundle {
 
 # ======================================================================= tests
 
+function Test-PmElevated {
+    try { return [bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { return $false }
+}
+
+function Invoke-PmLocalTestFlow {
+    <#
+        Connection method 'local': PRTG Mover is installed on the server itself. Nothing is
+        connected; the check runs in this process. It passes when PRTG Mover has administrator
+        rights, because backup (snapshot, registry) and restore (services) need them.
+    #>
+    param([Parameter(Mandatory)]$Server, $Job)
+    Add-PmJobLog -Job $Job -Level STEP -Message "Testing $($Server.name) - this computer ($env:COMPUTERNAME), connection method LOCAL"
+    $now = (Get-Date).ToString('o')
+    $info = $null; $ok = $false; $detail = ''
+    try {
+        $s = New-PmSession -Server $Server -Job $Job
+        $info = Invoke-PmRemote -Session $s -Function 'Get-PmSystemInfo' -Job $Job
+        $ok = [bool]$info.IsAdmin -or $env:PRTGMOVER_TEST -eq '1'
+        $detail = if ($ok) { 'this computer, administrator rights OK' } else { 'PRTG Mover is NOT running as administrator. Close it and start it with "Run as administrator" (the installer option -Local sets this up).' }
+    } catch {
+        $detail = Format-PmManagerError $_
+        Add-PmJobError -Job $Job -ErrorRecord $_ -Context 'Local system check: '
+    }
+    Add-PmJobLog -Job $Job -Level $(if ($ok) { 'OK' } else { 'ERROR' }) -Message "Local test: $(if ($ok) { 'PASS' } else { 'FAIL' }) - $detail"
+    if ($info) {
+        Add-PmJobLog -Job $Job -Level OK -Computer $info.Computer -Message ("{0}: {1} | admin={2} | PRTG={3} {4} ({5} GB data, core {6}) | VPN={7}" -f $info.Computer, $info.OS, $info.IsAdmin,
+                $(if ($info.Prtg.Installed) { 'yes' } else { 'no' }), $info.Prtg.Version, $info.PrtgDataGB, $info.Prtg.CoreStatus, @($info.VpnAllUsers).Count)
+        foreach ($d in @($info.Disks)) { Add-PmJobLog -Job $Job -Message ("Disk {0} {1} GB free of {2} GB" -f $d.Drive, $d.FreeGB, $d.SizeGB) -Computer $info.Computer }
+        if ($info.Prtg.Installed -and $info.PrtgConfigStats) { Add-PmJobLog -Job $Job -Message "PRTG configuration: $($info.PrtgConfigStats)" -Computer $info.Computer }
+    }
+    $status = [pscustomobject]@{
+        ok = $ok; checked = $now; lastMode = 'local'
+        methods = [pscustomobject][ordered]@{ rdp = $null; winrm = $null; local = [ordered]@{ ok = $ok; checked = $now; detail = $detail } }
+        info = $info; error = $(if ($ok) { $null } else { $detail }); ports = $null
+    }
+    $status | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path (Get-PmPath Status) "$($Server.id).json") -Encoding UTF8
+    if (-not $ok) { throw $detail }
+    return $status
+}
+
 function Invoke-PmTestFlow {
     <#
         Mode 'rdp'   : RDP port reachable (+ full system info when the agent is connected and idle)
@@ -768,6 +808,7 @@ function Invoke-PmTestFlow {
         erases the other. A server PASSES when at least one method is OK.
     #>
     param([Parameter(Mandatory)]$Server, [pscredential]$Credential, $Job, [ValidateSet('auto', 'rdp', 'winrm')][string]$Mode = 'auto')
+    if ((Get-PmTransport $Server) -eq 'local') { return Invoke-PmLocalTestFlow -Server $Server -Job $Job }
     Add-PmJobLog -Job $Job -Level STEP -Message "Testing $($Server.name) ($($Server.host)) - test: $($Mode.ToUpper()), connection method used by jobs: $((Get-PmTransport $Server).ToUpper())"
     $now = (Get-Date).ToString('o')
     $ports = Test-PmServerPorts -Server $Server
@@ -883,8 +924,8 @@ function Invoke-PmPreflight {
     $problems = @()
     $info = @{}
     foreach ($srv in @(@($Source) + @($Targets) | Where-Object { $_ })) {
-        $ports = Test-PmServerPorts -Server $srv
         $method = Get-PmTransport $srv
+        $ports = if ($method -eq 'local') { [pscustomobject]@{ rdpPort = 0; rdp = $false; winrmPort = 0; winrm = $false } } else { Test-PmServerPorts -Server $srv }
         Add-PmJobLog -Job $Job -Level DEBUG -Message "$($srv.name) ($($srv.host)): method=$method RDP $($ports.rdpPort)=$($ports.rdp) WinRM $($ports.winrmPort)=$($ports.winrm)"
         if ($method -eq 'winrm' -and -not $ports.winrm) { $problems += "$($srv.name): $(Get-PmConnectHint -Ports $ports)"; continue }
         $s = $null
@@ -892,7 +933,9 @@ function Invoke-PmPreflight {
             $s = New-PmSession -Server $srv -Credential (Resolve-PmCredential $srv $Credentials) -Job $Job
             $i = Invoke-PmRemote -Session $s -Function 'Initialize-PmRemoteWorkRoot' -Job $Job
             $info[$srv.id] = $i
-            if (-not $i.IsAdmin -and $env:PRTGMOVER_TEST -ne '1') { $problems += "$($srv.name): remote session is not elevated (administrator required)." }
+            if (-not $i.IsAdmin -and $env:PRTGMOVER_TEST -ne '1') {
+                $problems += if ($method -eq 'local') { "$($srv.name): PRTG Mover is not running as administrator. Close it and start it with 'Run as administrator'." } else { "$($srv.name): remote session is not elevated (administrator required)." }
+            }
             Add-PmJobLog -Job $Job -Level OK -Computer $i.Computer -Message ("{0}: reachable via {1}, admin={2}, PRTG={3}, {4:N1} GB free" -f $srv.name, $method.ToUpper(), $i.IsAdmin,
                     $(if ($i.Prtg.Installed) { "$($i.Prtg.Version) ($($i.Prtg.CoreStatus))" } else { 'not installed' }), ($i.FreeBytes / 1GB))
         } catch {
@@ -913,6 +956,8 @@ function Invoke-PmPreflight {
             $viaTunnel = [string]$Options.Transfer -in 'wireguard', 'ipip'
             if ($viaTunnel) {
                 Add-PmJobLog -Job $Job -Level OK -Message ("{0}: tunnel mode - WinRM goes from the source to the target's tunnel address. This computer is not in the data path (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
+            } elseif ((Get-PmTransport $Source) -eq 'local') {
+                Add-PmJobLog -Job $Job -Level OK -Message ("{0}: local mode - the files are read from a snapshot on this computer, nothing goes over the network (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
             } elseif ((Get-PmTransport $Source) -eq 'rdp') {
                 Add-PmJobLog -Job $Job -Level OK -Message ("{0}: RDP mode stages directly on the manager - no free space needed on the source (PRTG data {1:N1} GB)." -f $Source.name, ($data / 1GB))
             } else {

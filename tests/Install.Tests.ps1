@@ -258,3 +258,23 @@ Describe 'Setup-All never stops a dashboard it cannot ask' {
         $guard | Should -Match 'if \(\$busy\) \{ throw'
     }
 }
+
+Describe 'Installer option -Local (PRTG Mover on the PRTG server itself)' -Skip:($env:OS -ne 'Windows_NT') {
+    It 'refuses local mode without administrator rights and changes nothing' -Skip:([bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $target = Join-Path $Work 'local mode target'
+        $err = Join-Path $Work 'local.err.txt'
+        $list = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Root 'install.ps1')`"", '-InstallPath', "`"$target`"", '-Source', "`"$Root`"",
+            '-ShortcutFolder', "`"$Links`"", '-StartupFolder', "`"$Startup`"", '-NoStart', '-NoShortcut', '-Local')
+        $p = Start-Process powershell -ArgumentList $list -Wait -PassThru -WindowStyle Hidden -RedirectStandardError $err -RedirectStandardOutput (Join-Path $Work 'local.out.txt')
+        $p.ExitCode | Should -Not -Be 0
+        [IO.File]::ReadAllText($err) | Should -Match 'needs administrator rights'
+        Test-Path -LiteralPath $target | Should -BeFalse
+    }
+
+    It 'has the functions for the server entry, the logon task and the shortcut with administrator rights' {
+        $text = [IO.File]::ReadAllText((Join-Path $Root 'install.ps1'))
+        $text.Contains("Set-PmServer -Name `$env:COMPUTERNAME -HostName 'localhost' -Role 'both' -Transport 'local'") | Should -BeTrue
+        $text.Contains('-RunLevel Highest') | Should -BeTrue
+        $text.Contains('$bytes[0x15] -bor 0x20') | Should -BeTrue
+    }
+}

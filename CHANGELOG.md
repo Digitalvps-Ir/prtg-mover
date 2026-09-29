@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.9.0 — 2026-09-29
+
+### Added
+- **Connection method "Local (this computer)".** PRTG Mover can be installed on the PRTG server itself and back up or restore that server without any connection: no RDP, no WinRM, no credential. On the Servers page: **Add this computer**, or *Local* as the connection method. The test of such a server passes when PRTG Mover has administrator rights; without them the dashboard says so on the server row.
+- `install.ps1 -Local` (needs an elevated PowerShell): adds this computer to the server list, starts the dashboard with administrator rights at logon (scheduled task *PRTG Mover Dashboard*) and lets the shortcut start it with administrator rights.
+- `Setup-All.cmd` chooses local mode by itself when it runs as administrator on a computer where PRTG is installed, and sets VPN Watch up in local mode on a server.
+- `/api/info` reports `elevated`.
+
+### Fixed
+- **`Setup-All.cmd` stopped after PRTG Mover and never installed VPN Watch.** The setup waited for the installer and for everything the installer had started, which included the dashboard that keeps running. It now waits for the installer only and starts the dashboards itself.
+
 ## 1.8.0 — 2026-09-29
 
 ### Added
