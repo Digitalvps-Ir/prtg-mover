@@ -139,7 +139,9 @@
 
     <!-- ======================= JOBS -->
     <section id="view-jobs" class="view">
-      <header class="page-head"><div><h1>Jobs</h1><p class="muted">Live progress and full logs of every operation.</p></div></header>
+      <header class="page-head"><div><h1>Jobs</h1><p class="muted">Live progress and full logs of every operation. Failed jobs can be resumed.</p></div>
+        <div class="actions"><button class="btn" id="diagBtn" title="Zip with manager/audit/robocopy/agent logs, job records, test results and an environment report (no passwords)">Download diagnostics</button></div>
+      </header>
       <div class="jobs-layout">
         <div class="card flush"><div id="jobsList" class="list jobs"></div></div>
         <div class="card" id="jobDetail"><p class="muted">Select a job to see its progress and log.</p></div>

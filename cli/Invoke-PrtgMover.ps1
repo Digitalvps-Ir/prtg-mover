@@ -91,7 +91,9 @@ try {
             $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'Restart' }
             $creds = @{}; if ($Credential) { $creds[$srv.id] = $Credential }
             if (-not $SkipPreflight) { [void](Invoke-PmPreflight -Source $srv -Credentials $creds -Options $options -Job $job) }
-            $file = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
+            $bk = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
+            $file = $bk.Zip
+            if ($bk.StageDir) { Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
             $job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf) }
             if ($KeepLast -gt 0) {
                 # Retention only touches packages of the same source computer (PRTG_<COMPUTER>_<timestamp>.zip).
@@ -118,12 +120,14 @@ try {
             $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
             $creds = @{}; if ($Credential) { foreach ($x in @($srv) + $targets) { $creds[$x.id] = $Credential } }
             if (-not $SkipPreflight) { [void](Invoke-PmPreflight -Source $srv -Targets $targets -Credentials $creds -Options $options -Job $job) }
-            $file = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
+            $bk = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
+            $file = $bk.Zip
             foreach ($ref in $Target) {
                 $t = Resolve-CliServer $ref
-                $rep = Invoke-PmRestoreFlow -Server $t -Credential (Get-CliCredential $t) -BackupPath $file -Options $options -Job $job
+                $rep = Invoke-PmRestoreFlow -Server $t -Credential (Get-CliCredential $t) -BackupPath $file -StageDir $bk.StageDir -Options $options -Job $job
                 if (@($rep.Errors).Count) { $exit = 2 }
             }
+            if ($bk.StageDir) { Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
         }
     }
     $job.status = if ($exit) { 'failed' } else { 'succeeded' }

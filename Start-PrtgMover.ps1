@@ -218,22 +218,25 @@ function Invoke-PmRoute {
             $srv = Set-PmServer -Id ([string]$b.id) -Name $b.name -HostName $b.host -Port ([int]$b.port) -UseSsl ([bool]$b.useSsl) `
                 -SkipCaCheck ([bool]$b.skipCaCheck) -Authentication $auth -Role $role -Notes ([string]$b.notes) -RdpPort $rdp -Transport $(if ($b.transport -eq 'winrm') { 'winrm' } else { 'rdp' })
             if ($b.username -and $b.password) { Save-PmCredential -ServerId $srv.id -Credential (New-PmCredential -UserName $b.username -Password $b.password) }
+            Write-PmAudit -Action $(if ($b.id) { 'server.updated' } else { 'server.added' }) -Data @{ id = $srv.id; name = $srv.name; host = $srv.host; transport = $srv.transport; rdpPort = $srv.rdpPort; winrmPort = $srv.port; credentialChanged = [bool]($b.username -and $b.password) }
             Send-PmJson $Ctx $srv
             return
         }
-        '^DELETE /api/servers/[^/]+$' { Remove-PmServer -Id $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
+        '^DELETE /api/servers/[^/]+$' { Write-PmAudit -Action 'server.deleted' -Data @{ id = $seg[2] }; Remove-PmServer -Id $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
         '^POST /api/servers/[^/]+/credential$' {
             $b = Read-PmBody $Ctx
             if (-not $b.username -or -not $b.password) { Send-PmJson $Ctx @{ error = 'username and password are required' } 400; return }
             [void](Get-PmServer -Id $seg[2])
             Save-PmCredential -ServerId $seg[2] -Credential (New-PmCredential -UserName $b.username -Password $b.password)
+            Write-PmAudit -Action 'credential.saved' -Data @{ id = $seg[2]; user = [string]$b.username }
             Send-PmJson $Ctx @{ ok = $true }
             return
         }
-        '^DELETE /api/servers/[^/]+/credential$' { Remove-PmCredential -ServerId $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
+        '^DELETE /api/servers/[^/]+/credential$' { Write-PmAudit -Action 'credential.removed' -Data @{ id = $seg[2] }; Remove-PmCredential -ServerId $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
         '^POST /api/servers/[^/]+/rdp$' {
             $srv = Get-PmServer -Id $seg[2]
             [void](Start-PmRdp -Server $srv)
+            Write-PmAudit -Action 'rdp.opened' -Data @{ id = $srv.id; host = $srv.host; port = (Get-PmRdpPort $srv) }
             [void](Get-PmAgentDir -ServerId $srv.id)
             Send-PmJson $Ctx @{ ok = $true; target = "$($srv.host):$(Get-PmRdpPort $srv)"; agentCommand = (Get-PmAgentCommand -Server $srv) }
             return
@@ -274,7 +277,7 @@ function Invoke-PmRoute {
             return
         }
         '^GET /api/backups/[^/]+/manifest$' { Send-PmJson $Ctx (Read-PmBackupManifest -ZipPath (Get-PmBackupFile -Name $seg[2])); return }
-        '^DELETE /api/backups/[^/]+$' { Remove-PmBackup -Name $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
+        '^DELETE /api/backups/[^/]+$' { Write-PmAudit -Action 'backup.deleted' -Data @{ name = $seg[2] }; Remove-PmBackup -Name $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
 
         '^GET /api/installers$' { Send-PmJson $Ctx @(Get-PmInstallers); return }
         '^PUT /api/installers/upload$' {
@@ -336,6 +339,22 @@ function Invoke-PmRoute {
             return
         }
         '^POST /api/jobs/[^/]+/cancel$' { Stop-PmJob -Id $seg[2]; Send-PmJson $Ctx @{ ok = $true }; return }
+        '^POST /api/jobs/[^/]+/resume$' {
+            $job = Resume-PmJob -Id $seg[2]
+            Send-PmJson $Ctx @{ id = $job.id }
+            return
+        }
+        '^GET /api/diagnostics$' {
+            $zip = New-PmDiagnosticsBundle
+            Start-PmIoTask -Script $DownloadScript -Arguments @($Ctx, $zip, (Split-Path $zip -Leaf))
+            return
+        }
+        '^GET /api/logs/manager$' {
+            $lf = Join-Path (Get-PmPath Data) ('logs\manager-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+            $lines = @(); if (Test-Path -LiteralPath $lf) { $lines = @(Get-Content -LiteralPath $lf -Tail 300 -Encoding UTF8) }
+            Send-PmJson $Ctx @{ file = $lf; lines = $lines }
+            return
+        }
     }
     Send-PmJson $Ctx @{ error = "No route for $method $path" } 404
 }
@@ -358,6 +377,8 @@ Write-Host "  URL   : $url" -ForegroundColor Green
 if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/?token=$Token  (plain HTTP - trusted networks only)" -ForegroundColor Yellow }
 Write-Host "  Data  : $Root"
 Write-Host '  Stop  : Ctrl+C'
+Write-Host "  Logs  : $(Join-Path (Get-PmPath Data) 'logs')  (manager, audit, robocopy) + data\jobs + data\agent\<id>\agent.log"
+Write-PmManagerLog -Message "Dashboard $Version started on $prefix by $env:USERDOMAIN\$env:USERNAME (PID $PID)" -Source 'dashboard'
 Write-Host ''
 if (-not $NoBrowser) { Start-Process $url }
 
@@ -371,9 +392,15 @@ try {
             }
         }
         $ctx = $task.GetAwaiter().GetResult()
-        try { Invoke-PmRoute -Ctx $ctx }
+        $rsw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            Invoke-PmRoute -Ctx $ctx
+            $m = $ctx.Request.HttpMethod
+            if ($m -ne 'GET' -or $ctx.Request.Url.AbsolutePath -match 'download|diagnostics') { Write-PmManagerLog -Message ("API {0} {1} -> {2} ({3} ms)" -f $m, $ctx.Request.Url.AbsolutePath, $ctx.Response.StatusCode, $rsw.ElapsedMilliseconds) -Source 'api' }
+        }
         catch {
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $($ctx.Request.HttpMethod) $($ctx.Request.Url.AbsolutePath) -> $($_.Exception.Message)" -ForegroundColor DarkYellow
+            Write-PmManagerLog -Level ERROR -Message ("API {0} {1} failed: {2} | {3}" -f $ctx.Request.HttpMethod, $ctx.Request.Url.AbsolutePath, (Format-PmManagerError $_), ($_.ScriptStackTrace -replace '\r?\n', ' <- ')) -Source 'api'
             try { Send-PmJson $ctx @{ error = $_.Exception.Message } 500 } catch { }
         }
     }

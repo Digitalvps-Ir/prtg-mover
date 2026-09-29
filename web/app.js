@@ -120,10 +120,13 @@
     return `<div class="ports">${one('RDP', rdp, s.rdpPort || 3389)}${one('WinRM', win, winDefault)}</div>`;
   }
 
-  function methodResult(v) {
-    if (v === true) return '<span class="badge ok">✓</span>';
-    if (v === false) return '<span class="badge err">✗</span>';
-    return '<span class="badge">–</span>';
+  function methodResult(label, v) {
+    // v = { ok, checked, detail } (new) or true/false (old status files)
+    if (v === null || v === undefined) return `<span class="badge" title="not tested yet">${label} –</span>`;
+    const ok = typeof v === 'object' ? v.ok : v;
+    const when = typeof v === 'object' && v.checked ? ago(v.checked) : '';
+    const detail = typeof v === 'object' && v.detail ? v.detail : '';
+    return `<span class="badge ${ok ? 'ok' : 'err'}" title="${esc(detail)}${when ? ` · ${esc(when)}` : ''}">${label} ${ok ? '✓' : '✗'}${when ? ` <small>${esc(when)}</small>` : ''}</span>`;
   }
 
   function renderServers() {
@@ -134,8 +137,8 @@
       let test = '<span class="badge">never</span>';
       if (st) {
         const m = st.methods || {};
-        test = `${st.ok ? '<span class="badge ok">PASS</span>' : `<span class="badge err" title="${esc(st.error)}">FAIL</span>`}
-          <span class="sub-text">RDP ${methodResult(m.rdp)} WinRM ${methodResult(m.winrm)} · ${esc(ago(st.checked))}</span>`;
+        test = `${st.ok ? '<span class="badge ok" title="at least one connection method works">PASS</span>' : `<span class="badge err" title="${esc(st.error)}">FAIL</span>`}
+          <div class="ports" style="margin-top:4px">${methodResult('RDP', m.rdp)}${methodResult('WinRM', m.winrm)}</div>`;
       }
       let prtg = '–';
       if (info) prtg = info.Prtg && info.Prtg.Installed ? `${esc(info.Prtg.Version)}<span class="sub-text">${esc(info.PrtgDataGB)} GB data · ${esc(info.Prtg.CoreStatus)}</span>` : '<span class="badge warn">not installed</span>';
@@ -385,6 +388,10 @@
         <div style="text-align:right">${statusBadge(j.status)}${j.status === 'running' ? `<div class="progress mini-progress"><i style="width:${j.progress}%"></i></div>` : ''}</div>
       </div>`).join('') : '<div class="empty">No jobs yet.</div>';
   }
+  $('#diagBtn').addEventListener('click', () => {
+    toast('Building diagnostics bundle…');
+    location.href = `/api/diagnostics?token=${encodeURIComponent(token)}`;
+  });
   $('#jobsList').addEventListener('click', (e) => { const it = e.target.closest('[data-job]'); if (it) selectJob(it.dataset.job); });
 
   function selectJob(id) {
@@ -408,7 +415,12 @@
         <div class="sub-text" id="jobStep"></div>
         <dl class="kv" id="jobKv"></dl>
         <div id="jobResult"></div>
-        <div class="log" id="jobLog"></div>`;
+        <label class="check" style="margin-top:12px"><input type="checkbox" id="showDebug"> Show debug details (exact error position, stack, agent requests, timings)</label>
+        <div class="log hide-debug" id="jobLog"></div>`;
+      const sd = $('#showDebug');
+      sd.checked = state.showDebug === true;
+      $('#jobLog').classList.toggle('hide-debug', !sd.checked);
+      sd.onchange = () => { state.showDebug = sd.checked; $('#jobLog').classList.toggle('hide-debug', !sd.checked); };
     }
     const pr = $('#jobProgress');
     pr.className = 'progress' + (j.status === 'succeeded' ? ' ok' : j.status === 'failed' ? ' err' : '');
@@ -416,10 +428,19 @@
     $('#jobStep').textContent = `${j.progress || 0}% · ${j.step || ''}`;
     $('#jobKv').innerHTML = `<dt>Status</dt><dd>${statusBadge(j.status)}</dd><dt>Started</dt><dd>${esc(fmtDate(j.started))}</dd><dt>Finished</dt><dd>${esc(fmtDate(j.finished))}</dd>${j.error ? `<dt>Error</dt><dd style="color:var(--err)">${esc(j.error)}</dd>` : ''}`;
     const active = j.status === 'running' || j.status === 'queued';
+    const cp = j.checkpoint || {};
+    const doneTargets = arr(cp.targetsDone).length;
+    const resumeTitle = cp.backup ? `Continue: package ${cp.backup} is reused${doneTargets ? `, ${doneTargets} finished target(s) skipped` : ''}. Server IPs are re-read from the inventory.` : 'Run again with the same settings (server IPs are re-read from the inventory).';
     $('#jobActions').innerHTML = (active ? '<button class="btn small danger" id="cancelJob">Cancel</button>' : '')
+      + (j.resumable ? `<button class="btn small primary" id="resumeJob" title="${esc(resumeTitle)}">${cp.backup ? 'Resume' : 'Retry'}</button>` : '')
       + `<a class="btn small" href="/api/jobs/${encodeURIComponent(j.id)}/log?token=${encodeURIComponent(token)}">Download log</a>`;
     const cb = $('#cancelJob');
     if (cb) cb.onclick = async () => { if (confirm('Cancel this job?')) { await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/cancel`); pollJob(); } };
+    const rb = $('#resumeJob');
+    if (rb) rb.onclick = async () => {
+      if (!confirm(`${resumeTitle}\n\nStart now?`)) return;
+      try { const r = await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/resume`); toast('Resumed'); await loadJobs(); selectJob(r.id); } catch (err) { toast(err.message, true); }
+    };
     renderResult(j);
 
     const log = $('#jobLog');
