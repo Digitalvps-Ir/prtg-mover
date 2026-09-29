@@ -97,6 +97,8 @@ function Get-PmServerView {
         if (Test-Path $sf) { try { $status = Get-Content $sf -Raw -Encoding UTF8 | ConvertFrom-Json } catch { } }
         $s | Add-Member -NotePropertyName hasCredential -NotePropertyValue (Test-PmCredential -ServerId $s.id) -Force
         $s | Add-Member -NotePropertyName lastStatus -NotePropertyValue $status -Force
+        $s | Add-Member -NotePropertyName agent -NotePropertyValue (Get-PmAgentStatus -ServerId $s.id) -Force
+        $s | Add-Member -NotePropertyName agentCommand -NotePropertyValue (Get-PmAgentCommand -Server $s) -Force
         $s
     }
 }
@@ -214,7 +216,7 @@ function Invoke-PmRoute {
             $rdp = if ([int]$b.rdpPort -gt 0) { [int]$b.rdpPort } else { 3389 }
             if ([int]$b.port -gt 0 -and [int]$b.port -eq $rdp) { Send-PmJson $Ctx @{ error = "WinRM port $rdp is the RDP port. Put $rdp in 'RDP port' and leave the WinRM port at 0 (default 5985/5986)." } 400; return }
             $srv = Set-PmServer -Id ([string]$b.id) -Name $b.name -HostName $b.host -Port ([int]$b.port) -UseSsl ([bool]$b.useSsl) `
-                -SkipCaCheck ([bool]$b.skipCaCheck) -Authentication $auth -Role $role -Notes ([string]$b.notes) -RdpPort $rdp
+                -SkipCaCheck ([bool]$b.skipCaCheck) -Authentication $auth -Role $role -Notes ([string]$b.notes) -RdpPort $rdp -Transport $(if ($b.transport -eq 'winrm') { 'winrm' } else { 'rdp' })
             if ($b.username -and $b.password) { Save-PmCredential -ServerId $srv.id -Credential (New-PmCredential -UserName $b.username -Password $b.password) }
             Send-PmJson $Ctx $srv
             return
@@ -232,7 +234,8 @@ function Invoke-PmRoute {
         '^POST /api/servers/[^/]+/rdp$' {
             $srv = Get-PmServer -Id $seg[2]
             [void](Start-PmRdp -Server $srv)
-            Send-PmJson $Ctx @{ ok = $true; target = "$($srv.host):$(Get-PmRdpPort $srv)" }
+            [void](Get-PmAgentDir -ServerId $srv.id)
+            Send-PmJson $Ctx @{ ok = $true; target = "$($srv.host):$(Get-PmRdpPort $srv)"; agentCommand = (Get-PmAgentCommand -Server $srv) }
             return
         }
         '^GET /api/servers/ports$' {
@@ -294,7 +297,8 @@ function Invoke-PmRoute {
             switch ([string]$b.type) {
                 'test' {
                     $params.ServerIds = [string[]]@($b.serverIds)
-                    $summary = 'Test: ' + (($params.ServerIds | ForEach-Object { $names[$_] }) -join ', ')
+                    $params.Mode = if ($b.mode -in 'rdp', 'winrm') { [string]$b.mode } else { 'auto' }
+                    $summary = "Test ($($params.Mode.ToUpper())): " + (($params.ServerIds | ForEach-Object { $names[$_] }) -join ', ')
                 }
                 'backup' {
                     $params.SourceId = [string]$b.sourceId

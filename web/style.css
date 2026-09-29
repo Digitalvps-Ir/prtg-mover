@@ -108,6 +108,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); ou
 .check { display: flex; gap: 8px; align-items: flex-start; margin: 7px 0; cursor: pointer; }
 .check input { width: auto; margin-top: 3px; accent-color: var(--accent); }
 .check.sub { margin-left: 24px; }
+pre.cmd { background: #0b0d11; color: #d6dae2; font-family: var(--mono); font-size: 12.5px; padding: 12px 14px; border-radius: 8px; white-space: pre-wrap; word-break: break-all; margin: 10px 0; }
 .check.notouch { background: var(--ok-soft); border-radius: 8px; padding: 8px 10px; }
 #sourceAfterBox { margin-top: 10px; transition: opacity .2s; }
 #sourceAfterBox.disabled { opacity: .4; pointer-events: none; }

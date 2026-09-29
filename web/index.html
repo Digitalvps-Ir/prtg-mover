@@ -92,8 +92,8 @@
         </div>
         <div class="card">
           <h2>4 · Source server</h2>
-          <label class="check notouch"><input type="checkbox" name="NoTouch"> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
-          <div id="sourceAfterBox">
+          <label class="check notouch"><input type="checkbox" name="NoTouch" checked> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
+          <div id="sourceAfterBox" class="disabled">
             <div class="segmented" id="sourceAfter">
               <label><input type="radio" name="SourceAfter" value="KeepStopped" checked><span>Keep stopped</span></label>
               <label><input type="radio" name="SourceAfter" value="Disable"><span>Stop &amp; disable</span></label>
@@ -156,6 +156,10 @@
       <label class="field"><span>Display name</span><input name="name" required placeholder="PRTG-OLD"></label>
       <label class="field"><span>Host / IP</span><input name="host" required placeholder="10.0.0.10"></label>
       <label class="field"><span>Role</span><select name="role"><option value="both">Source &amp; target</option><option value="source">Source</option><option value="target">Target</option></select></label>
+      <label class="field"><span>Connection method for the script</span><select name="transport">
+        <option value="rdp">RDP (agent in a Remote Desktop session — nothing to configure on the server)</option>
+        <option value="winrm">WinRM (PowerShell remoting — fully automatic, needs WinRM enabled)</option>
+      </select></label>
       <label class="field"><span>RDP port</span><input type="number" name="rdpPort" value="3389" min="1" max="65535" required></label>
       <label class="field"><span>WinRM port (0 = default 5985 / 5986)</span><input type="number" name="port" value="0" min="0" max="65535"></label>
       <label class="field"><span>Authentication</span><select name="authentication"><option>Default</option><option>Negotiate</option><option>Kerberos</option><option>CredSSP</option><option>Basic</option></select></label>
@@ -195,6 +199,23 @@
     <div class="form-actions">
       <button value="cancel" class="btn" formnovalidate>Cancel</button>
       <button value="go" class="btn primary">Restore</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="agentDialog">
+  <form method="dialog">
+    <h2>Start the agent on <span id="agentServer"></span></h2>
+    <ol class="steps">
+      <li>A Remote Desktop window opens (with this manager's drive redirected). Log in with the server's administrator account. If Windows asks about <i>drive access</i>, allow it.</li>
+      <li>On the server, right-click <b>Start → Windows PowerShell → Run as administrator</b>.</li>
+      <li>Paste this command (it's already in the clipboard) and press Enter:</li>
+    </ol>
+    <pre class="cmd" id="agentCmd"></pre>
+    <p class="hint">The agent window shows <b>connected</b>; the server's badge here turns green. Keep the window open while jobs run. It changes nothing on the server — no WinRM, no firewall, no installation.</p>
+    <div class="form-actions">
+      <button type="button" class="btn" id="copyAgentCmd">Copy again</button>
+      <button value="close" class="btn primary">Done</button>
     </div>
   </form>
 </dialog>

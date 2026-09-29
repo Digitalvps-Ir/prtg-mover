@@ -120,53 +120,83 @@
     return `<div class="ports">${one('RDP', rdp, s.rdpPort || 3389)}${one('WinRM', win, winDefault)}</div>`;
   }
 
+  function methodResult(v) {
+    if (v === true) return '<span class="badge ok">✓</span>';
+    if (v === false) return '<span class="badge err">✗</span>';
+    return '<span class="badge">–</span>';
+  }
+
   function renderServers() {
     const tb = $('#serversTable tbody');
     if (!state.servers.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">No servers yet — add the source PRTG server and at least one target.</td></tr>'; return; }
     tb.innerHTML = state.servers.map((s) => {
       const st = s.lastStatus; const info = st && st.info;
       let test = '<span class="badge">never</span>';
-      if (st) test = st.ok ? `<span class="badge ok">ok</span><span class="sub-text">${esc(ago(st.checked))}</span>` : `<span class="badge err" title="${esc(st.error)}">failed</span><span class="sub-text">${esc(ago(st.checked))}</span>`;
+      if (st) {
+        const m = st.methods || {};
+        test = `${st.ok ? '<span class="badge ok">PASS</span>' : `<span class="badge err" title="${esc(st.error)}">FAIL</span>`}
+          <span class="sub-text">RDP ${methodResult(m.rdp)} WinRM ${methodResult(m.winrm)} · ${esc(ago(st.checked))}</span>`;
+      }
       let prtg = '–';
       if (info) prtg = info.Prtg && info.Prtg.Installed ? `${esc(info.Prtg.Version)}<span class="sub-text">${esc(info.PrtgDataGB)} GB data · ${esc(info.Prtg.CoreStatus)}</span>` : '<span class="badge warn">not installed</span>';
       const cred = s.hasCredential ? '<span class="badge ok">saved</span>' : '<span class="badge" title="The current Windows identity of the manager is used">Windows identity</span>';
+      const method = (s.transport === 'winrm') ? '<span class="badge info">WinRM</span>' : '<span class="badge info">RDP</span>';
+      const ag = s.agent && s.agent.connected
+        ? `<span class="badge ok" title="${esc(s.agent.computer)} · ${esc(s.agent.user)}">agent ${esc(s.agent.state || 'on')}</span>`
+        : (s.transport === 'winrm' ? '' : '<span class="badge" title="Only needed while a job runs">agent off</span>');
       return `<tr>
         <td><b>${esc(s.name)}</b>${info ? `<span class="sub-text">${esc(info.OS)}</span>` : ''}</td>
         <td class="num">${esc(s.host)}${s.useSsl ? ' <span class="badge info">HTTPS</span>' : ''}</td>
-        <td>${esc(s.role)}</td><td>${portBadges(s)}</td><td>${cred}</td><td>${test}</td><td>${prtg}</td>
+        <td>${esc(s.role)}<span class="sub-text">${method} ${ag}</span></td><td>${portBadges(s)}</td><td>${cred}</td><td>${test}</td><td>${prtg}</td>
         <td><div class="btn-group">
-          <button class="btn small" data-act="rdp" data-id="${esc(s.id)}" title="Open Remote Desktop to ${esc(s.host)}:${esc(s.rdpPort || 3389)}">RDP</button>
-          <button class="btn small" data-act="test" data-id="${esc(s.id)}">Test</button>
+          <button class="btn small" data-act="rdp" data-id="${esc(s.id)}" title="Open Remote Desktop to ${esc(s.host)}:${esc(s.rdpPort || 3389)} and start the agent">RDP</button>
+          <button class="btn small" data-act="test-rdp" data-id="${esc(s.id)}">Test RDP</button>
+          <button class="btn small" data-act="test-winrm" data-id="${esc(s.id)}">Test WinRM</button>
           <button class="btn small" data-act="edit" data-id="${esc(s.id)}">Edit</button>
           <button class="btn small danger" data-act="del" data-id="${esc(s.id)}">Delete</button>
         </div></td></tr>`;
     }).join('');
   }
 
+  async function copyText(text) {
+    try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+  }
+
   $('#serversTable').addEventListener('click', async (e) => {
     const b = e.target.closest('button[data-act]'); if (!b) return;
     const s = state.servers.find((x) => x.id === b.dataset.id);
-    if (b.dataset.act === 'test') startJob({ type: 'test', serverIds: [s.id] });
+    if (b.dataset.act === 'test-rdp') startJob({ type: 'test', mode: 'rdp', serverIds: [s.id] });
+    if (b.dataset.act === 'test-winrm') startJob({ type: 'test', mode: 'winrm', serverIds: [s.id] });
     if (b.dataset.act === 'rdp') {
-      try { const r = await api('POST', `/api/servers/${encodeURIComponent(s.id)}/rdp`); toast(`Remote Desktop opened on the manager → ${r.target}`); } catch (err) { toast(err.message, true); }
+      try {
+        const r = await api('POST', `/api/servers/${encodeURIComponent(s.id)}/rdp`);
+        const copied = await copyText(r.agentCommand);
+        $('#agentServer').textContent = `${s.name} (${r.target})`;
+        $('#agentCmd').textContent = r.agentCommand;
+        $('#agentDialog').showModal();
+        toast(copied ? 'Remote Desktop opened — agent command copied to the clipboard' : 'Remote Desktop opened');
+      } catch (err) { toast(err.message, true); }
     }
     if (b.dataset.act === 'edit') openServerDialog(s);
     if (b.dataset.act === 'del' && confirm(`Delete server "${s.name}" and its saved credential?`)) {
       try { await api('DELETE', `/api/servers/${encodeURIComponent(s.id)}`); toast('Server deleted'); loadServers(); } catch (err) { toast(err.message, true); }
     }
   });
+  $('#copyAgentCmd').addEventListener('click', async () => { toast((await copyText($('#agentCmd').textContent)) ? 'Copied' : 'Copy failed — select the text manually'); });
   $('#addServerBtn').addEventListener('click', () => openServerDialog(null));
   $('#testAllBtn').addEventListener('click', () => {
     if (!state.servers.length) return toast('Add a server first', true);
-    startJob({ type: 'test', serverIds: state.servers.map((s) => s.id) });
+    startJob({ type: 'test', mode: 'auto', serverIds: state.servers.map((s) => s.id) });
   });
 
   function openServerDialog(s) {
     const f = $('#serverForm'); f.reset();
     $('#serverDialogTitle').textContent = s ? `Edit ${s.name}` : 'Add server';
     f.id.value = s ? s.id : '';
+    f.transport.value = 'rdp';
     if (s) {
       f.name.value = s.name; f.host.value = s.host; f.role.value = s.role || 'both'; f.port.value = s.port || 0; f.rdpPort.value = s.rdpPort || 3389;
+      f.transport.value = s.transport === 'winrm' ? 'winrm' : 'rdp';
       f.authentication.value = s.authentication || 'Default'; f.useSsl.checked = !!s.useSsl; f.skipCaCheck.checked = !!s.skipCaCheck; f.notes.value = s.notes || '';
     }
     $('#serverDialog').showModal();
@@ -176,7 +206,7 @@
     const f = $('#serverForm');
     const body = {
       id: f.id.value || undefined, name: f.name.value.trim(), host: f.host.value.trim(), role: f.role.value, port: Number(f.port.value) || 0,
-      rdpPort: Number(f.rdpPort.value) || 3389,
+      rdpPort: Number(f.rdpPort.value) || 3389, transport: f.transport.value,
       authentication: f.authentication.value, useSsl: f.useSsl.checked, skipCaCheck: f.skipCaCheck.checked, notes: f.notes.value,
       username: f.username.value.trim() || undefined, password: f.password.value || undefined,
     };
@@ -242,7 +272,10 @@
       startJob({ type: 'backup', sourceId: f.sourceId.value, options });
     }
   });
-  $('#migrateForm').NoTouch.addEventListener('change', (e) => { $('#sourceAfterBox').classList.toggle('disabled', e.target.checked); });
+  $('#migrateForm').NoTouch.addEventListener('change', (e) => {
+    if (!e.target.checked && !confirm('Allow PRTG Mover to STOP PRTG on the source server during the backup?')) e.target.checked = true;
+    $('#sourceAfterBox').classList.toggle('disabled', e.target.checked);
+  });
 
   $('#installerUpload').addEventListener('change', (e) => {
     const file = e.target.files[0]; if (!file) return;

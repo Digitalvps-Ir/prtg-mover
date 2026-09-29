@@ -42,7 +42,7 @@ param(
     [int]$HealthTimeoutMinutes = 15,
     [switch]$ConnectVpn,
     [switch]$AllowDowngrade,
-    [switch]$NoTouch,
+    [switch]$AllowSourceStop,
     [switch]$NoLicense,
     [switch]$NoFirewall,
     [switch]$SkipPreflight,
@@ -59,7 +59,7 @@ function Resolve-CliServer {
     $s = Get-PmServers | Where-Object { $_.id -eq $Ref -or $_.name -eq $Ref -or $_.host -eq $Ref } | Select-Object -First 1
     if ($s) { return $s }
     # ad-hoc server (not in inventory) - default WinRM settings
-    return [pscustomobject]@{ id = "adhoc-$Ref"; name = $Ref; host = $Ref; port = 0; useSsl = $false; skipCaCheck = $false; authentication = 'Default' }
+    return [pscustomobject]@{ id = "adhoc-$Ref"; name = $Ref; host = $Ref; transport = 'winrm'; port = 0; useSsl = $false; skipCaCheck = $false; authentication = 'Default' }
 }
 
 function Get-CliCredential { param($Server) if ($Credential) { return $Credential } return Get-PmCredential -ServerId $Server.id }
@@ -69,7 +69,7 @@ $options = @{
     ExtraPaths = $ExtraPaths; StartServices = -not $NoStart; HealthTimeoutMinutes = $HealthTimeoutMinutes
     ConnectVpn = [bool]$ConnectVpn; AllowDowngrade = [bool]$AllowDowngrade
     RestorePrtg = -not $NoPrtg; RestoreVpn = -not $NoVpn; RestoreDesktop = -not $NoDesktop; RestoreExtra = $true
-    NoTouch = [bool]$NoTouch; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
+    NoTouch = -not $AllowSourceStop; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
 }
 if ($InstallerFile) { $options.InstallerFile = $InstallerFile }
 
