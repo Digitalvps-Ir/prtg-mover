@@ -64,7 +64,6 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 | Symptom | Cause / fix |
 |---|---|
 | `Could not listen on http://+:8765/` | `-ListenAll` needs a URL ACL. Run `tools\Setup-Manager.ps1 -DashboardPort 8765` (elevated). |
-| `Unauthorized` | Open the dashboard on the manager itself at `http://localhost:8765/` and reload the page: it receives the access token automatically. From another computer, use the link with the token from the dashboard console, or paste the token from `data\token.txt` when the page asks for it. |
 | `Request from another web site refused` | The request did not come from the dashboard page. Nothing to fix: this protects the manager from pages open in the browser. |
 | Scripts are blocked | Run `Get-ChildItem -Recurse *.ps1,*.psm1 \| Unblock-File`, or start with `powershell -ExecutionPolicy Bypass -File …`. |
 

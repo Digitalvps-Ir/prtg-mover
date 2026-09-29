@@ -495,56 +495,24 @@ Describe 'Removing the PRTG license from a migrated server' -Skip:($env:OS -ne '
 }
 
 Describe 'Dashboard access' {
-    BeforeAll {
-        $script:AccRoot = Join-Path $Work 'manager-access'
-        New-Item -ItemType Directory -Force -Path $AccRoot | Out-Null
-        Set-PmRoot -Path $AccRoot
+    It 'serves requests of the dashboard page itself without any token' {
+        (Test-PmDashboardRequest -Method GET -Path '/api/info').Allowed | Should -BeTrue
+        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -Origin 'http://localhost:8765' -RequestOrigin 'http://localhost:8765').Allowed | Should -BeTrue
     }
 
-    It 'creates a random token once and replaces it on request' {
-        $a = Get-PmDashboardToken
-        $a | Should -Match '^[0-9a-f]{48}$'
-        Get-PmDashboardToken | Should -Be $a
-        Get-PmDashboardToken -New | Should -Not -Be $a
-    }
-
-    It 'refuses requests without the token' {
-        (Test-PmDashboardRequest -Method GET -Path '/api/info' -ExpectedToken 'abc').Status | Should -Be 401
-        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -ExpectedToken 'abc' -HeaderToken 'abd').Status | Should -Be 401
-        (Test-PmDashboardRequest -Method GET -Path '/api/info' -ExpectedToken '' -HeaderToken '').Allowed | Should -BeFalse
-    }
-
-    It 'serves requests that carry the token in the header' {
-        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -ExpectedToken 'abc' -HeaderToken 'abc' -Origin 'http://localhost:8765' -RequestOrigin 'http://localhost:8765').Allowed | Should -BeTrue
-        (Test-PmDashboardRequest -Method GET -Path '/api/info' -ExpectedToken 'abc' -HeaderToken 'abc').Allowed | Should -BeTrue
-    }
-
-    It 'accepts the token in the address only for file downloads' {
-        (Test-PmDashboardRequest -Method GET -Path '/api/backups/a.zip/download' -ExpectedToken 'abc' -QueryToken 'abc').Allowed | Should -BeTrue
-        (Test-PmDashboardRequest -Method GET -Path '/api/jobs/1/log' -ExpectedToken 'abc' -QueryToken 'abc').Allowed | Should -BeTrue
-        (Test-PmDashboardRequest -Method GET -Path '/api/diagnostics' -ExpectedToken 'abc' -QueryToken 'abc').Allowed | Should -BeTrue
-        (Test-PmDashboardRequest -Method GET -Path '/api/servers' -ExpectedToken 'abc' -QueryToken 'abc').Status | Should -Be 401
-        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -ExpectedToken 'abc' -QueryToken 'abc').Status | Should -Be 401
-    }
-
-    It 'refuses requests that come from another web site, even with the token' {
-        $r = Test-PmDashboardRequest -Method POST -Path '/api/jobs' -ExpectedToken 'abc' -HeaderToken 'abc' -Origin 'http://evil.example' -RequestOrigin 'http://localhost:8765'
+    It 'refuses requests that come from another web site' {
+        $r = Test-PmDashboardRequest -Method POST -Path '/api/jobs' -Origin 'http://evil.example' -RequestOrigin 'http://localhost:8765'
+        $r.Allowed | Should -BeFalse
         $r.Status | Should -Be 403
-        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -ExpectedToken 'abc' -HeaderToken 'abc' -Origin 'null' -RequestOrigin 'http://localhost:8765').Status | Should -Be 403
-    }
-
-    It 'hands the token to the page only on the manager itself' {
-        Test-PmLocalBrowser -IsLocal $true -HostName 'localhost:8765' | Should -BeTrue
-        Test-PmLocalBrowser -IsLocal $true -HostName '127.0.0.1:8765' | Should -BeTrue
-        Test-PmLocalBrowser -IsLocal $true -HostName 'evil.example:8765' | Should -BeFalse
-        Test-PmLocalBrowser -IsLocal $true -HostName 'MANAGER-PC:8765' | Should -BeFalse
-        Test-PmLocalBrowser -IsLocal $false -HostName 'localhost:8765' | Should -BeFalse
+        (Test-PmDashboardRequest -Method POST -Path '/api/jobs' -Origin 'null' -RequestOrigin 'http://localhost:8765').Status | Should -Be 403
     }
 }
 
 Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT') {
     BeforeAll {
         $script:DashData = Join-Path $Work 'dash-data'
+        New-Item -ItemType Directory -Force -Path (Join-Path $DashData 'data') | Out-Null
+        'old-token-of-an-earlier-version' | Set-Content (Join-Path $DashData 'data\token.txt')
         $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $script:DashPort = $l.LocalEndpoint.Port; $l.Stop()
         $script:DashProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
             (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $DashPort, '-NoBrowser', '-Quiet', '-DataRoot', $DashData
@@ -554,7 +522,6 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         while (-not $script:DashPage -and (Get-Date) -lt $deadline) {
             try { $script:DashPage = (Invoke-WebRequest "$Dash/" -UseBasicParsing -TimeoutSec 3).Content } catch { Start-Sleep -Milliseconds 500 }
         }
-        $script:DashToken = if ($DashPage -match '<meta name="pm-token" content="([0-9a-f]{48})">') { $Matches[1] } else { $null }
         $script:StatusOf = {
             param([string]$Method, [string]$Url, [hashtable]$Headers = @{}, [string]$Body)
             $req = [Net.HttpWebRequest]::Create($Url); $req.Method = $Method; $req.Timeout = 10000
@@ -567,27 +534,22 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         if ($script:DashProc) { Stop-Process -Id $script:DashProc.Id -Force -ErrorAction SilentlyContinue }
     }
 
-    It 'opens on the manager without asking for anything and gives the page its token' {
+    It 'opens without a token and removes the token file of an earlier version' {
         $DashPage | Should -Not -BeNullOrEmpty
-        $DashToken | Should -Not -BeNullOrEmpty
-        $DashToken | Should -Be ([IO.File]::ReadAllText((Join-Path $DashData 'data\token.txt')).Trim())
+        $DashPage | Should -Not -Match 'pm-token'
+        Test-Path (Join-Path $DashData 'data\token.txt') | Should -BeFalse
+        & $StatusOf GET "$Dash/api/info" | Should -Be 200
+        & $StatusOf GET "$Dash/api/servers" | Should -Be 200
     }
 
-    It 'answers 401 without the token and 200 with it' {
-        & $StatusOf GET "$Dash/api/info" | Should -Be 401
-        & $StatusOf GET "$Dash/api/servers" @{ 'X-PM-Token' = 'wrong' } | Should -Be 401
-        & $StatusOf GET "$Dash/api/info" @{ 'X-PM-Token' = $DashToken } | Should -Be 200
-    }
-
-    It 'does not start a job for a request without the token (cross-site form post)' {
+    It 'refuses a request from another web site and starts no job for it' {
         & $StatusOf POST "$Dash/api/jobs" @{ 'Content-Type' = 'text/plain'; 'Origin' = 'http://evil.example' } '{"type":"test","serverIds":["x"]}' | Should -Be 403
-        & $StatusOf POST "$Dash/api/jobs" @{ 'Content-Type' = 'text/plain' } '{"type":"test","serverIds":["x"]}' | Should -Be 401
+        & $StatusOf DELETE "$Dash/api/servers/x" @{ 'Origin' = 'http://evil.example' } | Should -Be 403
         @(Get-ChildItem (Join-Path $DashData 'data\jobs') -Filter '*.json' -ErrorAction SilentlyContinue).Count | Should -Be 0
     }
 
-    It 'accepts the token in the address for downloads only' {
-        & $StatusOf GET "$Dash/api/info?token=$DashToken" | Should -Be 401
-        & $StatusOf GET "$Dash/api/diagnostics?token=$DashToken" | Should -Be 200
+    It 'serves the same request when it comes from the dashboard page' {
+        & $StatusOf POST "$Dash/api/servers" @{ 'Content-Type' = 'application/json'; 'Origin' = $Dash } '{"name":"T1","host":"192.0.2.10","role":"target"}' | Should -Be 200
     }
 }
 

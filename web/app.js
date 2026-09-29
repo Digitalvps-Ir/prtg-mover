@@ -19,26 +19,10 @@
     setTimeout(() => el.remove(), isErr ? 7000 : 3500);
   }
 
-  // ------------------------------------------------------------ access token
-  // On the manager itself the page receives the token from the dashboard (meta tag).
-  // From another computer it comes from the link (?token=...) or is asked for once.
-  const store = {
-    get(k) { try { return sessionStorage.getItem(k); } catch { return null; } },
-    set(k, v) { try { sessionStorage.setItem(k, v); } catch { /* storage blocked */ } },
-  };
-  const urlToken = new URLSearchParams(location.search).get('token');
-  let token = (document.querySelector('meta[name="pm-token"]') || {}).content || urlToken || store.get('pm_token') || '';
-  if (urlToken) { store.set('pm_token', urlToken); history.replaceState(null, '', location.pathname + location.hash); }
-  const withToken = (url) => `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
-
   async function api(method, path, body) {
-    const opts = { method, headers: { 'X-PM-Token': token } };
+    const opts = { method, headers: {} };
     if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-    let res = await fetch(path, opts);
-    if (res.status === 401) {
-      const entered = window.prompt('Access token of this dashboard (shown in the dashboard console, stored in data\\token.txt):');
-      if (entered) { token = entered.trim(); store.set('pm_token', token); opts.headers['X-PM-Token'] = token; res = await fetch(path, opts); }
-    }
+    const res = await fetch(path, opts);
     if (res.status === 401) throw new Error('Unauthorized');
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
@@ -81,7 +65,7 @@
     } catch (err) { toast(err.message, true); }
   }
   $('#refreshLogs').addEventListener('click', loadLogs);
-  $('#diagBtn2').addEventListener('click', () => { toast('Building diagnostics bundle…'); location.href = withToken('/api/diagnostics'); });
+  $('#diagBtn2').addEventListener('click', () => { toast('Building diagnostics bundle…'); location.href = '/api/diagnostics'; });
 
   // ------------------------------------------------------------ agents in the sidebar
   function renderSideAgents() {
@@ -414,7 +398,7 @@
       if (m.vpn && m.vpn.included) parts.push(`<span class="badge">VPN ×${arr(m.vpn.allUsers).length}</span>`);
       if (m.desktop && m.desktop.included) parts.push(`<span class="badge">Desktop ×${arr(m.desktop.users).length}</span>`);
       if (arr(m.extra).length) parts.push(`<span class="badge">Extra ×${arr(m.extra).length}</span>`);
-      const dl = withToken(`/api/backups/${encodeURIComponent(b.name)}/download`);
+      const dl = `/api/backups/${encodeURIComponent(b.name)}/download`;
       return `<tr>
         <td><b>${esc(b.name)}</b>${b.sha256 ? `<span class="sub-text" title="SHA256">${esc(b.sha256.slice(0, 16))}…</span>` : ''}</td>
         <td>${esc(b.source || (m.source && m.source.computer) || '–')}</td>
@@ -461,7 +445,6 @@
     return new Promise((resolve, reject) => {
       const x = new XMLHttpRequest();
       x.open('PUT', url);
-      x.setRequestHeader('X-PM-Token', token);
       x.upload.onprogress = (ev) => { if (ev.lengthComputable) onProgress(Math.round((ev.loaded / ev.total) * 100)); };
       x.onload = () => { let d = {}; try { d = JSON.parse(x.responseText); } catch { /* empty */ } x.status < 300 ? resolve(d) : reject(new Error(d.error || `HTTP ${x.status}`)); };
       x.onerror = () => reject(new Error('Upload failed'));
@@ -503,7 +486,7 @@
   }
   $('#diagBtn').addEventListener('click', () => {
     toast('Building diagnostics bundle…');
-    location.href = withToken('/api/diagnostics');
+    location.href = '/api/diagnostics';
   });
   $('#jobsList').addEventListener('click', (e) => { const it = e.target.closest('[data-job]'); if (it) selectJob(it.dataset.job); });
 
@@ -547,7 +530,7 @@
     const resumeTitle = cp.backup ? `Continue: package ${cp.backup} is reused${doneTargets ? `, ${doneTargets} finished target(s) skipped` : ''}. Server IPs are re-read from the inventory.` : 'Run again with the same settings (server IPs are re-read from the inventory).';
     $('#jobActions').innerHTML = (active ? '<button class="btn small danger" id="cancelJob">Cancel</button>' : '')
       + (j.resumable ? `<button class="btn small primary" id="resumeJob" title="${esc(resumeTitle)}">${cp.backup ? 'Resume' : 'Retry'}</button>` : '')
-      + `<a class="btn small" href="${esc(withToken(`/api/jobs/${encodeURIComponent(j.id)}/log`))}">Download log</a>`;
+      + `<a class="btn small" href="/api/jobs/${encodeURIComponent(j.id)}/log">Download log</a>`;
     const cb = $('#cancelJob');
     if (cb) cb.onclick = async () => { if (confirm('Cancel this job?')) { await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/cancel`); pollJob(); } };
     const rb = $('#resumeJob');
@@ -599,7 +582,7 @@
     if (!r || j.type === 'test') { el.innerHTML = ''; return; }
     let html = '';
     if (r.backup) {
-      html += `<p style="margin:12px 0 0">Package: <b>${esc(r.backup)}</b> <a class="btn small" href="${esc(withToken(`/api/backups/${encodeURIComponent(r.backup)}/download`))}">Download</a></p>`;
+      html += `<p style="margin:12px 0 0">Package: <b>${esc(r.backup)}</b> <a class="btn small" href="/api/backups/${encodeURIComponent(r.backup)}/download">Download</a></p>`;
     }
     const targets = arr(r.targets || (Array.isArray(r) ? r : null));
     if (targets.length) {

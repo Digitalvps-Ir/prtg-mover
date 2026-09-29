@@ -181,7 +181,7 @@ function Remove-PmCredential {
 function New-PmCredential {
     <#
         Builds a PSCredential from the dashboard form. The password arrives once over the
-        token-protected localhost API; it is turned into a SecureString immediately and
+        localhost API; it is turned into a SecureString immediately and
         only ever persisted DPAPI-encrypted (Save-PmCredential).
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Entry point for the web form; converted to SecureString immediately.')]
@@ -653,61 +653,17 @@ function Get-PmConnectHint {
 
 # ======================================================================= dashboard access
 
-function Get-PmDashboardToken {
-    <# Random access token of the dashboard (data\token.txt). Created on first use, replaced with -New. #>
-    param([switch]$New)
-    $file = Join-Path (Get-PmPath Data) 'token.txt'
-    $current = $null
-    if (Test-Path -LiteralPath $file) { $current = ([IO.File]::ReadAllText($file)).Trim() }
-    if ($New -or $current -notmatch '^[0-9a-f]{48}$') {
-        $bytes = New-Object byte[] 24
-        $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
-        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-        $current = ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
-        [IO.File]::WriteAllText($file, $current, [Text.Encoding]::ASCII)
-    }
-    return $current
-}
-
-function Test-PmTokenEqual {
-    <# Compares two tokens without stopping at the first difference. #>
-    param([string]$A, [string]$B)
-    if (-not $A -or -not $B -or $A.Length -ne $B.Length) { return $false }
-    $diff = 0
-    for ($i = 0; $i -lt $A.Length; $i++) { $diff = $diff -bor ([int][char]$A[$i] -bxor [int][char]$B[$i]) }
-    return ($diff -eq 0)
-}
-
-function Test-PmLocalBrowser {
-    <#
-        True when the page is opened on the manager itself under a local name. Only then
-        the dashboard hands the token to the page, so nothing has to be typed. A request
-        that arrives under another host name (network access, DNS rebinding) gets no token.
-    #>
-    param([bool]$IsLocal, [string]$HostName)
-    if (-not $IsLocal) { return $false }
-    return (($HostName -replace ':\d+$', '').Trim('[', ']') -in 'localhost', '127.0.0.1', '::1')
-}
-
 function Test-PmDashboardRequest {
     <#
-        Decides whether an API request is served. Pure function.
-          - every request needs the token: header X-PM-Token, or ?token= for file downloads only
-          - a request that comes from another web site (Origin differs) is refused
+        The dashboard uses no access token. One check remains: a request that comes from
+        another web site (its Origin differs from the dashboard's own address) is refused,
+        so a page that is open in the browser cannot start jobs. Pure function.
         Returns Allowed, Status and Reason.
     #>
-    param(
-        [string]$Method, [string]$Path, [string]$ExpectedToken,
-        [string]$HeaderToken, [string]$QueryToken, [string]$Origin, [string]$RequestOrigin
-    )
-    $deny = { param($status, $reason) [pscustomobject]@{ Allowed = $false; Status = $status; Reason = $reason } }
-    if ($Origin -and $Origin -ne $RequestOrigin) { return (& $deny 403 'Request from another web site refused.') }
-    if (-not $ExpectedToken) { return (& $deny 500 'The dashboard has no access token.') }
-    $ok = Test-PmTokenEqual $HeaderToken $ExpectedToken
-    if (-not $ok -and $Method -eq 'GET' -and $Path -match '^/api/(backups/[^/]+/download|jobs/[^/]+/log|diagnostics)$') {
-        $ok = Test-PmTokenEqual $QueryToken $ExpectedToken
+    param([string]$Method, [string]$Path, [string]$Origin, [string]$RequestOrigin)
+    if ($Origin -and $Origin -ne $RequestOrigin) {
+        return [pscustomobject]@{ Allowed = $false; Status = 403; Reason = 'Request from another web site refused.' }
     }
-    if (-not $ok) { return (& $deny 401 'Unauthorized - open the dashboard on the manager itself (http://localhost:<port>/), or use the link with the token from the dashboard console.') }
     return [pscustomobject]@{ Allowed = $true; Status = 200; Reason = $null }
 }
 

@@ -7,10 +7,9 @@
     manage servers, run connectivity tests, back up / migrate / restore PRTG servers,
     and download or upload backup packages.
 
-    Every API request needs an access token (data\token.txt). Opened on the manager itself
-    (http://localhost:<port>/) the page receives the token automatically, so nothing has
-    to be typed. From another computer (-ListenAll) the link with the token is needed.
-    Requests that come from other web sites are refused.
+    The dashboard listens on localhost and uses no access token. Requests that come from
+    other web sites are refused. With -ListenAll everyone who can reach the port can use
+    the dashboard.
 
 .PARAMETER Port
     TCP port of the dashboard. Default 8765.
@@ -24,7 +23,7 @@
     Do not open the browser automatically.
 
 .PARAMETER NewToken
-    Generate a new access token (invalidates links that contain the old one).
+    Kept so older start commands still run. The dashboard uses no token.
 
 .EXAMPLE
     .\Start-PrtgMover.ps1
@@ -54,8 +53,8 @@ $Version = 'dev'
 $versionFile = Join-Path $Root 'VERSION'
 if (Test-Path $versionFile) { $Version = ([IO.File]::ReadAllText($versionFile)).Trim() }
 
-# ------------------------------------------------------------------ token
-$Token = Get-PmDashboardToken -New:$NewToken
+# The dashboard uses no access token. Remove a token left by an older version.
+Remove-Item -LiteralPath (Join-Path (Get-PmPath Data) 'token.txt') -Force -ErrorAction SilentlyContinue
 
 # ------------------------------------------------------------------ helpers
 function Send-PmResponse {
@@ -91,8 +90,7 @@ function Test-PmAuth {
     <# Returns the decision of Test-PmDashboardRequest for this request. #>
     param($Ctx)
     $req = $Ctx.Request
-    Test-PmDashboardRequest -Method $req.HttpMethod -Path $req.Url.AbsolutePath.TrimEnd('/') -ExpectedToken $Token `
-        -HeaderToken $req.Headers['X-PM-Token'] -QueryToken $req.QueryString['token'] `
+    Test-PmDashboardRequest -Method $req.HttpMethod -Path $req.Url.AbsolutePath.TrimEnd('/') `
         -Origin $req.Headers['Origin'] -RequestOrigin $req.Url.GetLeftPart([UriPartial]::Authority)
 }
 
@@ -188,19 +186,14 @@ function Invoke-PmRoute {
     if ($path -eq '') { $path = '/' }
     $method = $req.HttpMethod
 
-    # ---- static files (no token needed). The page itself gets the token only on the manager.
+    # ---- static files
     if ($method -eq 'GET' -and $path -notlike '/api/*') {
         $name = if ($path -eq '/') { 'index.html' } else { $path.TrimStart('/') }
         $file = Join-Path (Get-PmPath Web) $name
         if ($name -match '^[\w\-\.]+$' -and (Test-Path -LiteralPath $file -PathType Leaf)) {
             $types = @{ '.html' = 'text/html; charset=utf-8'; '.js' = 'application/javascript; charset=utf-8'; '.css' = 'text/css; charset=utf-8'; '.svg' = 'image/svg+xml' }
             $ct = $types[[IO.Path]::GetExtension($file)]; if (-not $ct) { $ct = 'application/octet-stream' }
-            $body = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)
-            if ($name -eq 'index.html') {
-                $give = Test-PmLocalBrowser -IsLocal $req.IsLocal -HostName $req.UserHostName
-                $body = $body.Replace('<meta name="pm-token" content="">', ('<meta name="pm-token" content="{0}">' -f $(if ($give) { $Token } else { '' })))
-            }
-            Send-PmResponse -Ctx $Ctx -Body $body -ContentType $ct
+            Send-PmResponse -Ctx $Ctx -Body ([IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)) -ContentType $ct
         } else { Send-PmJson $Ctx @{ error = 'Not found' } 404 }
         return
     }
@@ -423,8 +416,7 @@ $url = "http://localhost:$Port/"
 Write-Host ''
 Write-Host "  PRTG Mover $Version - dashboard running" -ForegroundColor Cyan
 Write-Host "  URL   : $url" -ForegroundColor Green
-if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/?token=$Token  (plain HTTP - trusted networks only)" -ForegroundColor Yellow }
-Write-Host '  Access: this computer opens the dashboard without a token; every API request is checked.'
+if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/  (plain HTTP, NO access protection - everyone who reaches this port can use the dashboard)" -ForegroundColor Yellow }
 Write-Host "  Data  : $DataRootPath"
 Write-Host '  Stop  : Ctrl+C'
 Write-Host "  Logs  : $(Join-Path (Get-PmPath Data) 'logs')  (manager, audit, robocopy) + data\jobs + data\agent\<id>\agent.log"
