@@ -65,6 +65,9 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 |---|---|
 | `Could not listen on http://+:8765/` | `-ListenAll` needs a URL ACL. Run `tools\Setup-Manager.ps1 -DashboardPort 8765` (elevated). |
 | Scripts are blocked | Run `Get-ChildItem -Recurse *.ps1,*.psm1 \| Unblock-File`, or start with `powershell -ExecutionPolicy Bypass -File …`. |
+| The shortcut opens the browser but no new window | The dashboard was already running, so it was opened instead of started again. Its window with the live log is the one that was started first (after a start with Windows it is minimized in the taskbar). |
+| `Port 8765 is used by another program` | Another program listens on that port. Start with `-Port <other port>`, or install with `-Port <other port>` so that the shortcut uses it. |
+| The dashboard does not run after a restart of the computer | Nothing starts it by itself unless you ask for it: run `install.ps1 -Autostart` once. |
 
 ## Installation
 

@@ -8,10 +8,12 @@ BeforeAll {
     # A folder name with a space, as in "C:\Program Files".
     $script:Target = Join-Path $Work 'Prtg Mover'
     $script:Links = Join-Path $Work 'links'
+    # The tests never touch the real desktop, start menu or Startup folder.
+    $script:Startup = Join-Path $Work 'startup'
     $script:Install = {
         param([string[]]$More = @())
         $list = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Root 'install.ps1')`"",
-            '-InstallPath', "`"$Target`"", '-ShortcutFolder', "`"$Links`"") + $More
+            '-InstallPath', "`"$Target`"", '-ShortcutFolder', "`"$Links`"", '-StartupFolder', "`"$Startup`"") + $More
         $out = Join-Path $Work 'install.out.txt'
         $p = Start-Process powershell -ArgumentList $list -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -RedirectStandardError (Join-Path $Work 'install.err.txt')
         [pscustomobject]@{ ExitCode = $p.ExitCode; Output = [string][IO.File]::ReadAllText($out) }
@@ -49,6 +51,49 @@ Describe 'Installer' -Skip:($env:OS -ne 'Windows_NT') {
         $s.Arguments | Should -BeLike "*$Target\Start-PrtgMover.ps1*"
         $s.Arguments | Should -Match '-Port 8765'
         $s.WorkingDirectory | Should -Be $Target
+    }
+
+    It 'does not start with Windows unless that is asked for' {
+        Test-Path -LiteralPath (Join-Path $Startup 'PRTG Mover.lnk') | Should -BeFalse
+    }
+
+    It 'leaves the start with Windows of another installation alone' {
+        New-Item -ItemType Directory -Force -Path $Startup | Out-Null
+        $lnk = Join-Path $Startup 'PRTG Mover.lnk'
+        $elsewhere = Join-Path $Work 'another installation'
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $s.Arguments = "-File `"$elsewhere\Start-PrtgMover.ps1`" -NoBrowser"; $s.WorkingDirectory = $elsewhere; $s.Save()
+
+        $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut')
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).WorkingDirectory | Should -Be $elsewhere
+
+        $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut', '-NoAutostart')
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        $r.Output | Should -Match 'another installation'
+        (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).WorkingDirectory | Should -Be $elsewhere
+        Remove-Item -LiteralPath $lnk -Force
+    }
+
+    It 'starts with Windows with -Autostart, keeps that on an update and removes it with -NoAutostart' {
+        $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut', '-Autostart')
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        $lnk = Join-Path $Startup 'PRTG Mover.lnk'
+        Test-Path -LiteralPath $lnk | Should -BeTrue
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        $s.Arguments | Should -BeLike "*$Target\Start-PrtgMover.ps1*"
+        $s.Arguments | Should -Match '-NoBrowser'
+        $s.WindowStyle | Should -Be 7
+
+        $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut')
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        $r.Output | Should -Match 'the dashboard starts when you log on'
+        Test-Path -LiteralPath $lnk | Should -BeTrue
+
+        $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut', '-NoAutostart')
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        Test-Path -LiteralPath $lnk | Should -BeFalse
     }
 
     It 'an update keeps the server list and the backups and repairs the program' {
@@ -101,30 +146,40 @@ Describe 'Installer' -Skip:($env:OS -ne 'Windows_NT') {
         foreach ($i in 'Start-PrtgMover.ps1', 'VERSION') { Copy-Item -LiteralPath (Join-Path $Root $i) -Destination $bad }
         [IO.File]::WriteAllText((Join-Path $bad 'src\broken.ps1'), 'function Broken { if (')
         $other = Join-Path $Work 'damaged target'
-        $list = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Root 'install.ps1')`"", '-InstallPath', "`"$other`"", '-Source', "`"$bad`"", '-NoStart', '-NoShortcut')
+        $list = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Root 'install.ps1')`"", '-InstallPath', "`"$other`"", '-Source', "`"$bad`"", '-NoStart', '-NoShortcut', '-StartupFolder', "`"$Startup`"")
         $p = Start-Process powershell -ArgumentList $list -Wait -PassThru -WindowStyle Hidden -RedirectStandardError (Join-Path $Work 'damaged.err.txt') -RedirectStandardOutput (Join-Path $Work 'damaged.out.txt')
         $p.ExitCode | Should -Not -Be 0
         [IO.File]::ReadAllText((Join-Path $Work 'damaged.err.txt')) | Should -Match 'is damaged'
     }
 
-    It 'uninstall removes the program and the shortcut and keeps the data' {
+    It 'uninstall removes the program and the shortcuts and keeps the data' {
+        New-Item -ItemType Directory -Force -Path $Startup | Out-Null
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $Startup 'PRTG Mover.lnk'))
+        $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'; $s.WorkingDirectory = $Target; $s.Save()
+
         $r = & $Install @('-Uninstall')
         $r.ExitCode | Should -Be 0 -Because $r.Output
         Test-Path -LiteralPath (Join-Path $Links 'PRTG Mover.lnk') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $Startup 'PRTG Mover.lnk') | Should -BeFalse
         foreach ($f in 'Start-PrtgMover.ps1', 'src', 'web', 'agent', 'tools', 'VERSION') { Test-Path -LiteralPath (Join-Path $Target $f) | Should -BeFalse -Because "$f is a program file" }
         Test-Path -LiteralPath (Join-Path $Target 'config\servers.json') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $Target 'backups\PRTG_TEST_20260101-000000.zip') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $Target 'data\jobs.keep') | Should -BeTrue
     }
 
-    It 'uninstall of a folder without PRTG Mover removes nothing' {
+    It 'uninstall of a folder without PRTG Mover removes nothing, also not the shortcut of another installation' {
         $other = Join-Path $Work 'something else'
-        New-Item -ItemType Directory -Force -Path (Join-Path $other 'src') | Out-Null
+        New-Item -ItemType Directory -Force -Path (Join-Path $other 'src'), $Links | Out-Null
         [IO.File]::WriteAllText((Join-Path $other 'src\mine.txt'), 'x')
-        $list = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Root 'install.ps1')`"", '-InstallPath', "`"$other`"", '-ShortcutFolder', "`"$Links`"", '-Uninstall')
+        $foreign = Join-Path $Links 'PRTG Mover.lnk'
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($foreign)
+        $s.TargetPath = Join-Path $env:SystemRoot 'System32\cmd.exe'; $s.WorkingDirectory = (Join-Path $Work 'another installation'); $s.Save()
+
+        $list = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Root 'install.ps1')`"", '-InstallPath', "`"$other`"", '-ShortcutFolder', "`"$Links`"", '-StartupFolder', "`"$Startup`"", '-Uninstall')
         $p = Start-Process powershell -ArgumentList $list -Wait -PassThru -WindowStyle Hidden
         $p.ExitCode | Should -Be 0
         Test-Path -LiteralPath (Join-Path $other 'src\mine.txt') | Should -BeTrue
+        Test-Path -LiteralPath $foreign | Should -BeTrue
     }
 }
 

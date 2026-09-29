@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.1 — 2026-09-29
+
+### Fixed
+- **Starting the dashboard a second time** (for example with the shortcut while it is already running) opened a window that reported an error and nothing else happened. Now the running dashboard is opened in the browser and the second start ends without an error.
+- A port that is used by another program is reported as such, with the hint to choose another port.
+- `Start-PrtgMover.cmd` only waits for a key when the start failed.
+
+### Added
+- `install.ps1 -Autostart` starts the dashboard when you log on to Windows (shortcut in the Startup folder, minimized, without opening the browser). An update keeps it, `-NoAutostart` switches it off, `-Uninstall` removes it.
+- `/api/info` names the product, so a running dashboard can be recognised.
+
+### Changed
+- `install.ps1 -Uninstall` only removes shortcuts that belong to the installation it removes. A shortcut that starts PRTG Mover from another folder is left alone.
+
 ## 1.7.0 — 2026-09-29
 
 ### Added

@@ -43,6 +43,38 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Root = $PSScriptRoot
+
+# A dashboard that already runs on this port is opened, not started a second time.
+function Test-PortInUse {
+    $c = New-Object Net.Sockets.TcpClient
+    try { return ($c.ConnectAsync('127.0.0.1', $Port).Wait(500) -and $c.Connected) } catch { return $false } finally { $c.Close() }
+}
+function Get-RunningDashboard {
+    <# Version of the PRTG Mover dashboard that answers on the port, or $null. Waits for one that is still starting. #>
+    param([int]$WaitSeconds = 0)
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    do {
+        try {
+            $i = Invoke-RestMethod -Uri "http://localhost:$Port/api/info" -TimeoutSec 5
+            if ($i -and ($i.product -eq 'PRTG Mover' -or (-not $i.PSObject.Properties['product'] -and $i.PSObject.Properties['backupsPath']))) { return [string]$i.version }
+        } catch { }
+        if ((Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+    } while ((Get-Date) -lt $deadline)
+    return $null
+}
+function Open-RunningDashboard {
+    param([string]$RunningVersion)
+    Write-Host "PRTG Mover $RunningVersion is already running: http://localhost:$Port/" -ForegroundColor Green
+    if (-not $NoBrowser) { Start-Process "http://localhost:$Port/" }
+    exit 0
+}
+if (Test-PortInUse) {
+    $other = Get-RunningDashboard -WaitSeconds 5
+    if ($other) { Open-RunningDashboard $other }
+    Write-Host "Port $Port is used by another program. Start PRTG Mover on another port: .\Start-PrtgMover.ps1 -Port 8766" -ForegroundColor Red
+    exit 1
+}
+
 # Echo live job logs into this console (use -Quiet to turn it off).
 if (-not $Quiet) { $env:PRTGMOVER_ECHO = '1' }
 Import-Module (Join-Path $Root 'src\PrtgMover.psm1') -Force -DisableNameChecking
@@ -196,7 +228,7 @@ function Invoke-PmRoute {
     switch -Regex ("$method $path") {
         '^GET /api/info$' {
             Send-PmJson $Ctx @{
-                version = $Version; manager = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; root = $DataRootPath
+                product = 'PRTG Mover'; version = $Version; manager = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; root = $DataRootPath
                 backupsPath = (Get-PmPath Backups); installersPath = (Get-PmPath Installers)
                 servers = @(Get-PmServers).Count; backups = @(Get-PmBackups).Count
             }
@@ -393,7 +425,10 @@ $prefix = if ($ListenAll) { "http://+:$Port/" } else { "http://localhost:$Port/"
 $listener.Prefixes.Add($prefix)
 try { $listener.Start() }
 catch {
-    Write-Host "Could not listen on $prefix : $($_.Exception.Message)" -ForegroundColor Red
+    $why = $_.Exception.Message
+    # Two starts at the same moment (shortcut and start with Windows): the other one took the port while this one was loading.
+    if (Test-PortInUse) { $other = Get-RunningDashboard -WaitSeconds 20; if ($other) { Open-RunningDashboard $other } }
+    Write-Host "Could not listen on $prefix : $why" -ForegroundColor Red
     if ($ListenAll) { Write-Host "Run as administrator: .\tools\Setup-Manager.ps1 -DashboardPort $Port   (creates the URL ACL)" -ForegroundColor Yellow }
     exit 1
 }
