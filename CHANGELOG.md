@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.1 — 2026-09-29
+
+### Fixed
+- After a migration PRTG only answered on `127.0.0.1`, because the web server was still bound to the source's IP address. Restore now binds it to the target's own address.
+- **Fix PRTG IP** (job type `rebind`) repairs a server that was already migrated. The binding is changed while PRTG is stopped, because the core writes its settings back when it stops.
+- The connectivity test shows the addresses PRTG listens on, and restore warns when PRTG is only reachable locally.
+- A 32-bit overflow in the progress line stopped a transfer after 2 GB on the wire. Progress reporting can no longer stop a transfer.
+
 ## 1.5.0 — 2026-09-29
 
 ### Added

@@ -549,11 +549,13 @@ function Get-PmLicenseFiles {
 
 function Get-PmReboundIpList {
     <# "a,b" -> the same list with addresses that do not exist locally replaced by $Own; 127.0.0.1 is always kept. #>
-    param([string]$Current, [string[]]$Local = @(), [string]$Own)
+    param([string]$Current, [string[]]$Local = @(), [string]$Own, [switch]$AddOwn)
     $new = @()
     foreach ($ip in ($Current -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         if ($ip -eq '127.0.0.1' -or $Local -contains $ip) { $new += $ip } elseif ($Own) { $new += $Own }
     }
+    # -AddOwn: PRTG itself drops addresses it cannot bind at start-up, leaving only 127.0.0.1.
+    if ($AddOwn -and $Own -and -not @($new | Where-Object { $_ -ne '127.0.0.1' }).Count) { $new = @($Own) + $new }
     if ($new -notcontains '127.0.0.1') { $new += '127.0.0.1' }
     return (@($new | Select-Object -Unique) -join ',')
 }
@@ -565,7 +567,7 @@ function Set-PmPrtgWebBinding {
         PRTG then only listens on 127.0.0.1. Addresses that do not exist on this server are
         replaced by this server's own address. Nothing is changed when every address exists.
     #>
-    param([string]$TargetAddress)
+    param([string]$TargetAddress, [bool]$AddOwn = $false, [bool]$CheckOnly = $false)
     $local = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.IPAddress })
     $own = if ($TargetAddress -and $local -contains $TargetAddress) { $TargetAddress }
     else { $local | Where-Object { $_ -ne '127.0.0.1' -and $_ -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)' } | Select-Object -First 1 }
@@ -576,10 +578,11 @@ function Set-PmPrtgWebBinding {
         $p = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
         if ($p.UseIPs -ne 'owioSpecIPs' -or -not $p.IPs) { continue }
         $before = [string]$p.IPs
-        $after = Get-PmReboundIpList -Current $before -Local $local -Own $own
-        if ($after -ne $before) { Set-ItemProperty -Path $key -Name 'IPs' -Value $after; $changed = $true }
+        $after = Get-PmReboundIpList -Current $before -Local $local -Own $own -AddOwn:$AddOwn
+        if ($after -ne $before) { if (-not $CheckOnly) { Set-ItemProperty -Path $key -Name 'IPs' -Value $after }; $changed = $true }
     }
-    if ($changed) { Write-PmLog "PRTG web server was bound to the source's address(es) ($before) - now bound to this server: $after" 'OK' }
+    if ($CheckOnly) { return [pscustomobject]@{ PmType = 'binding'; Changed = $changed; Before = $before; After = $after } }
+    if ($changed) { Write-PmLog "PRTG web server binding changed from '$before' to '$after' (addresses of this server)." 'OK' }
     elseif ($before) { Write-PmLog "PRTG web server binding is valid for this server ($before)." 'OK' }
     else { Write-PmLog 'PRTG web server listens on all addresses (no specific binding).' 'OK' }
     [pscustomobject]@{ PmType = 'binding'; Changed = $changed; Before = $before; After = $after }
@@ -593,20 +596,29 @@ function Repair-PmPrtgBinding {
     if (-not $prtg.Installed) { throw 'PRTG is not installed on this server.' }
     Write-PmLog "PRTG currently listens on: $(@($prtg.ListenEndpoints) -join ', ')"
     Write-PmProgress 10 'Adjusting web server binding'
-    $bx = @{}
-    Set-PmPrtgWebBinding -TargetAddress $TargetAddress | ForEach-Object { if ($_.PmType -eq 'binding') { $bx.B = $_ } else { $_ } }
+    $bx = @{ B = (Set-PmPrtgWebBinding -TargetAddress $TargetAddress -AddOwn $true -CheckOnly $true) }
     $health = $null
+    if (-not $bx.B.Changed) { Write-PmLog "PRTG web server binding needs no change ($($bx.B.Before))." 'OK' }
     if ($bx.B.Changed) {
-        Write-PmProgress 30 'Restarting PRTG'
-        Write-PmLog 'Restarting PRTG so the new binding takes effect...' 'STEP'
+        # Order matters: the core writes its settings back to the registry when it stops,
+        # so the binding must be changed while PRTG is stopped.
+        Write-PmProgress 20 'Stopping PRTG'
+        Write-PmLog 'Stopping PRTG (the binding can only be changed while the core is stopped)...' 'STEP'
         Stop-PmPrtgServices
+        Write-PmProgress 40 'Adjusting web server binding'
+        Set-PmPrtgWebBinding -TargetAddress $TargetAddress -AddOwn $true | ForEach-Object { if ($_.PmType -eq 'binding') { $bx.B = $_ } else { $_ } }
+        Write-PmProgress 50 'Starting PRTG'
         $box = @{}
         Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
         $health = $box.Health
         if (-not $health.Healthy) { throw "PRTG did not come up completely after the restart ($($health.Message))." }
     }
     $after = Get-PmPrtgInfo
-    Write-PmLog "PRTG now listens on: $(@($after.ListenEndpoints) -join ', ')" 'OK'
+    $outside = @($after.ListenEndpoints | Where-Object { $_ -notmatch '^(127\.0\.0\.1|::1):' })
+    $reg = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Webserver' -ErrorAction SilentlyContinue)
+    Write-PmLog "Registry after start: UseIPs=$($reg.UseIPs) IPs=$($reg.IPs) Ports=$($reg.Ports)" 'DEBUG'
+    if ($outside.Count) { Write-PmLog "PRTG now listens on: $(@($after.ListenEndpoints) -join ', ')" 'OK' }
+    else { Write-PmLog "PRTG still only listens on this server itself: $(@($after.ListenEndpoints) -join ', ') (registry IPs=$($reg.IPs)). Set the web server IP in the PRTG Administration Tool on the server." 'ERROR' }
     Write-PmProgress 100 'Done'
     New-PmResult @{ Changed = $bx.B.Changed; Before = $bx.B.Before; After = $bx.B.After; ListenEndpoints = @($after.ListenEndpoints); Core = $after.CoreStatus; Probe = $after.ProbeStatus }
 }
