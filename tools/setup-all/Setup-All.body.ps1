@@ -49,14 +49,17 @@ try {
     if (-not $SkipPrtgMover) {
         Step "PRTG Mover -> $PrtgMoverPath"
         $run = Get-Dashboard $PrtgMoverPath 'Start-PrtgMover.ps1'
-        if ($run.Count) {
-            $busy = 0
-            try { $busy = @(Invoke-RestMethod "http://localhost:$PrtgMoverPort/api/jobs" -TimeoutSec 5 | ForEach-Object { $_ } | Where-Object { $_.status -in 'running', 'queued' }).Count } catch { }
-            if ($busy) { throw "PRTG Mover is working on $busy job(s) right now. Run the setup again when they are finished." }
-            $run | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-            Start-Sleep -Seconds 1
-            Ok 'the running dashboard was stopped for the update (no job was running)'
+        foreach ($d in $run) {
+            # A dashboard is only stopped when it says itself that no job is running. No answer means: do not touch it.
+            $port = if ($d.CommandLine -match '-Port\s+(\d+)') { [int]$Matches[1] } else { 8765 }
+            try { $jobs = @(Invoke-RestMethod "http://localhost:$port/api/jobs" -TimeoutSec 15 | ForEach-Object { $_ }) }
+            catch { throw "PRTG Mover is running (process $($d.ProcessId)) and does not answer on port $port, so it is not known whether a job is running. Nothing was changed. Close the dashboard yourself and run the setup again." }
+            $busy = @($jobs | Where-Object { $_.status -in 'running', 'queued' }).Count
+            if ($busy) { throw "PRTG Mover is working on $busy job(s) right now. Nothing was changed. Run the setup again when they are finished." }
+            Stop-Process -Id $d.ProcessId -Force -ErrorAction SilentlyContinue
+            Ok "the running dashboard on port $port was stopped for the update (no job was running)"
         }
+        if ($run.Count) { Start-Sleep -Seconds 1 }
         $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tmp\files\PrtgMover\install.ps1`"", '-Source', "`"$tmp\files\PrtgMover`"", '-InstallPath', "`"$PrtgMoverPath`"", '-Port', $PrtgMoverPort)
         if (-not $NoAutostart) { $a += '-Autostart' }
         if ($NoShortcut) { $a += '-NoShortcut' }
@@ -102,8 +105,13 @@ try {
         } finally { if (-not $t.HasExited) { Stop-Process -Id $t.Id -Force -ErrorAction SilentlyContinue } }
         Ok "program files copied and tested (version $(([IO.File]::ReadAllText("$VpnWatchPath\VERSION")).Trim()))"
 
-        if ($NoShortcut) { Write-Host '    shortcut and start with Windows skipped (-NoShortcut)' }
-        else {
+        if ($NoShortcut) {
+            # the shortcut and the start with Windows of VPN Watch are created together by its own installer
+            Note 'VPN Watch: no shortcut and no start with Windows (-NoShortcut)'
+            if (-not $NoStart) {
+                Start-Process -FilePath $ps -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$VpnWatchPath\Open-VpnWatch.ps1`"", '-Port', $VpnWatchPort)
+            }
+        } else {
             $own = 0
             if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) {
                 try { $own += @(Get-VpnConnection -AllUserConnection -ErrorAction Stop).Count } catch { }

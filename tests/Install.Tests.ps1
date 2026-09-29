@@ -247,3 +247,14 @@ Describe 'Setup-All: one file for PRTG Mover and VPN Watch' -Skip:($env:OS -ne '
         Test-Path -LiteralPath (Join-Path $Work 'vw target\data\token.txt') | Should -BeFalse
     }
 }
+
+Describe 'Setup-All never stops a dashboard it cannot ask' {
+    It 'stops a running dashboard only after it answered that no job is running' {
+        $body = [IO.File]::ReadAllText((Join-Path $Root 'tools\setup-all\Setup-All.body.ps1'))
+        $guard = $body.Substring($body.IndexOf('foreach ($d in $run)'))
+        $guard = $guard.Substring(0, $guard.IndexOf('Stop-Process'))
+        $guard | Should -Match 'catch \{ throw'
+        $guard.Contains('$d.CommandLine -match') | Should -BeTrue -Because 'the port is taken from the running process'
+        $guard | Should -Match 'if \(\$busy\) \{ throw'
+    }
+}
