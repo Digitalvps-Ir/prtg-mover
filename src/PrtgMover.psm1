@@ -1141,6 +1141,7 @@ function Invoke-PmTransferFiles {
             try { $pool.Dispose() } catch { }
         }
         if ($state.Failed) { throw $(if ($state.Error) { $state.Error } else { 'The parallel transfer was interrupted.' }) }
+        & $report
     } else {
         # ---------------- sequential (single stream / RDP agent)
         $b = 0
@@ -1159,7 +1160,6 @@ function Invoke-PmTransferFiles {
             & $report
         }
     }
-    & $report
     Add-PmJobLog -Job $Job -Level OK -Message ("{0} {1} complete: {2:N2} GB of data in {3:hh\:mm\:ss} ({4:N2} GB on the wire, {5:N1} MB/s effective)." -f $Direction, $Label, ($state.DoneBytes / 1GB), $sw.Elapsed, ($state.Wire / 1GB), (($state.DoneBytes / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)))
 }
 

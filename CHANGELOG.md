@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.5.0 — 2026-09-29
+
+### Added
+- **WinRM transfer without disk space on the source**: the manager pulls the files straight from the VSS snapshot. The target receives the staged files and **moves** them into place, so it needs no second copy of the data.
+- **Compressed chunks**: files travel as compressed chunks of about 256 MB of data (PRTG data compresses roughly 7x).
+- **Parallel streams**: several chunks travel at once, each over its own connection (default 4, `TransferStreams` in the dashboard, `-Streams` in the CLI). Streams reconnect after a broken session and retry a chunk up to 4 times.
+- Transfers are resumable per file, and every chunk is verified (size after transfer, file count after unpacking).
+- Snapshots left behind by interrupted runs are removed before a new one is created. Other snapshots are never touched.
+- Chunk compression on servers runs below normal priority, so a running PRTG keeps its CPU.
+- The manager waits for a WinRM HTTPS certificate that is not valid yet because the manager's clock is behind.
+
+### Fixed
+- A partial staging copy was treated as complete on Resume. A copy now counts as complete only after the transfer finished and `PRTG Configuration.dat` matches the source checksum.
+- Hidden and system files could not be transferred over WinRM. `desktop.ini` and `Thumbs.db` are skipped.
+- Pulling removes local files that are not part of the transfer (logs, cache and temp files of earlier runs).
+
 ## 1.4.0 — 2026-09-29
 
 ### Added
