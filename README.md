@@ -115,7 +115,7 @@ The code that runs on the servers (`src\Remote\PrtgMover.Remote.ps1`) is sent wi
 |---|---|
 | **Manager** | Windows 10/11 or Windows Server 2012 R2+, Windows PowerShell 5.1, network access to the servers on TCP 5985 (or 5986), enough free disk space for the backups. |
 | **Source / target** | Windows Server 2012 R2 – 2025 with PowerShell 5.1, WinRM enabled (see below), an administrator account, and free disk space of about **2 × the PRTG data folder** (staging + zip). |
-| **PRTG** | Same or newer version on the target as on the source. If PRTG isn't installed on the target, upload the installer in the dashboard and it's installed silently. |
+| **PRTG** | Only needed on the source. When the target has no PRTG, the **program itself is cloned** from the source (program files and Windows services, same version), so no installer is needed. If PRTG is already on the target, it must be the same version or newer. |
 
 ## Installation
 

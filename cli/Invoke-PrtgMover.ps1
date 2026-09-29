@@ -43,6 +43,7 @@ param(
     [switch]$ConnectVpn,
     [switch]$AllowDowngrade,
     [switch]$AllowSourceStop,
+    [switch]$NoProgramClone,
     [switch]$NoLicense,
     [switch]$NoFirewall,
     [switch]$SkipPreflight,
@@ -69,7 +70,7 @@ $options = @{
     ExtraPaths = $ExtraPaths; StartServices = -not $NoStart; HealthTimeoutMinutes = $HealthTimeoutMinutes
     ConnectVpn = [bool]$ConnectVpn; AllowDowngrade = [bool]$AllowDowngrade
     RestorePrtg = -not $NoPrtg; RestoreVpn = -not $NoVpn; RestoreDesktop = -not $NoDesktop; RestoreExtra = $true
-    NoTouch = -not $AllowSourceStop; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
+    NoTouch = -not $AllowSourceStop; IncludeProgram = -not $NoProgramClone; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
 }
 if ($InstallerFile) { $options.InstallerFile = $InstallerFile }
 

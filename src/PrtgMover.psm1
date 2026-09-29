@@ -13,7 +13,7 @@ $script:PmJobs = [hashtable]::Synchronized(@{})
 $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
-$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes'
+$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram'
 $script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall'
 
 # ======================================================================= paths
@@ -602,7 +602,8 @@ function Invoke-PmPreflight {
                 $sv = [version]($src.Prtg.Version -replace '[^\d\.]', ''); $tv = [version]($ti.Prtg.Version -replace '[^\d\.]', '')
                 if ($tv -lt $sv -and -not $Options.AllowDowngrade) { $problems += "$($t.name): PRTG $tv is older than source $sv - upgrade the target first." }
             } elseif (-not $ti.Prtg.Installed -and -not $Options.InstallerFile) {
-                $problems += "$($t.name): PRTG is not installed and no installer was selected."
+                if ($Options.ContainsKey('IncludeProgram') -and -not $Options.IncludeProgram) { $problems += "$($t.name): PRTG is not installed, program cloning is off and no installer was selected." }
+                else { Add-PmJobLog -Job $Job -Level INFO -Message "$($t.name): PRTG not installed - it will be CLONED from the source (program files + services, no installer)." }
             }
         }
     }

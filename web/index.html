@@ -84,6 +84,7 @@
           <p class="hint">Leave all targets unchecked to create a backup only.</p>
           <h2 class="mt">3 · What to include</h2>
           <label class="check"><input type="checkbox" name="IncludePrtg" checked> PRTG (configuration, registry, certificates, custom sensors, lookups, MIBs…)</label>
+          <label class="check sub"><input type="checkbox" name="IncludeProgram" checked> Clone the <b>PRTG program itself</b> (program files + services) — targets without PRTG need no installer</label>
           <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source <b>license</b> to the target(s)</label>
           <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> Historic monitoring data &amp; logs</label>
           <label class="check"><input type="checkbox" name="IncludeVpn" checked> Windows VPN connections (all-user + per-user phonebooks)</label>
@@ -108,7 +109,7 @@
           <label class="field inline"><span>Health-check timeout (minutes)</span><input type="number" name="HealthTimeoutMinutes" value="15" min="1" max="120"></label>
           <label class="check"><input type="checkbox" name="ConnectVpn"> Dial the VPN connections after restore</label>
           <label class="check"><input type="checkbox" name="AllowDowngrade"> Allow restoring onto an older PRTG version (not recommended)</label>
-          <label class="field"><span>PRTG installer for targets without PRTG</span><select name="InstallerFile"><option value="">— none (PRTG must already be installed) —</option></select></label>
+          <label class="field"><span>PRTG installer (optional — only if you prefer a fresh install over the clone)</span><select name="InstallerFile"><option value="">— none (use the clone) —</option></select></label>
           <label class="field"><span>Installer arguments</span><input name="InstallerArgs" value="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"></label>
           <div class="upload-row">
             <label class="btn small">Upload installer<input type="file" id="installerUpload" accept=".exe,.zip" hidden></label>

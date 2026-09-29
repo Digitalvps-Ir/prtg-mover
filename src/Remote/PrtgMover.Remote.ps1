@@ -424,7 +424,8 @@ function Invoke-PmRemoteBackup {
         [string[]]$ExtraPaths = @(),
         [ValidateSet('Restart', 'KeepStopped', 'Disable')][string]$SourceAfter = 'Restart',
         [bool]$NoTouch = $false,
-        [int]$HealthTimeoutMinutes = 15
+        [int]$HealthTimeoutMinutes = 15,
+        [bool]$IncludeProgram = $true
     )
     $ErrorActionPreference = 'Stop'
     $sourceHealth = $null
@@ -500,6 +501,31 @@ function Invoke-PmRemoteBackup {
                 }
                 Write-PmLog "Program customisation folders: $($copiedFolders -join ', ')" 'OK'
 
+                # ---- full program clone: lets a target without PRTG run it without any installer
+                $programCloned = $false; $services = @()
+                if ($IncludeProgram) {
+                    Write-PmProgress 38 'PRTG: cloning program files and services'
+                    $progSource = $prtg.ProgramPath
+                    if ($shadow -and $prtg.ProgramPath.StartsWith($shadow.Volume, [StringComparison]::OrdinalIgnoreCase)) {
+                        $progSource = Join-Path $shadow.Link $prtg.ProgramPath.Substring($shadow.Volume.Length)
+                    }
+                    $code = Invoke-PmRobocopy -Source $progSource -Destination (Join-Path $stage 'prtg\programfull')
+                    if (Test-PmRobocopyOk $code) {
+                        $programCloned = $true
+                        Write-PmLog ("Complete PRTG program folder cloned ({0:N0} MB) - the target needs no installer." -f ((Get-PmDirectorySize (Join-Path $stage 'prtg\programfull')) / 1MB)) 'OK'
+                    } else { Write-PmLog "Program folder clone failed (robocopy $code) - the target will need the PRTG installer." 'WARN' }
+                    $svcDir = Join-Path $stage 'prtg\services'
+                    New-Item -ItemType Directory -Force -Path $svcDir | Out-Null
+                    foreach ($n in $PmCoreService, $PmProbeService) {
+                        $w = Get-CimInstance Win32_Service -Filter "Name='$n'" -ErrorAction SilentlyContinue
+                        if (-not $w) { continue }
+                        [void](Invoke-PmReg -Verb export -Key "HKLM\SYSTEM\CurrentControlSet\Services\$n" -File (Join-Path $svcDir "$n.reg"))
+                        $services += [ordered]@{ name = $w.Name; displayName = $w.DisplayName; pathName = $w.PathName; startMode = $w.StartMode; startName = $w.StartName; description = $w.Description }
+                    }
+                    Write-PmLog "Service definitions saved: $(@($services | ForEach-Object { $_.name }) -join ', ')" 'OK'
+                }
+                $netRelease = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
+
                 Write-PmProgress 40 'PRTG: exporting registry'
                 $regDir = Join-Path $stage 'prtg\registry'
                 New-Item -ItemType Directory -Force -Path $regDir | Out-Null
@@ -520,6 +546,7 @@ function Invoke-PmRemoteBackup {
                     includeHistory = $IncludeHistory; programFolders = $copiedFolders; registryFiles = $regFiles
                     listenPorts = $prtg.ListenPorts; configSha256 = $cfgHash; configSize = $cfgInfo.Length; configStats = $cfgStats
                     licenseValueNames = $licNames; licenseFiles = $licFiles
+                    programCloned = $programCloned; services = $services; netFrameworkRelease = $netRelease
                     consistency = $(if ($NoTouch) { if ($shadow) { 'vss-snapshot' } else { 'live-copy' } } else { 'services-stopped' })
                 }
             } finally {
@@ -701,8 +728,35 @@ function Invoke-PmRemoteRestore {
         try {
             Write-PmProgress 15 'PRTG: checking installation'
             $prtg = Get-PmPrtgInfo
+            $cloneDir = Join-Path $stage 'prtg\programfull'
+            if (-not $prtg.Installed -and -not $InstallerPath -and $manifest.prtg.programCloned -and (Test-Path -LiteralPath $cloneDir)) {
+                # ---- clone install: same program files + same Windows services as the source
+                $progPath = [string]$manifest.prtg.programPath
+                $q = Split-Path $progPath -Qualifier -ErrorAction SilentlyContinue
+                if (-not $q -or -not (Test-Path "$q\")) { $progPath = Join-Path ${env:ProgramFiles(x86)} 'PRTG Network Monitor' }
+                Write-PmLog "PRTG is not installed here - installing the CLONED program files from the source to $progPath (no installer needed)..." 'STEP'
+                $code = Invoke-PmRobocopy -Source $cloneDir -Destination $progPath
+                if (-not (Test-PmRobocopyOk $code)) { throw "Copying the PRTG program files failed (robocopy $code)." }
+                $srcNet = [int]$manifest.prtg.netFrameworkRelease
+                $dstNet = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
+                if ($srcNet -and $dstNet -lt $srcNet) { Write-PmLog ".NET Framework on target (release $dstNet) is older than on the source ($srcNet). If PRTG does not start, install the same .NET Framework version." 'WARN' }
+                foreach ($svc in @($manifest.prtg.services)) {
+                    $bin = ([string]$svc.pathName).Replace([string]$manifest.prtg.programPath, $progPath)
+                    if (Get-Service -Name $svc.name -ErrorAction SilentlyContinue) { & sc.exe delete $svc.name | Out-Null; Start-Sleep -Seconds 2 }
+                    $np = @{ Name = $svc.name; BinaryPathName = $bin; DisplayName = $svc.displayName; StartupType = 'Automatic' }
+                    if ($svc.description) { $np.Description = $svc.description }
+                    New-Service @np | Out-Null
+                    $regFile = Join-Path $stage "prtg\services\$($svc.name).reg"
+                    if ($bin -eq $svc.pathName -and (Test-Path -LiteralPath $regFile)) { [void](Invoke-PmReg -Verb import -File $regFile) }   # recovery options etc.
+                    if ($svc.startName -and $svc.startName -ne 'LocalSystem') { Write-PmLog "Service $($svc.name) ran as '$($svc.startName)' on the source - it now runs as LocalSystem; change it in services.msc if required." 'WARN' }
+                    Write-PmLog "Service created: $($svc.name) -> $bin" 'OK'
+                }
+                $prtg = Get-PmPrtgInfo
+                if (-not $prtg.Installed) { throw 'PRTG services could not be created from the clone.' }
+                Write-PmLog "PRTG $($prtg.Version) cloned from the source and registered." 'OK'
+            }
             if (-not $prtg.Installed) {
-                if (-not $InstallerPath) { throw 'PRTG is not installed on this server and no installer was supplied. Install the same PRTG version (or upload the installer in the dashboard) and run the restore again.' }
+                if (-not $InstallerPath) { throw 'PRTG is not installed on this server, the package has no program clone and no installer was supplied. Upload the installer in the dashboard and run the restore again.' }
                 $exe = $InstallerPath
                 if ($InstallerPath -like '*.zip') {
                     $instDir = Join-Path $WorkRoot "installer\$JobId"

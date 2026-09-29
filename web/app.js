@@ -239,7 +239,7 @@
   $('#targetList').addEventListener('change', updateMigrateButton);
 
   function renderInstallers() {
-    const opts = '<option value="">— none (PRTG must already be installed) —</option>' + state.installers.map((i) => `<option>${esc(i.name)}</option>`).join('');
+    const opts = '<option value="">— none (use the clone) —</option>' + state.installers.map((i) => `<option>${esc(i.name)}</option>`).join('');
     $$('select[name="InstallerFile"]').forEach((sel) => { const v = sel.value; sel.innerHTML = opts; sel.value = v; });
   }
   async function loadInstallers() { state.installers = arr(await api('GET', '/api/installers')); renderInstallers(); }
@@ -252,7 +252,7 @@
     const options = {
       IncludePrtg: f.IncludePrtg.checked, IncludeHistory: f.IncludeHistory.checked, IncludeVpn: f.IncludeVpn.checked, IncludeDesktop: f.IncludeDesktop.checked,
       ExtraPaths: f.ExtraPaths.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-      NoTouch: f.NoTouch.checked, CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked,
+      NoTouch: f.NoTouch.checked, IncludeProgram: f.IncludeProgram.checked, CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked,
       StartServices: f.StartServices.checked, HealthTimeoutMinutes: Number(f.HealthTimeoutMinutes.value) || 15, ConnectVpn: f.ConnectVpn.checked,
       AllowDowngrade: f.AllowDowngrade.checked, InstallerFile: f.InstallerFile.value, InstallerArgs: f.InstallerArgs.value,
       RestorePrtg: true, RestoreVpn: true, RestoreDesktop: true, RestoreExtra: true,

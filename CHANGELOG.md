@@ -3,6 +3,7 @@
 ## 1.2.0 — 2026-09-29
 
 ### Added
+- **Full PRTG clone**: the complete program folder and the Windows service definitions (with recovery options) are packaged. A target **without PRTG needs no installer**: files are copied, the services are created and the .NET version is checked. An uploaded installer is still used if you select one.
 - **RDP connection method (agent)**, now the default. It needs no WinRM and makes no configuration change on the server:
   - The dashboard opens Remote Desktop with the manager's drive redirected. A one-line command (copied to the clipboard) starts `agent\PrtgMover-Agent.ps1` in an elevated PowerShell.
   - The agent runs the same payload and talks to the manager over files in the redirected drive (requests, streamed JSON-lines responses, heartbeat from a background thread).
