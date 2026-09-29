@@ -13,8 +13,8 @@ $script:PmJobs = [hashtable]::Synchronized(@{})
 $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
-$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter'
-$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn'
+$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes'
+$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall'
 
 # ======================================================================= paths
 
@@ -91,13 +91,14 @@ function Set-PmServer {
         [bool]$SkipCaCheck = $false,
         [ValidateSet('Default', 'Negotiate', 'Kerberos', 'Basic', 'CredSSP')][string]$Authentication = 'Default',
         [string]$Role = 'both',
-        [string]$Notes = ''
+        [string]$Notes = '',
+        [ValidateRange(1, 65535)][int]$RdpPort = 3389
     )
     if (-not $Id) { $Id = ([guid]::NewGuid().ToString('N')).Substring(0, 10) }
     $all = @(Get-PmServers | Where-Object { $_.id -ne $Id })
     $srv = [pscustomobject][ordered]@{
         id = $Id; name = $Name; host = $HostName; port = $Port; useSsl = $UseSsl; skipCaCheck = $SkipCaCheck
-        authentication = $Authentication; role = $Role; notes = $Notes
+        authentication = $Authentication; role = $Role; notes = $Notes; rdpPort = $RdpPort
     }
     Save-PmServers -Servers ($all + $srv)
     return $srv
@@ -134,6 +135,66 @@ function Remove-PmCredential {
 function New-PmCredential {
     param([Parameter(Mandatory)][string]$UserName, [Parameter(Mandatory)][string]$Password)
     New-Object System.Management.Automation.PSCredential($UserName, (ConvertTo-SecureString $Password -AsPlainText -Force))
+}
+
+# ======================================================================= network / RDP
+
+function Test-PmTcpPort {
+    param([Parameter(Mandatory)][string]$HostName, [Parameter(Mandatory)][int]$Port, [int]$TimeoutMs = 3000)
+    $c = New-Object Net.Sockets.TcpClient
+    try { return [bool]$c.ConnectAsync($HostName, $Port).Wait($TimeoutMs) } catch { return $false } finally { $c.Dispose() }
+}
+
+function Get-PmWinRmPort {
+    param([Parameter(Mandatory)]$Server)
+    if ([int]$Server.port -gt 0) { return [int]$Server.port }
+    if ($Server.useSsl) { return 5986 } else { return 5985 }
+}
+
+function Get-PmRdpPort {
+    param([Parameter(Mandatory)]$Server)
+    if ($Server.PSObject.Properties['rdpPort'] -and [int]$Server.rdpPort -gt 0) { return [int]$Server.rdpPort }
+    return 3389
+}
+
+function Test-PmServerPorts {
+    <# Quick TCP reachability of WinRM and RDP from the manager. #>
+    param([Parameter(Mandatory)]$Server)
+    $w = Get-PmWinRmPort $Server; $r = Get-PmRdpPort $Server
+    [pscustomobject]@{
+        winrmPort = $w; winrm = (Test-PmTcpPort -HostName $Server.host -Port $w)
+        rdpPort = $r; rdp = (Test-PmTcpPort -HostName $Server.host -Port $r)
+        checked = (Get-Date).ToString('o')
+    }
+}
+
+function Start-PmRdp {
+    <#
+        Opens a Remote Desktop session to the server from the manager (mstsc). A .rdp file
+        with host, port and user name is written to data\rdp - the password is never
+        written; Windows asks for it (or uses one saved in Credential Manager).
+    #>
+    param([Parameter(Mandatory)]$Server)
+    $user = $null
+    $cred = Get-PmCredential -ServerId $Server.id
+    if ($cred) { $user = $cred.UserName }
+    $dir = Join-Path (Get-PmPath Data) 'rdp'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $file = Join-Path $dir "$($Server.id).rdp"
+    $lines = @(
+        "full address:s:$($Server.host):$(Get-PmRdpPort $Server)"
+        'prompt for credentials:i:1'
+        'authentication level:i:2'
+        'screen mode id:i:1'
+        'desktopwidth:i:1600'
+        'desktopheight:i:900'
+        'redirectclipboard:i:1'
+        'drivestoredirect:s:'
+    )
+    if ($user) { $lines += "username:s:$user" }
+    Set-Content -LiteralPath $file -Value $lines -Encoding Unicode
+    Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\mstsc.exe') -ArgumentList "`"$file`""
+    return $file
 }
 
 # ======================================================================= remoting
@@ -249,25 +310,96 @@ function Remove-PmBackup {
 
 # ======================================================================= flows
 
+function Get-PmConnectHint {
+    param([string]$Message, $Ports)
+    if ($Ports -and -not $Ports.winrm) {
+        return "WinRM port $($Ports.winrmPort) is not reachable. Enable remoting on the server (tools\Enable-PrtgMoverRemoting.ps1, over RDP) and open the firewall for the manager."
+    }
+    if ($Message -match 'TrustedHosts') { return 'Add the server to TrustedHosts on the manager: tools\Setup-Manager.ps1 -TrustedHosts <ip> (elevated).' }
+    if ($Message -match 'Access is denied|access denied') { return 'Credential rejected or not an administrator. Use HOST\Administrator (or .\Administrator) and check LocalAccountTokenFilterPolicy.' }
+    if ($Message -match 'WinRM.*service|cannot process the request') { return 'Start the WinRM service on the manager (tools\Setup-Manager.ps1, elevated).' }
+    return $null
+}
+
 function Invoke-PmTestFlow {
     param([Parameter(Mandatory)]$Server, [pscredential]$Credential, $Job)
-    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host))..."
+    Add-PmJobLog -Job $Job -Level STEP -Message "Testing $($Server.name) ($($Server.host))..."
+    $ports = Test-PmServerPorts -Server $Server
+    Add-PmJobLog -Job $Job -Level $(if ($ports.rdp) { 'OK' } else { 'WARN' }) -Message "RDP   TCP $($ports.rdpPort): $(if ($ports.rdp) { 'reachable' } else { 'NOT reachable' })"
+    Add-PmJobLog -Job $Job -Level $(if ($ports.winrm) { 'OK' } else { 'ERROR' }) -Message "WinRM TCP $($ports.winrmPort): $(if ($ports.winrm) { 'reachable' } else { 'NOT reachable' })"
     $s = $null
+    $status = $null
     try {
+        if (-not $ports.winrm) { throw (Get-PmConnectHint -Ports $ports) }
         $s = New-PmSession -Server $Server -Credential $Credential
         $r = Invoke-PmRemote -Session $s -Function 'Get-PmSystemInfo' -Job $Job
-        $status = [pscustomobject]@{ ok = $true; checked = (Get-Date).ToString('o'); info = $r; error = $null }
-        Add-PmJobLog -Job $Job -Level OK -Message ("{0}: {1} | admin={2} | PRTG={3} {4} ({5} GB data) | VPN={6}" -f $r.Computer, $r.OS, $r.IsAdmin,
-                $(if ($r.Prtg.Installed) { 'yes' } else { 'no' }), $r.Prtg.Version, $r.PrtgDataGB, @($r.VpnAllUsers).Count) -Computer $r.Computer
+        $status = [pscustomobject]@{ ok = $true; checked = (Get-Date).ToString('o'); info = $r; error = $null; ports = $ports }
+        Add-PmJobLog -Job $Job -Level OK -Message ("{0}: {1} | admin={2} | PRTG={3} {4} ({5} GB data, core {6}) | VPN={7} | RDP port on server={8}" -f $r.Computer, $r.OS, $r.IsAdmin,
+                $(if ($r.Prtg.Installed) { 'yes' } else { 'no' }), $r.Prtg.Version, $r.PrtgDataGB, $r.Prtg.CoreStatus, @($r.VpnAllUsers).Count, $r.RdpPort) -Computer $r.Computer
+        foreach ($d in @($r.Disks)) { Add-PmJobLog -Job $Job -Message ("Disk {0} {1} GB free of {2} GB" -f $d.Drive, $d.FreeGB, $d.SizeGB) -Computer $r.Computer }
         if (-not $r.IsAdmin) { Add-PmJobLog -Job $Job -Level WARN -Message 'Remote session is NOT elevated - use a local/domain administrator (see README: LocalAccountTokenFilterPolicy).' }
+        if ($r.RdpPort -and [int]$r.RdpPort -ne (Get-PmRdpPort $Server)) { Add-PmJobLog -Job $Job -Level WARN -Message "The server's RDP service listens on port $($r.RdpPort) but the inventory says $(Get-PmRdpPort $Server) - edit the server." }
     } catch {
-        $status = [pscustomobject]@{ ok = $false; checked = (Get-Date).ToString('o'); info = $null; error = "$_" }
+        $msg = "$_"
+        $hint = Get-PmConnectHint -Message $msg -Ports $ports
+        if ($hint -and $hint -ne $msg) { Add-PmJobLog -Job $Job -Level WARN -Message "Hint: $hint" }
+        $status = [pscustomobject]@{ ok = $false; checked = (Get-Date).ToString('o'); info = $null; error = $msg; ports = $ports }
         throw
     } finally {
         if ($s) { Remove-PSSession $s }
-        $status | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path (Get-PmPath Status) "$($Server.id).json") -Encoding UTF8
+        if ($status) { $status | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path (Get-PmPath Status) "$($Server.id).json") -Encoding UTF8 }
     }
     return $status
+}
+
+function Invoke-PmPreflight {
+    <#
+        Runs BEFORE anything is changed on the source: every server must be reachable with
+        admin rights, have enough disk space, and the target PRTG version must not be older
+        than the source. Throws with the list of problems.
+    #>
+    param([Parameter(Mandatory)]$Source, [object[]]$Targets = @(), [hashtable]$Credentials, [hashtable]$Options = @{}, $Job)
+    Add-PmJobLog -Job $Job -Level STEP -Message 'Pre-flight checks (nothing is changed yet)...'
+    $problems = @()
+    $info = @{}
+    foreach ($srv in @($Source) + @($Targets)) {
+        $ports = Test-PmServerPorts -Server $srv
+        if (-not $ports.winrm) { $problems += "$($srv.name): $(Get-PmConnectHint -Ports $ports)"; continue }
+        $s = $null
+        try {
+            $s = New-PmSession -Server $srv -Credential (Resolve-PmCredential $srv $Credentials)
+            $i = Invoke-PmRemote -Session $s -Function 'Initialize-PmRemoteWorkRoot' -Job $Job
+            $info[$srv.id] = $i
+            if (-not $i.IsAdmin) { $problems += "$($srv.name): remote session is not elevated (administrator required)." }
+            Add-PmJobLog -Job $Job -Level OK -Computer $i.Computer -Message ("{0}: reachable, admin={1}, PRTG={2}, {3:N1} GB free" -f $srv.name, $i.IsAdmin,
+                    $(if ($i.Prtg.Installed) { "$($i.Prtg.Version) ($($i.Prtg.CoreStatus))" } else { 'not installed' }), ($i.FreeBytes / 1GB))
+        } catch {
+            $problems += "$($srv.name): $_"
+        } finally { if ($s) { Remove-PSSession $s } }
+    }
+    $src = $info[$Source.id]
+    if ($src) {
+        $includePrtg = -not ($Options.ContainsKey('IncludePrtg') -and -not $Options.IncludePrtg)
+        if ($includePrtg -and -not $src.Prtg.Installed) { $problems += "$($Source.name): PRTG is not installed on the source." }
+        $data = [int64]$src.PrtgDataBytes
+        if ($data -gt 0 -and $src.FreeBytes -lt ($data * 2)) { $problems += ("{0}: needs ~{1:N1} GB free for staging + package, has {2:N1} GB." -f $Source.name, ($data * 2 / 1GB), ($src.FreeBytes / 1GB)) }
+        foreach ($t in $Targets) {
+            $ti = $info[$t.id]; if (-not $ti) { continue }
+            if ($data -gt 0 -and $ti.FreeBytes -lt ($data * 2.5)) { $problems += ("{0}: needs ~{1:N1} GB free, has {2:N1} GB." -f $t.name, ($data * 2.5 / 1GB), ($ti.FreeBytes / 1GB)) }
+            if ($ti.Prtg.Installed -and $src.Prtg.Version) {
+                $sv = [version]($src.Prtg.Version -replace '[^\d\.]', ''); $tv = [version]($ti.Prtg.Version -replace '[^\d\.]', '')
+                if ($tv -lt $sv -and -not $Options.AllowDowngrade) { $problems += "$($t.name): PRTG $tv is older than source $sv - upgrade the target first." }
+            } elseif (-not $ti.Prtg.Installed -and -not $Options.InstallerFile) {
+                $problems += "$($t.name): PRTG is not installed and no installer was selected."
+            }
+        }
+    }
+    if ($problems.Count) {
+        foreach ($p in $problems) { Add-PmJobLog -Job $Job -Level ERROR -Message "Pre-flight: $p" }
+        throw "Pre-flight failed ($($problems.Count) problem(s)) - nothing was changed on any server."
+    }
+    Add-PmJobLog -Job $Job -Level OK -Message 'Pre-flight passed.'
+    return $info
 }
 
 function Invoke-PmBackupFlow {
@@ -287,14 +419,18 @@ function Invoke-PmBackupFlow {
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.82)) -Step 'Downloading package to manager'
         Add-PmJobLog -Job $Job -Level STEP -Message ("Downloading {0} ({1:N1} MB) to the manager..." -f $r.ZipName, ($r.Size / 1MB))
         $local = Join-Path (Get-PmPath Backups) $r.ZipName
+        $sw = [Diagnostics.Stopwatch]::StartNew()
         Copy-Item -FromSession $s -Path $r.ZipPath -Destination $local -Force -ErrorAction Stop
         $hash = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash
         if ($hash -ne $r.Sha256) { throw "Checksum mismatch after download (remote $($r.Sha256), local $hash)." }
-        Add-PmJobLog -Job $Job -Level OK -Message "Backup stored on manager: $local (SHA256 verified)"
+        Add-PmJobLog -Job $Job -Level OK -Message ("Backup stored on manager: {0} (SHA-256 verified, {1:N1} MB/s)" -f $local, (($r.Size / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)))
         [pscustomobject]@{ source = $Server.name; sha256 = $hash; manifest = ($r.Manifest | ConvertFrom-Json) } |
             ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$local.meta.json" -Encoding UTF8
         [void](Invoke-PmRemote -Session $s -Function 'Remove-PmRemoteFile' -Parameters @{ Path = $r.ZipPath } -Job $Job)
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]$ProgressSpan) -Step 'Backup complete'
+        if ($r.SourceHealth -and -not $r.SourceHealth.Healthy) {
+            throw "Backup saved as $($r.ZipName), but PRTG on the source did NOT come back up completely ($($r.SourceHealth.Message))."
+        }
         return $local
     } finally { if ($s) { Remove-PSSession $s } }
 }
@@ -312,6 +448,11 @@ function Invoke-PmRestoreFlow {
         $params = ConvertTo-PmHashtable -InputObject $Options -Keys $script:PmRestoreKeys
         $params.JobId = $jobId
 
+        $size = (Get-Item -LiteralPath $BackupPath).Length
+        if ($init.FreeBytes -and $init.FreeBytes -lt ($size * 3)) {
+            throw ("Not enough free space on target: {0:N1} GB free, ~{1:N1} GB needed." -f ($init.FreeBytes / 1GB), ($size * 3 / 1GB))
+        }
+
         if (-not $init.Prtg.Installed -and $Options.InstallerFile) {
             $inst = Join-Path (Get-PmPath Installers) (Split-Path $Options.InstallerFile -Leaf)
             if (-not (Test-Path -LiteralPath $inst)) { throw "Installer '$($Options.InstallerFile)' not found in installers folder." }
@@ -321,12 +462,19 @@ function Invoke-PmRestoreFlow {
             $params.InstallerPath = $remoteInst
         }
 
+        # Expected checksum: sidecar metadata, otherwise computed now.
+        $sha = $null
+        $meta = "$BackupPath.meta.json"
+        if (Test-Path -LiteralPath $meta) { try { $sha = (Get-Content -LiteralPath $meta -Raw -Encoding UTF8 | ConvertFrom-Json).sha256 } catch { } }
+        if (-not $sha) { $sha = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash }
+        $params.ExpectedSha256 = $sha
+
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.05)) -Step "$($Server.name): uploading package"
-        $size = (Get-Item -LiteralPath $BackupPath).Length
         Add-PmJobLog -Job $Job -Level STEP -Message ("Uploading package to target ({0:N1} MB)..." -f ($size / 1MB))
         $remoteZip = Join-Path $init.Inbox (Split-Path $BackupPath -Leaf)
+        $sw = [Diagnostics.Stopwatch]::StartNew()
         Copy-Item -ToSession $s -Path $BackupPath -Destination $remoteZip -Force -ErrorAction Stop
-        Add-PmJobLog -Job $Job -Level OK -Message 'Package uploaded.'
+        Add-PmJobLog -Job $Job -Level OK -Message ("Package uploaded ({0:N1} MB/s)." -f (($size / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)))
         $params.ZipPath = $remoteZip
 
         $r = Invoke-PmRemote -Session $s -Function 'Invoke-PmRemoteRestore' -Parameters $params -Job $Job `
@@ -407,6 +555,7 @@ function Invoke-PmJob {
             'backup' {
                 $srv = Get-PmServer -Id $Params.SourceId
                 if (-not $options.ContainsKey('SourceAfter')) { $options.SourceAfter = 'Restart' }
+                [void](Invoke-PmPreflight -Source $srv -Credentials $creds -Options $options -Job $Job)
                 $file = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job
                 $Job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf) }
             }
@@ -417,6 +566,9 @@ function Invoke-PmJob {
             'migrate' {
                 $srv = Get-PmServer -Id $Params.SourceId
                 if (-not $options.ContainsKey('SourceAfter')) { $options.SourceAfter = 'KeepStopped' }
+                $targets = @($Params.TargetIds | ForEach-Object { Get-PmServer -Id $_ })
+                [void](Invoke-PmPreflight -Source $srv -Targets $targets -Credentials $creds -Options $options -Job $Job)
+                if ($options.NoTouch) { Add-PmJobLog -Job $Job -Level WARN -Message 'No-touch mode: the source keeps running. Two PRTG cores with the same configuration will now monitor (and alert) in parallel.' }
                 $file = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job -ProgressBase 0 -ProgressSpan 40
                 $reports = Invoke-PmMultiRestore -File $file -TargetIds @($Params.TargetIds) -Options $options -Credentials $creds -Job $Job -Base 40 -Span 60
                 $Job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf); targets = $reports }

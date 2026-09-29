@@ -42,6 +42,10 @@ param(
     [int]$HealthTimeoutMinutes = 15,
     [switch]$ConnectVpn,
     [switch]$AllowDowngrade,
+    [switch]$NoTouch,
+    [switch]$NoLicense,
+    [switch]$NoFirewall,
+    [switch]$SkipPreflight,
     [int]$KeepLast = 0
 )
 
@@ -65,6 +69,7 @@ $options = @{
     ExtraPaths = $ExtraPaths; StartServices = -not $NoStart; HealthTimeoutMinutes = $HealthTimeoutMinutes
     ConnectVpn = [bool]$ConnectVpn; AllowDowngrade = [bool]$AllowDowngrade
     RestorePrtg = -not $NoPrtg; RestoreVpn = -not $NoVpn; RestoreDesktop = -not $NoDesktop; RestoreExtra = $true
+    NoTouch = [bool]$NoTouch; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
 }
 if ($InstallerFile) { $options.InstallerFile = $InstallerFile }
 
@@ -83,6 +88,8 @@ try {
             if (-not $Source) { throw '-Source is required.' }
             $srv = Resolve-CliServer $Source
             $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'Restart' }
+            $creds = @{}; if ($Credential) { $creds[$srv.id] = $Credential }
+            if (-not $SkipPreflight) { [void](Invoke-PmPreflight -Source $srv -Credentials $creds -Options $options -Job $job) }
             $file = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
             $job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf) }
             if ($KeepLast -gt 0) {
@@ -107,6 +114,9 @@ try {
             if (-not $Source -or -not $Target) { throw '-Source and -Target are required.' }
             $srv = Resolve-CliServer $Source
             $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'KeepStopped' }
+            $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
+            $creds = @{}; if ($Credential) { foreach ($x in @($srv) + $targets) { $creds[$x.id] = $Credential } }
+            if (-not $SkipPreflight) { [void](Invoke-PmPreflight -Source $srv -Targets $targets -Credentials $creds -Options $options -Job $job) }
             $file = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
             foreach ($ref in $Target) {
                 $t = Resolve-CliServer $ref
