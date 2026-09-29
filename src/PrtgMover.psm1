@@ -1378,6 +1378,22 @@ function Invoke-PmRestoreFlow {
     } finally { if ($s) { Close-PmSession $s } }
 }
 
+function Invoke-PmRebindFlow {
+    <#
+        Binds the web server of an already migrated PRTG to the server's own address (it kept
+        the source's address and only answers on 127.0.0.1), restarts PRTG and verifies it.
+    #>
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, $Job)
+    if ((Get-PmTransport $Server) -eq 'rdp') { throw "$($Server.name): this action needs the WinRM connection method." }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $r = Invoke-PmRemote -Session $s -Function 'Repair-PmPrtgBinding' -Parameters @{ TargetAddress = [string]$Server.host } -Job $Job -ProgressBase 0 -ProgressSpan 100
+        Write-PmAudit -Action 'prtg.rebind' -Data @{ server = $Server.name; changed = $r.Changed; before = $r.Before; after = $r.After }
+        return [pscustomobject]@{ target = $Server.name; ok = $true; changed = $r.Changed; before = $r.Before; after = $r.After; listens = @($r.ListenEndpoints) }
+    } finally { Close-PmSession $s }
+}
+
 # ======================================================================= jobs
 
 function New-PmJobObject {
@@ -1481,14 +1497,7 @@ function Invoke-PmJob {
                 $results = @()
                 foreach ($id in @($Params.ServerIds)) {
                     $srv = Get-PmServer -Id $id
-                    if ((Get-PmTransport $srv) -eq 'rdp') { throw "$($srv.name): this action needs the WinRM connection method." }
-                    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($srv.name) ($($srv.host)) via $((Get-PmTransport $srv).ToUpper())..."
-                    $s = New-PmSession -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Job $Job
-                    try {
-                        $r = Invoke-PmRemote -Session $s -Function 'Repair-PmPrtgBinding' -Parameters @{ TargetAddress = [string]$srv.host } -Job $Job -ProgressBase 0 -ProgressSpan 100
-                        $results += [pscustomobject]@{ target = $srv.name; ok = $true; changed = $r.Changed; before = $r.Before; after = $r.After; listens = @($r.ListenEndpoints) }
-                        Write-PmAudit -Action 'prtg.rebind' -Data @{ server = $srv.name; changed = $r.Changed; before = $r.Before; after = $r.After }
-                    } finally { Close-PmSession $s }
+                    $results += Invoke-PmRebindFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Job $Job
                 }
                 $Job.result = $results
             }

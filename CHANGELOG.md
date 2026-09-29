@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.2 — 2026-09-29
+
+### Added
+- Command line: `-Action FixBinding -Target <server>` binds the web server of a migrated PRTG to the server's own address.
+
+### Changed
+- README (English and Persian), architecture and troubleshooting guides rewritten for the current behaviour: connection methods, source untouched by default, program clone, compressed parallel transfer, resume, logs and audit.
+- The addresses of a server are read without Windows-only cmdlets when those are missing, so the test suite keeps working under PowerShell 7.
+
 ## 1.5.1 — 2026-09-29
 
 ### Fixed

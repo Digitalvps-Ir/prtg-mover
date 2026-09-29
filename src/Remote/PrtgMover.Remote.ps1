@@ -308,6 +308,24 @@ function Invoke-PmReg {
 
 # ---------------------------------------------------------------- PRTG discovery / control
 
+function Get-PmLocalIPv4 {
+    <# IPv4 addresses of this machine (loopback included, link-local excluded). Works without the NetTCPIP module. #>
+    $list = @()
+    if (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue) {
+        try { $list = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | ForEach-Object { [string]$_.IPAddress }) } catch { $list = @() }
+    }
+    if (-not $list.Count) {
+        try {
+            foreach ($nic in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+                foreach ($a in $nic.GetIPProperties().UnicastAddresses) {
+                    if ($a.Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { $list += $a.Address.ToString() }
+                }
+            }
+        } catch { }
+    }
+    return @($list | Where-Object { $_ -and $_ -notlike '169.254.*' } | Select-Object -Unique)
+}
+
 function Get-PmPrtgInfo {
     $info = [ordered]@{
         Installed = $false; Version = $null; ProgramPath = $null; DataPath = $null
@@ -346,12 +364,13 @@ function Get-PmPrtgInfo {
 
     $proc = Get-Process -Name 'PRTG Server' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($proc) {
-        $listen = @(Get-NetTCPConnection -State Listen -OwningProcess $proc.Id -ErrorAction SilentlyContinue)
+        $listen = @()
+        if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) { $listen = @(Get-NetTCPConnection -State Listen -OwningProcess $proc.Id -ErrorAction SilentlyContinue) }
         $info.ListenPorts = @($listen | Select-Object -ExpandProperty LocalPort -Unique | Sort-Object)
         # address:port pairs show whether the web server is bound to all addresses or only to specific ones
         $info.ListenEndpoints = @($listen | Sort-Object LocalPort, LocalAddress | ForEach-Object { '{0}:{1}' -f $_.LocalAddress, $_.LocalPort } | Select-Object -Unique)
     }
-    $info.LocalAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.IPAddress })
+    $info.LocalAddresses = @(Get-PmLocalIPv4 | Where-Object { $_ -notlike '127.*' })
     return [pscustomobject]$info
 }
 
@@ -568,7 +587,7 @@ function Set-PmPrtgWebBinding {
         replaced by this server's own address. Nothing is changed when every address exists.
     #>
     param([string]$TargetAddress, [bool]$AddOwn = $false, [bool]$CheckOnly = $false)
-    $local = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.IPAddress })
+    $local = @(Get-PmLocalIPv4)
     $own = if ($TargetAddress -and $local -contains $TargetAddress) { $TargetAddress }
     else { $local | Where-Object { $_ -ne '127.0.0.1' -and $_ -notmatch '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)' } | Select-Object -First 1 }
     if (-not $own) { $own = $local | Where-Object { $_ -ne '127.0.0.1' } | Select-Object -First 1 }
