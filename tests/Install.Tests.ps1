@@ -57,6 +57,25 @@ Describe 'Installer' -Skip:($env:OS -ne 'Windows_NT') {
         Test-Path -LiteralPath (Join-Path $Startup 'PRTG Mover.lnk') | Should -BeFalse
     }
 
+    It 'leaves the start with Windows of another installation alone' {
+        New-Item -ItemType Directory -Force -Path $Startup | Out-Null
+        $lnk = Join-Path $Startup 'PRTG Mover.lnk'
+        $elsewhere = Join-Path $Work 'another installation'
+        $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+        $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $s.Arguments = "-File `"$elsewhere\Start-PrtgMover.ps1`" -NoBrowser"; $s.WorkingDirectory = $elsewhere; $s.Save()
+
+        $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut')
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).WorkingDirectory | Should -Be $elsewhere
+
+        $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut', '-NoAutostart')
+        $r.ExitCode | Should -Be 0 -Because $r.Output
+        $r.Output | Should -Match 'another installation'
+        (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).WorkingDirectory | Should -Be $elsewhere
+        Remove-Item -LiteralPath $lnk -Force
+    }
+
     It 'starts with Windows with -Autostart, keeps that on an update and removes it with -NoAutostart' {
         $r = & $Install @('-Source', "`"$Root`"", '-NoStart', '-NoShortcut', '-Autostart')
         $r.ExitCode | Should -Be 0 -Because $r.Output

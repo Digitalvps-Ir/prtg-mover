@@ -258,17 +258,23 @@ function Set-AutostartShortcut {
     return $lnk
 }
 
+function Test-OwnShortcut {
+    <# True when the shortcut starts PRTG Mover from this installation folder. #>
+    param([string]$Link, [string]$Path)
+    if (-not (Test-Path -LiteralPath $Link)) { return $false }
+    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($Link)
+    $folder = $Path.TrimEnd('\')
+    $ic = [StringComparison]::OrdinalIgnoreCase
+    return ("$($s.WorkingDirectory)".TrimEnd('\').Equals($folder, $ic)) -or ("$($s.Arguments)".IndexOf("$folder\Start-PrtgMover.", $ic) -ge 0) -or ("$($s.TargetPath)".StartsWith("$folder\", $ic))
+}
+
 function Remove-Shortcuts {
     <# Removes the shortcuts of THIS installation. A shortcut that starts another folder is left alone. #>
     param([string]$Path)
     $removed = @()
-    $shell = New-Object -ComObject WScript.Shell
     $links = @(Get-AutostartShortcut) + @(Get-ShortcutFolders | ForEach-Object { Join-Path $_ 'PRTG Mover.lnk' })
     foreach ($lnk in $links) {
-        if (-not (Test-Path -LiteralPath $lnk)) { continue }
-        $s = $shell.CreateShortcut($lnk)
-        $mine = ("$($s.WorkingDirectory)".TrimEnd('\') -eq $Path) -or ("$($s.Arguments)" -like "*$Path\Start-PrtgMover.*") -or ("$($s.TargetPath)" -like "$Path\*")
-        if ($mine) { Remove-Item -LiteralPath $lnk -Force; $removed += $lnk }
+        if (Test-OwnShortcut -Link $lnk -Path $Path) { Remove-Item -LiteralPath $lnk -Force; $removed += $lnk }
     }
     foreach ($folder in (Get-ShortcutFolders)) {
         if ((Split-Path $folder -Leaf) -eq 'PRTG Mover' -and (Test-Path -LiteralPath $folder) -and -not (Get-ChildItem -LiteralPath $folder -Force)) { Remove-Item -LiteralPath $folder -Force }
@@ -359,11 +365,19 @@ try {
 
     Write-Step 'Start with Windows'
     $auto = Get-AutostartShortcut
+    $exists = Test-Path -LiteralPath $auto
+    $own = Test-OwnShortcut -Link $auto -Path $InstallPath
     if ($NoAutostart) {
-        if (Test-Path -LiteralPath $auto) { Remove-Item -LiteralPath $auto -Force; Write-Ok 'switched off' } else { Write-Info 'was not switched on' }
-    } elseif ($Autostart -or (Test-Path -LiteralPath $auto)) {
+        if ($own) { Remove-Item -LiteralPath $auto -Force; Write-Ok 'switched off' }
+        elseif ($exists) { Write-Note 'another installation of PRTG Mover starts with Windows - left as it is' }
+        else { Write-Info 'was not switched on' }
+    } elseif ($Autostart) {
+        if ($exists -and -not $own) { Write-Note 'the start with Windows belonged to another installation - it starts this one now' }
         Write-Ok "the dashboard starts when you log on ($(Set-AutostartShortcut -Path $InstallPath))"
-    } else { Write-Info 'not switched on (use -Autostart)' }
+    } elseif ($own) {
+        Write-Ok "the dashboard starts when you log on ($(Set-AutostartShortcut -Path $InstallPath))"
+    } elseif ($exists) { Write-Info 'another installation of PRTG Mover starts with Windows - left as it is' }
+    else { Write-Info 'not switched on (use -Autostart)' }
 
     Write-Step 'WinRM on this computer'
     if (-not $TrustedHosts.Count) { Write-Info 'skipped - only needed for servers reached over plain WinRM (HTTP). RDP and WinRM over HTTPS need nothing here.' }

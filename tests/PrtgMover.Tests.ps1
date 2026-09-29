@@ -544,6 +544,23 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         & $StatusOf GET "$Dash/api/info" | Should -Be 200
     }
 
+    It 'two starts at the same moment leave one dashboard running and no error' {
+        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $port = $l.LocalEndpoint.Port; $l.Stop()
+        $both = foreach ($n in 1, 2) {
+            Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $port, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work "dash-race-$n")
+        }
+        try {
+            $both | ForEach-Object { $null = $_.Handle }
+            $deadline = (Get-Date).AddSeconds(60)
+            while (@($both | Where-Object { $_.HasExited }).Count -eq 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+            $ended = @($both | Where-Object { $_.HasExited })
+            $ended.Count | Should -Be 1
+            $ended[0].ExitCode | Should -Be 0
+            & $StatusOf GET "http://localhost:$port/api/info" | Should -Be 200
+        } finally { $both | Where-Object { -not $_.HasExited } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } }
+    }
+
     It 'refuses a port that another program uses' {
         $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start()
         try {
