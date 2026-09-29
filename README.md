@@ -86,7 +86,7 @@ The code that runs on the servers (`src\Remote\PrtgMover.Remote.ps1`) is sent wi
 ### 1. Get PRTG Mover on the manager
 
 ```powershell
-git clone https://github.com/<your-account>/prtg-mover.git C:\PrtgMover
+git clone https://github.com/Digitalvps-Ir/prtg-mover.git C:\PrtgMover
 cd C:\PrtgMover
 ```
 

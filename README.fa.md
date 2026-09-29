@@ -45,7 +45,7 @@
 </div>
 
 ```powershell
-git clone https://github.com/<your-account>/prtg-mover.git C:\PrtgMover
+git clone https://github.com/Digitalvps-Ir/prtg-mover.git C:\PrtgMover
 cd C:\PrtgMover
 ```
 
