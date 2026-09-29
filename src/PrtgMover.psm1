@@ -167,8 +167,12 @@ function Save-PmCredential {
 function Get-PmCredential {
     param([Parameter(Mandatory)][string]$ServerId)
     $f = Join-Path (Get-PmPath Credentials) "$ServerId.cred.xml"
-    if (Test-Path -LiteralPath $f) { return Import-Clixml -LiteralPath $f }
-    return $null
+    if (-not (Test-Path -LiteralPath $f)) { return $null }
+    try { return Import-Clixml -LiteralPath $f -ErrorAction Stop }
+    catch {
+        # Windows protects a saved password for the account that saved it (DPAPI).
+        throw "The saved credential of this server cannot be read by $env:USERDOMAIN\$env:USERNAME: it was saved while PRTG Mover ran under another Windows account. Enter user and password again (Servers > Edit). [$($_.Exception.Message)]"
+    }
 }
 
 function Test-PmCredential { param([string]$ServerId) Test-Path -LiteralPath (Join-Path (Get-PmPath Credentials) "$ServerId.cred.xml") }

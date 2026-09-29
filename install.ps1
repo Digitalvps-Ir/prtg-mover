@@ -271,11 +271,30 @@ function Set-LogonTask {
     param([string]$Path)
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $Path -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Start-PrtgMover.ps1')`" -Port $Port -NoBrowser -Quiet"
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    # Credentials that a user saved in this installation can only be read by that user (Windows DPAPI).
+    # Then the dashboard has to keep running as that user, which is only possible from the logon on.
+    $saved = @(Get-ChildItem -LiteralPath (Join-Path $Path 'data\credentials') -Filter '*.cred.xml' -File -ErrorAction SilentlyContinue)
+    $bySystem = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+    if ($saved.Count -and -not $bySystem -and -not (Test-SystemTask)) {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $me
+        $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest
+        Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Mover dashboard with administrator rights at logon (local mode).' -Force | Out-Null
+        Write-Note "$($saved.Count) saved server credential(s) can only be read by $me. So the dashboard starts when $me logs on, not with the computer."
+        Write-Note 'For a start with the computer: delete the servers that have a saved credential, run the installation with -Local again and enter the credentials again in the dashboard.'
+        return "task '$LogonTask': starts at logon of $me, with administrator rights"
+    }
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Mover dashboard when the computer starts (local mode).' -Force | Out-Null
     return "task '$LogonTask': starts with the computer, without logon"
+}
+
+function Test-SystemTask {
+    <# True when the dashboard of this computer already runs as SYSTEM: saved credentials then belong to SYSTEM. #>
+    $t = Get-ScheduledTask -TaskName $LogonTask -ErrorAction SilentlyContinue
+    return [bool]($t -and "$($t.Principal.UserId)" -match '^(SYSTEM|S-1-5-18|NT AUTHORITY\\SYSTEM)$')
 }
 
 function Start-LocalDashboard {

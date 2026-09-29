@@ -816,6 +816,31 @@ Describe 'Routes of a VPN connection (format vpn-routes/1)' {
         [datetimeoffset]::Parse($json.created) | Should -Not -BeNullOrEmpty
     }
 
+    It 'keeps persistent routes that wait for a VPN when the VPN is not connected, marked as assumed' {
+        Mock Get-PmPersistentRoutes { @(
+                [ordered]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '203.0.113.77'; metric = 1 },   # no connected network reaches this gateway
+                [ordered]@{ prefix = '10.99.0.0/16'; mask = '255.255.0.0'; gateway = '198.51.100.5'; metric = 1 }) }   # reachable over a connected network: not a VPN route
+        Mock Get-NetRoute { @([pscustomobject]@{ NextHop = '0.0.0.0'; DestinationPrefix = '127.0.0.0/8' }, [pscustomobject]@{ NextHop = '0.0.0.0'; DestinationPrefix = '198.51.100.0/24' }) }
+        $b = Get-PmVpnRouteBackup -Name 'no-such-vpn-for-the-test'
+        $b.scope | Should -Be 'AllUsers'
+        @($b.persistentRoutes).Count | Should -Be 1
+        $b.persistentRoutes[0].prefix | Should -Be '192.168.91.0/24'
+        $b.persistentRoutes[0].assumed | Should -BeTrue
+    }
+
+    It 'reads a credential of another Windows account as a clear error, not as a missing password' {
+        $root = Join-Path $Work 'manager-foreign-credential'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Set-PmRoot -Path $root
+        $srv = Set-PmServer -Name 'REMOTE' -HostName '192.0.2.20' -Transport winrm
+        # a credential file whose protected part this account cannot decrypt
+        $good = Join-Path $root 'good.xml'
+        (New-PmCredential -UserName 'u' -Password 'p') | Export-Clixml -LiteralPath $good
+        $xml = [IO.File]::ReadAllText($good) -replace '(<SS N="Password">)[0-9a-f]{40}', '${1}0000000000000000000000000000000000000000'
+        [IO.File]::WriteAllText((Join-Path (Get-PmPath Credentials) "$($srv.id).cred.xml"), $xml)
+        { Get-PmCredential -ServerId $srv.id } | Should -Throw '*another Windows account*'
+    }
+
     It 'leaves routes alone that are already there and reports a connection that does not exist' {
         Mock Get-PmPersistentRoutes { @([ordered]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '10.0.0.2'; metric = 1 }) }
         Mock Write-PmLog { }
