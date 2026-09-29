@@ -1097,10 +1097,12 @@ function Invoke-PmTransferFiles {
     $state = [hashtable]::Synchronized(@{ DoneBytes = [int64]0; Wire = [int64]0; Files = 0; Batches = 0; Failed = $false; Error = $null })
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $report = {
+        # Reporting must never be able to abort a transfer.
+        trap { Add-PmJobLog -Job $Job -Level DEBUG -Message "Progress report failed (ignored): $($_.Exception.Message)"; continue }
         $pct = if ($todoBytes) { [int](100 * $state.DoneBytes / $todoBytes) } else { 100 }
         $rate = ($state.DoneBytes / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)
         $eta = if ($rate -gt 0) { [TimeSpan]::FromSeconds((($todoBytes - $state.DoneBytes) / 1MB) / $rate) } else { [TimeSpan]::Zero }
-        Add-PmJobLog -Job $Job -Message ("{0} {1}: {2}% ({3:N2} / {4:N2} GB, {5} files, chunk {6}/{7}) - {8:N1} MB/s effective, {9:N1}x compression, about {10:hh\:mm\:ss} left" -f $Direction, $Label, $pct, ($state.DoneBytes / 1GB), ($todoBytes / 1GB), $state.Files, $state.Batches, $batches.Count, $rate, ($state.DoneBytes / [math]::Max(1, $state.Wire)), $eta)
+        Add-PmJobLog -Job $Job -Message ("{0} {1}: {2}% ({3:N2} / {4:N2} GB, {5} files, chunk {6}/{7}) - {8:N1} MB/s effective, {9:N1}x compression, about {10:hh\:mm\:ss} left" -f $Direction, $Label, $pct, ($state.DoneBytes / 1GB), ($todoBytes / 1GB), $state.Files, $state.Batches, $batches.Count, $rate, ($state.DoneBytes / [math]::Max([double]1, [double]$state.Wire)), $eta)
         if ($ProgressSpan -gt 0) { Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * $pct / 100)) -Step ("{0} {1}: {2}%" -f $Direction, $Label, $pct) }
     }
 
