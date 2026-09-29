@@ -116,6 +116,7 @@
           <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify it is fully up (services + web + stability)</label>
           <label class="check"><input type="checkbox" name="OpenFirewall" checked> Open the Windows firewall for the PRTG web ports and remote probes (23560)</label>
           <label class="field inline"><span>Health-check timeout (minutes)</span><input type="number" name="HealthTimeoutMinutes" value="15" min="1" max="120"></label>
+          <label class="field inline"><span>Parallel transfer streams (WinRM)</span><input type="number" name="TransferStreams" value="4" min="1" max="8"></label>
           <label class="check"><input type="checkbox" name="ConnectVpn"> Dial the VPN connections after restore</label>
           <label class="check"><input type="checkbox" name="AllowDowngrade"> Allow restoring onto an older PRTG version (not recommended)</label>
           <label class="field"><span>PRTG installer (optional — only if you prefer a fresh install over the clone)</span><select name="InstallerFile"><option value="">— none (use the clone) —</option></select></label>

@@ -327,7 +327,7 @@
       IncludePrtg: f.IncludePrtg.checked, IncludeHistory: f.IncludeHistory.checked, IncludeVpn: f.IncludeVpn.checked, IncludeDesktop: f.IncludeDesktop.checked,
       ExtraPaths: f.ExtraPaths.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
       NoTouch: f.NoTouch.checked, IncludeProgram: f.IncludeProgram.checked, IncludeLogs: f.IncludeLogs.checked, IncludeAutoBackups: f.IncludeAutoBackups.checked, CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked,
-      StartServices: f.StartServices.checked, HealthTimeoutMinutes: Number(f.HealthTimeoutMinutes.value) || 15, ConnectVpn: f.ConnectVpn.checked,
+      StartServices: f.StartServices.checked, HealthTimeoutMinutes: Number(f.HealthTimeoutMinutes.value) || 15, TransferStreams: Number(f.TransferStreams.value) || 4, ConnectVpn: f.ConnectVpn.checked,
       AllowDowngrade: f.AllowDowngrade.checked, InstallerFile: f.InstallerFile.value, InstallerArgs: f.InstallerArgs.value,
       RestorePrtg: true, RestoreVpn: true, RestoreDesktop: true, RestoreExtra: true,
     };

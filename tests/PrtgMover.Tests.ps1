@@ -203,6 +203,88 @@ Describe 'RDP agent transport (end to end, local)' {
     }
 }
 
+Describe 'Parallel chunked transfer (local transport, same code path as WinRM)' {
+    BeforeAll {
+        $script:PRoot = Join-Path $Work 'manager-parallel'
+        New-Item -ItemType Directory -Force -Path $PRoot | Out-Null
+        Set-PmRoot -Path $PRoot
+        $env:PRTGMOVER_WORKROOT = Join-Path $Work 'server-workroot'
+        $env:PRTGMOVER_RETRY_SECONDS = '0'
+        $script:Local = Set-PmServer -Name 'LOCAL' -HostName 'localhost' -Transport local
+        $script:PSrc = Join-Path $Work 'par-src'
+        New-Item -ItemType Directory -Force -Path (Join-Path $PSrc 'a\b'), (Join-Path $PSrc 'c') | Out-Null
+        $rnd = New-Object Random 42
+        1..40 | ForEach-Object {
+            $bytes = New-Object byte[] (20000 + $rnd.Next(60000)); $rnd.NextBytes($bytes)
+            $dir = @('', 'a', 'a\b', 'c')[$_ % 4]
+            [IO.File]::WriteAllBytes((Join-Path (Join-Path $PSrc $dir) "f$_.bin"), $bytes)
+        }
+        $script:HashOf = { param($root) $h = @{}; Get-ChildItem $root -Recurse -File -Force | ForEach-Object { $h[$_.FullName.Substring($root.Length + 1)] = (Get-FileHash $_.FullName).Hash }; $h }
+    }
+    AfterAll {
+        Remove-Item Env:\PRTGMOVER_WORKROOT, Env:\PRTGMOVER_RETRY_SECONDS -ErrorAction SilentlyContinue
+    }
+
+    It 'pulls with several streams, keeps timestamps, purges extra files and resumes without re-transferring' {
+        $dst = Join-Path $Work 'par-dst'
+        New-Item -ItemType Directory -Force -Path $dst | Out-Null
+        'junk' | Set-Content (Join-Path $dst 'old-cache.tmp')
+        $s = New-PmSession -Server $Local
+        $lst = Invoke-PmRemote -Session $s -Function 'Get-PmPullList' -Parameters @{ Source = $PSrc }
+        $lst.Count | Should -Be 40
+        $job = New-PmJobObject -Type 'backup' -Summary 'par'
+        Invoke-PmTransferFiles -Session $s -Direction Pull -RemoteRoot $PSrc -LocalRoot $dst -Files @($lst.Files) -Job $job -Server $Local -Streams 3 -ChunkBytes 200KB -Purge
+        @($job.logs | Where-Object { $_.message -like '*parallel streams*' }).Count | Should -Be 1
+        Test-Path (Join-Path $dst 'old-cache.tmp') | Should -BeFalse
+        $a = & $HashOf $PSrc; $b = & $HashOf $dst
+        $b.Count | Should -Be 40
+        foreach ($k in $a.Keys) { $b[$k] | Should -Be $a[$k] }
+        (Get-Item (Join-Path $dst 'a\b\f2.bin')).LastWriteTimeUtc | Should -Be (Get-Item (Join-Path $PSrc 'a\b\f2.bin')).LastWriteTimeUtc
+        # second run: nothing left to do
+        $job2 = New-PmJobObject -Type 'backup' -Summary 'par2'
+        Invoke-PmTransferFiles -Session $s -Direction Pull -RemoteRoot $PSrc -LocalRoot $dst -Files @($lst.Files) -Job $job2 -Server $Local -Streams 3 -ChunkBytes 200KB
+        @($job2.logs | Where-Object { $_.message -like '* 0 file(s), 0.00 GB still to transfer*' }).Count | Should -Be 1
+        # no temporary chunks left on either side
+        @(Get-ChildItem (Join-Path $PRoot 'data\chunks') -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+        @(Get-ChildItem (Join-Path $env:PRTGMOVER_WORKROOT 'chunks') -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+
+    It 'pushes with several streams' {
+        $remote = Join-Path $Work 'par-remote\stage'
+        $s = New-PmSession -Server $Local
+        $files = @((Get-PmLocalFileList -Root $PSrc).GetEnumerator() | ForEach-Object { [pscustomobject]@{ Rel = $_.Value.FullName.Substring($PSrc.Length + 1); Size = $_.Value.Length; Time = $_.Value.LastWriteTimeUtc.Ticks } })
+        Invoke-PmTransferFiles -Session $s -Direction Push -RemoteRoot $remote -LocalRoot $PSrc -Files $files -Server $Local -Streams 4 -ChunkBytes 300KB
+        $a = & $HashOf $PSrc; $b = & $HashOf $remote
+        $b.Count | Should -Be 40
+        foreach ($k in $a.Keys) { $b[$k] | Should -Be $a[$k] }
+    }
+
+    It 'fails the whole transfer when a stream cannot transfer its chunk' {
+        $s = New-PmSession -Server $Local
+        $lst = Invoke-PmRemote -Session $s -Function 'Get-PmPullList' -Parameters @{ Source = $PSrc }
+        $files = @($lst.Files) + [pscustomobject]@{ Rel = 'missing\ghost.bin'; Size = 10; Time = 1 }
+        { Invoke-PmTransferFiles -Session $s -Direction Pull -RemoteRoot $PSrc -LocalRoot (Join-Path $Work 'par-fail') -Files $files -Server $Local -Streams 2 -ChunkBytes 200KB } | Should -Throw '*failed 4 times*'
+    }
+
+    It 'runs a complete backup and restore through the pull / push / move path' {
+        $x = Join-Path $Work 'flow-extra'
+        New-Item -ItemType Directory -Force -Path (Join-Path $x 'sub') | Out-Null
+        'flow' | Set-Content (Join-Path $x 'sub\f.txt')
+        $job = New-PmJobObject -Type 'migrate' -Summary 'flow'
+        $opt = @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($x); NoTouch = $true }
+        $bk = Invoke-PmBackupFlow -Server $Local -Options $opt -Job $job
+        Test-Path $bk.Zip | Should -BeTrue
+        Test-PmStageComplete -StageDir $bk.StageDir | Should -BeTrue
+        Remove-Item $x -Recurse -Force
+        $rep = Invoke-PmRestoreFlow -Server $Local -BackupPath $bk.Zip -StageDir $bk.StageDir -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
+        $rep.Extra | Should -Be 'ok'
+        @($rep.Errors).Count | Should -Be 0
+        Get-Content (Join-Path $x 'sub\f.txt') | Should -Be 'flow'
+        # nothing left behind on the "server"
+        @(Get-ChildItem (Join-Path $env:PRTGMOVER_WORKROOT 'restore') -Force -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+}
+
 Describe 'Connectivity tests keep each method separately' {
     BeforeAll {
         $mgr = Join-Path $Work 'manager-tests'

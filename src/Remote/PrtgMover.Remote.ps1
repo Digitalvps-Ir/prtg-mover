@@ -22,6 +22,12 @@ $PmProgramFolders = @(
     'webroot\mapicons', 'webroot\custom'
 )
 
+function Get-PmWorkRoot {
+    <# Folder for PRTG Mover's own temporary files on this server. #>
+    if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\') }
+    return (Join-Path $env:SystemDrive 'PrtgMover')
+}
+
 # ---------------------------------------------------------------- output helpers
 
 function Write-PmLog {
@@ -369,6 +375,28 @@ function New-PmShadowCopy {
     [pscustomobject]@{ Id = $sc.ID; Link = $link; Volume = $volume }
 }
 
+function Clear-PmStaleSnapshots {
+    <#
+        Removes VSS snapshots that PRTG Mover itself created in an earlier, interrupted run
+        (recognised by their C:\PrtgMoverVss_* link). Other snapshots are never touched.
+    #>
+    $removed = 0
+    foreach ($link in (Get-ChildItem -LiteralPath ($env:SystemDrive + '\') -Filter 'PrtgMoverVss_*' -Force -ErrorAction SilentlyContinue)) {
+        try {
+            $target = [string]($link.Target | Select-Object -First 1)
+            if ($target) {
+                $dev = $target.TrimEnd('\')
+                foreach ($sc in @(Get-WmiObject Win32_ShadowCopy -ErrorAction SilentlyContinue)) {
+                    if ($sc.DeviceObject -and $dev.EndsWith(($sc.DeviceObject -replace '^\\\\\?\\', ''), [StringComparison]::OrdinalIgnoreCase)) { $sc.Delete() }
+                }
+            }
+            cmd.exe /c "rmdir `"$($link.FullName)`"" | Out-Null
+            $removed++
+        } catch { Write-PmLog "Could not remove stale snapshot link $($link.FullName): $($_.Exception.Message)" 'WARN' }
+    }
+    if ($removed) { Write-PmLog "Removed $removed snapshot(s) left behind by interrupted runs." 'OK' }
+}
+
 function Remove-PmShadowCopy {
     param($Shadow)
     if (-not $Shadow) { return }
@@ -474,7 +502,7 @@ function Invoke-PmRemoteBackup {
     $ErrorActionPreference = 'Stop'
     $sourceHealth = $null
     $pullItems = @()
-    if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
+    if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
     $direct = [bool]$StageDir
     $stage = if ($direct) { $StageDir } else { Join-Path $WorkRoot "staging\$JobId" }
     $outDir = Join-Path $WorkRoot 'out'
@@ -506,6 +534,7 @@ function Invoke-PmRemoteBackup {
         } else {
             Write-PmLog "PRTG $($prtg.Version) found. Program: $($prtg.ProgramPath) | Data: $($prtg.DataPath)"
             $wasRunning = ($prtg.CoreStatus -eq 'Running')
+            Clear-PmStaleSnapshots
             $shadow = $null
             $dataSource = $prtg.DataPath
             if ($NoTouch) {
@@ -791,7 +820,7 @@ function Invoke-PmRemoteRestore {
         [bool]$CleanupStage = $false
     )
     $ErrorActionPreference = 'Stop'
-    if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
+    if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
     $direct = [bool]$StageDir
     $stage = if ($direct) { $StageDir } else { Join-Path $WorkRoot "restore\$JobId" }
     if ($LogDir) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null; $global:PmRobocopyLog = Join-Path $LogDir "robocopy-$JobId-$env:COMPUTERNAME.log" } else { $global:PmRobocopyLog = $null }
@@ -1135,7 +1164,9 @@ function New-PmTransferChunk {
     #>
     param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string[]]$Files, [string]$ChunkPath)
     Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
-    if (-not $ChunkPath) { $ChunkPath = Join-Path $env:SystemDrive ("PrtgMover\chunks\{0}.zip" -f [guid]::NewGuid().ToString('N')) }
+    if (-not $ChunkPath) { $ChunkPath = Join-Path (Get-PmWorkRoot) ("chunks\{0}.zip" -f [guid]::NewGuid().ToString('N')) }
+    # Never compete with a running PRTG for CPU: remoting host processes run below normal priority.
+    if ($Host.Name -eq 'ServerRemoteHost') { try { [Diagnostics.Process]::GetCurrentProcess().PriorityClass = 'BelowNormal' } catch { } }
     New-Item -ItemType Directory -Force -Path (Split-Path $ChunkPath -Parent) | Out-Null
     if (Test-Path -LiteralPath $ChunkPath) { Remove-Item -LiteralPath $ChunkPath -Force }
     $zip = [IO.Compression.ZipFile]::Open($ChunkPath, [IO.Compression.ZipArchiveMode]::Create)
@@ -1173,10 +1204,14 @@ function Remove-PmTransferChunk {
     New-PmResult @{ Removed = $ChunkPath }
 }
 
+function Get-PmHostFacts {
+    New-PmResult @{ Cores = [Environment]::ProcessorCount; Computer = $env:COMPUTERNAME }
+}
+
 function Clear-PmRemoteStages {
     <# Removes PRTG Mover's own temporary restore folders / chunks of earlier (cancelled) runs, except $Keep. #>
     param([string]$Keep)
-    $root = Join-Path $env:SystemDrive 'PrtgMover\restore'
+    $root = Join-Path (Get-PmWorkRoot) 'restore'
     $removed = @()
     foreach ($d in (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
         if ($Keep -and $d.FullName -eq $Keep.TrimEnd('\')) { continue }
@@ -1199,7 +1234,7 @@ function Complete-PmRemotePull {
     param([string]$StageDir, [string]$ShadowId, [string]$ShadowLink)
     if ($ShadowId) { Remove-PmShadowCopy -Shadow ([pscustomobject]@{ Id = $ShadowId; Link = $ShadowLink }); Write-PmLog 'VSS snapshot removed.' 'OK' }
     if ($StageDir -and (Test-Path -LiteralPath $StageDir)) { Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction SilentlyContinue }
-    $root = Join-Path $env:SystemDrive 'PrtgMover'
+    $root = Get-PmWorkRoot
     $chunks = Join-Path $root 'chunks'
     if (Test-Path -LiteralPath $chunks) { Remove-Item -LiteralPath $chunks -Recurse -Force -ErrorAction SilentlyContinue }
     foreach ($d in (Join-Path $root 'staging'), (Join-Path $root 'out'), $root) {
@@ -1224,7 +1259,7 @@ function Remove-PmRemoteFile {
 
 function Initialize-PmRemoteWorkRoot {
     param([string]$WorkRoot)
-    if (-not $WorkRoot) { $WorkRoot = Join-Path $env:SystemDrive 'PrtgMover' }
+    if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
     New-Item -ItemType Directory -Force -Path (Join-Path $WorkRoot 'in') | Out-Null
     $drive = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='{0}'" -f (Split-Path $WorkRoot -Qualifier))
     $prtg = Get-PmPrtgInfo

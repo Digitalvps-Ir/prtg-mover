@@ -40,6 +40,7 @@ param(
     [string]$InstallerFile,
     [switch]$NoStart,
     [int]$HealthTimeoutMinutes = 15,
+    [ValidateRange(1, 8)][int]$Streams = 4,
     [switch]$ConnectVpn,
     [switch]$AllowDowngrade,
     [switch]$AllowSourceStop,
@@ -67,7 +68,7 @@ function Get-CliCredential { param($Server) if ($Credential) { return $Credentia
 
 $options = @{
     IncludePrtg = -not $NoPrtg; IncludeHistory = -not $NoHistory; IncludeVpn = -not $NoVpn; IncludeDesktop = -not $NoDesktop
-    ExtraPaths = $ExtraPaths; StartServices = -not $NoStart; HealthTimeoutMinutes = $HealthTimeoutMinutes
+    ExtraPaths = $ExtraPaths; StartServices = -not $NoStart; HealthTimeoutMinutes = $HealthTimeoutMinutes; TransferStreams = $Streams
     ConnectVpn = [bool]$ConnectVpn; AllowDowngrade = [bool]$AllowDowngrade
     RestorePrtg = -not $NoPrtg; RestoreVpn = -not $NoVpn; RestoreDesktop = -not $NoDesktop; RestoreExtra = $true
     NoTouch = -not $AllowSourceStop; IncludeProgram = -not $NoProgramClone; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
