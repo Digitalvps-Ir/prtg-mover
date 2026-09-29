@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.1 — 2026-09-29
+
+### Fixed
+- `install.ps1 -Local` finds out whose the saved credentials are by reading one, not by looking at the task. After an uninstall or `-NoAutostart` a later installation in local mode no longer starts the dashboard under the wrong account.
+- A restore puts the routes of a connection back where the connection is now: the connection of a user without a profile is in the phonebook for all users after a restore, and its routes are bound there.
+
 ## 1.9.0 — 2026-09-29
 
 ### Added

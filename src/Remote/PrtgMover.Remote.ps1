@@ -384,7 +384,12 @@ function Restore-PmVpnRoutes {
     $added = 0; $kept = 0; $failed = 0
     $conn = $null
     if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) {
-        try { $conn = if ($AllUsers) { Get-VpnConnection -Name $name -AllUserConnection -ErrorAction Stop } else { Get-VpnConnection -Name $name -ErrorAction Stop } } catch { }
+        # Where the connection is NOW decides, not where it was: a restore puts the connections of a user
+        # without a profile into the phonebook for all users, and it runs as another account than that user.
+        foreach ($scope in @($AllUsers, (-not $AllUsers))) {
+            try { $conn = if ($scope) { Get-VpnConnection -Name $name -AllUserConnection -ErrorAction Stop } else { Get-VpnConnection -Name $name -ErrorAction Stop } } catch { $conn = $null }
+            if ($conn) { $AllUsers = $scope; break }
+        }
     }
     foreach ($r in @($Backup.connectionRoutes | Where-Object { $_ })) {
         if (-not $conn) { Write-PmLog "Routes of '$name': the connection does not exist on this computer - route $($r.prefix) skipped." 'WARN'; $failed++; continue }
