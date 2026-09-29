@@ -91,9 +91,15 @@ try {
         if ($rc -ne 0) { throw "The installation of PRTG Mover failed (code $rc). See the message above." }
         if (-not $NoStart) {
             # started here, without waiting for it: the setup has to go on with VPN Watch
-            $d = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$PrtgMoverPath\Start-PrtgMover.ps1`"", '-Port', $PrtgMoverPort)
-            if ($NoBrowser) { $d += '-NoBrowser' }
-            Start-Process -FilePath $ps -WorkingDirectory $PrtgMoverPath -ArgumentList $d
+            if ($pmLocal -and -not $NoAutostart) {
+                # local mode: always through the task, so the dashboard runs under the same account as after a restart
+                Start-ScheduledTask -TaskName 'PRTG Mover Dashboard'
+                if (-not $NoBrowser) { Start-Process -FilePath $ps -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PrtgMoverPath\Open-PrtgMover.ps1`"", '-Port', $PrtgMoverPort) }
+            } else {
+                $d = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$PrtgMoverPath\Start-PrtgMover.ps1`"", '-Port', $PrtgMoverPort)
+                if ($NoBrowser) { $d += '-NoBrowser' }
+                Start-Process -FilePath $ps -WorkingDirectory $PrtgMoverPath -ArgumentList $d
+            }
         }
         if ($pmLocal) { Ok 'local mode: this computer is in the server list, PRTG Mover backs it up without any connection' }
         elseif (Get-Service -Name PRTGCoreService -ErrorAction SilentlyContinue) { Note "PRTG is installed on this computer. To back it up from here, run this setup once with 'Run as administrator'." }

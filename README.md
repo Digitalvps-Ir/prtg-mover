@@ -193,6 +193,10 @@ Administrator rights are not needed. The installer
 
 `install.ps1` on its own, without the other files, downloads the program from GitHub. The repository is private, so that only works on a computer where `git` or the GitHub CLI is signed in.
 
+**On the PRTG server itself (local mode):** install with `install.ps1 -Local` from an elevated PowerShell, or run `Setup-All.cmd` with *Run as administrator* on a computer where PRTG is installed. This computer is then in the server list with the connection method *Local*: backup and restore work without RDP, WinRM or a credential, and the dashboard comes up by itself when the computer starts, without anybody logging on. In an existing installation use **Servers → Add this computer**; PRTG Mover then has to be started with administrator rights.
+
+**Backups of VPN connections and routes:** on the **Backups** page the section *VPN* has the button **Back up VPN and routes**. The package holds the VPN connections and, per connection, the routes bound to it, the live routes on its interface and the persistent routes that point into it. Passwords and pre-shared keys are never part of a backup. Full backups are listed in the section *PRTG* and contain the same route files when *VPN* is ticked.
+
 **PRTG Mover and VPN Watch in one file:** `tools\Build-SetupAll.ps1 -VpnWatchSource <folder of VPN Watch>` builds `Setup-All.cmd`. Copy that single file to a Windows computer and double-click it: it installs or updates both programs (PRTG Mover in `C:\PrtgMover`, VPN Watch in `C:\VpnWatchDashboard`), creates the shortcuts, starts both with Windows and tests both dashboards. The file contains program files only; servers, users and passwords are entered in the dashboards. Options: `-SkipPrtgMover`, `-SkipVpnWatch`, `-PrtgMoverPath`, `-VpnWatchPath`, `-NoAutostart`. When the computer has VPN connections of its own, run the file with *Run as administrator* so that VPN Watch manages them directly.
 
 Without the installer: `powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1` (or a double-click on `Start-PrtgMover.cmd`) starts the dashboard right from the folder the files are in.

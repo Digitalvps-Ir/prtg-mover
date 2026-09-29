@@ -786,3 +786,73 @@ Describe 'WireGuard tunnel config' {
         { Send-PmTunnelWinRmCopy -PeerTunnelIp '203.0.113.8' -UserName '.\Administrator' -Password 'x' -Destination 'C:\PrtgMover\tunnel\job' } | Should -Throw
     }
 }
+
+Describe 'Routes of a VPN connection (format vpn-routes/1)' {
+    It 'converts prefix lengths and masks' {
+        ConvertTo-PmIPv4Mask 24 | Should -Be '255.255.255.0'
+        ConvertTo-PmIPv4Mask 32 | Should -Be '255.255.255.255'
+        ConvertTo-PmIPv4Mask 0 | Should -Be '0.0.0.0'
+        ConvertTo-PmPrefixLength '255.255.255.0' | Should -Be 24
+        ConvertTo-PmPrefixLength '255.255.255.255' | Should -Be 32
+    }
+
+    It 'knows whether a gateway lies inside a network' {
+        Test-PmAddressInPrefix -Address '192.168.25.1' -Prefix '192.168.25.0/24' | Should -BeTrue
+        Test-PmAddressInPrefix -Address '192.168.26.1' -Prefix '192.168.25.0/24' | Should -BeFalse
+        Test-PmAddressInPrefix -Address '10.0.0.2' -Prefix '10.0.0.2/32' | Should -BeTrue
+        Test-PmAddressInPrefix -Address 'not-an-address' -Prefix '10.0.0.0/8' | Should -BeFalse
+    }
+
+    It 'writes a backup in the shared format, also for a VPN that does not exist or is not connected' {
+        $b = Get-PmVpnRouteBackup -Name 'no-such-vpn-for-the-test'
+        $b.format | Should -Be 'vpn-routes/1'
+        $b.vpn | Should -Be 'no-such-vpn-for-the-test'
+        $b.computer | Should -Be $env:COMPUTERNAME
+        $b.tunnelIp | Should -BeNullOrEmpty
+        @($b.liveRoutes).Count | Should -Be 0
+        $json = ConvertTo-Json -InputObject $b -Depth 5 | ConvertFrom-Json
+        foreach ($k in 'format', 'computer', 'vpn', 'created', 'tunnelIp', 'connectionRoutes', 'liveRoutes', 'persistentRoutes') { $json.PSObject.Properties.Name | Should -Contain $k }
+        [datetimeoffset]::Parse($json.created) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'leaves routes alone that are already there and reports a connection that does not exist' {
+        Mock Get-PmPersistentRoutes { @([ordered]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '10.0.0.2'; metric = 1 }) }
+        Mock Write-PmLog { }
+        $backup = [pscustomobject]@{ vpn = 'no-such-vpn-for-the-test'; connectionRoutes = @([pscustomobject]@{ prefix = '8.8.8.8/32'; metric = 1 })
+            persistentRoutes = @([pscustomobject]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '10.0.0.2'; metric = 1 }) }
+        $r = Restore-PmVpnRoutes -Backup $backup
+        $r.kept | Should -Be 1
+        $r.added | Should -Be 0
+        $r.failed | Should -Be 1
+    }
+}
+
+Describe 'Backups are listed as PRTG or VPN' {
+    It 'tells the kind of a backup from its contents' {
+        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $true }; vpn = [pscustomobject]@{ included = $true } }) | Should -Be 'prtg'
+        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $false }; vpn = [pscustomobject]@{ included = $true } }) | Should -Be 'vpn'
+        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $false }; vpn = [pscustomobject]@{ included = $false } }) | Should -Be 'files'
+        Get-PmBackupKind -Manifest $null -Name 'VPN_SERVER_20260101-000000.zip' | Should -Be 'vpn'
+        Get-PmBackupKind -Manifest $null -Name 'PRTG_SERVER_20260101-000000.zip' | Should -Be 'prtg'
+    }
+
+    It 'makes a VPN backup of this computer with the routes of every connection' {
+        $root = Join-Path $Work 'manager-vpn-backup'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Set-PmRoot -Path $root
+        $me = Set-PmServer -Name 'THIS' -HostName 'localhost' -Transport local -Role both
+        $old = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'
+        try {
+            $job = New-PmJobObject -Type 'backup' -Summary 'vpn backup test'
+            $r = Invoke-PmBackupFlow -Server (Get-PmServer -Id $me.id) -Options @{ IncludePrtg = $false; IncludeVpn = $true; IncludeDesktop = $false; NoTouch = $true } -Job $job
+        } finally { $env:PRTGMOVER_TEST = $old }
+        (Split-Path $r.Zip -Leaf) | Should -BeLike 'VPN_*'
+        $b = @(Get-PmBackups | ForEach-Object { $_ }) | Where-Object { $_.name -eq (Split-Path $r.Zip -Leaf) }
+        $b.kind | Should -Be 'vpn'
+        $b.manifest.vpn.included | Should -BeTrue
+        foreach ($route in @($b.manifest.vpn.routes | Where-Object { $_ })) {
+            Test-Path -LiteralPath (Join-Path $r.StageDir "vpn\routes\$($route.file)") | Should -BeTrue
+            (Get-Content -LiteralPath (Join-Path $r.StageDir "vpn\routes\$($route.file)") -Raw | ConvertFrom-Json).format | Should -Be 'vpn-routes/1'
+        }
+    }
+}

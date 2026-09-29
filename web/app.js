@@ -411,14 +411,35 @@
   // ------------------------------------------------------------ backups
   async function loadBackups() { state.backups = arr(await api('GET', '/api/backups')); renderBackups(); renderOverview(); }
 
+  function routeBadges(m) {
+    // one line per VPN connection: how many routes of each kind the backup holds
+    const routes = arr(m.vpn && m.vpn.routes);
+    if (!routes.length) return arr(m.vpn && m.vpn.allUsers).map((n) => `<span class="badge">${esc(n)}</span>`).join(' ');
+    return routes.map((r) => `<div class="ports" style="margin:2px 0"><span class="badge info">${esc(r.vpn)}</span>`
+      + `<span class="badge" title="routes bound to the connection">bound ${esc(r.connection)}</span>`
+      + `<span class="badge ${r.connected ? '' : 'warn'}" title="${r.connected ? 'routes on the interface of the VPN at the time of the backup' : 'the VPN was not connected at the time of the backup, so its live routes could not be read'}">live ${r.connected ? esc(r.live) : '–'}</span>`
+      + `<span class="badge" title="persistent routes that point into the VPN">persistent ${esc(r.persistent)}</span></div>`).join('');
+  }
+
   function renderBackups() {
-    const tb = $('#backupsTable tbody');
-    if (!state.backups.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No backups yet. Run a backup or migration, or upload a package.</td></tr>'; return; }
-    tb.innerHTML = state.backups.map((b) => {
+    const sel = $('#vpnBackupSource');
+    const keep = sel.value;
+    const sources = state.servers.filter((s) => s.role !== 'target');
+    sel.innerHTML = sources.length ? sources.map((s) => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('') : '<option value="">— add a server first —</option>';
+    if (keep && sources.some((s) => s.id === keep)) sel.value = keep;
+    const full = state.backups.filter((b) => b.kind !== 'vpn');
+    const vpn = state.backups.filter((b) => b.kind === 'vpn');
+    $('#backupsTable tbody').innerHTML = full.length ? full.map(backupRow).join('') : '<tr><td colspan="6" class="empty">No PRTG backups yet. Run a backup or migration, or upload a package.</td></tr>';
+    $('#vpnBackupsTable tbody').innerHTML = vpn.length ? vpn.map(backupRow).join('') : '<tr><td colspan="6" class="empty">No VPN backups yet. Choose a server and press "Back up VPN and routes".</td></tr>';
+  }
+
+  function backupRow(b) {
+    {
       const m = b.manifest || {};
       const parts = [];
       if (m.prtg && m.prtg.included) parts.push(`<span class="badge info">PRTG ${esc(m.prtg.version || '')}</span>`);
-      if (m.vpn && m.vpn.included) parts.push(`<span class="badge">VPN ×${arr(m.vpn.allUsers).length}</span>`);
+      if (b.kind === 'vpn') parts.push(routeBadges(m));
+      else if (m.vpn && m.vpn.included) parts.push(`<span class="badge" title="${esc(arr(m.vpn.routes).map((r) => `${r.vpn}: ${r.connection} bound, ${r.connected ? r.live : 'no'} live, ${r.persistent} persistent routes`).join(' · '))}">VPN ×${arr(m.vpn.allUsers).length}${arr(m.vpn.routes).length ? ' + routes' : ''}</span>`);
       if (m.desktop && m.desktop.included) parts.push(`<span class="badge">Desktop ×${arr(m.desktop.users).length}</span>`);
       if (arr(m.extra).length) parts.push(`<span class="badge">Extra ×${arr(m.extra).length}</span>`);
       const dl = `/api/backups/${encodeURIComponent(b.name)}/download`;
@@ -433,16 +454,25 @@
           <button class="btn small" data-act="restore" data-name="${esc(b.name)}">Restore…</button>
           <button class="btn small danger" data-act="del" data-name="${esc(b.name)}">Delete</button>
         </div></td></tr>`;
-    }).join('');
+    }
   }
 
-  $('#backupsTable').addEventListener('click', async (e) => {
+  async function onBackupClick(e) {
     const b = e.target.closest('button[data-act]'); if (!b) return;
     const name = b.dataset.name;
     if (b.dataset.act === 'del' && confirm(`Delete backup ${name} from the manager?`)) {
       try { await api('DELETE', `/api/backups/${encodeURIComponent(name)}`); toast('Backup deleted'); loadBackups(); } catch (err) { toast(err.message, true); }
     }
     if (b.dataset.act === 'restore') openRestore(name);
+  }
+  $('#backupsTable').addEventListener('click', onBackupClick);
+  $('#vpnBackupsTable').addEventListener('click', onBackupClick);
+  $('#vpnBackupBtn').addEventListener('click', () => {
+    const id = $('#vpnBackupSource').value;
+    const s = state.servers.find((x) => x.id === id);
+    if (!s) return toast('Add a server first', true);
+    if (!confirm(`Back up the VPN connections and routes of ${s.name}?\n\nNothing is stopped or changed on the server. PRTG and desktop files are not part of this backup. Passwords are never saved.`)) return;
+    startJob({ type: 'backup', sourceId: id, options: { IncludePrtg: false, IncludeHistory: false, IncludeProgram: false, IncludeDesktop: false, IncludeVpn: true, NoTouch: true, SourceAfter: 'Restart' } });
   });
 
   function openRestore(name) {
@@ -460,7 +490,7 @@
     if (!targets.length) return toast('Select at least one target', true);
     startJob({
       type: 'restore', backupName: f.dataset.name, targetIds: targets,
-      options: { CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked, RestorePrtg: f.RestorePrtg.checked, RestoreVpn: f.RestoreVpn.checked, RestoreDesktop: f.RestoreDesktop.checked, RestoreExtra: f.RestoreExtra.checked, StartServices: f.StartServices.checked, InstallerFile: f.InstallerFile.value },
+      options: { CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked, RestorePrtg: f.RestorePrtg.checked, RestoreVpn: f.RestoreVpn.checked, RestoreRoutes: f.RestoreRoutes.checked, RestoreDesktop: f.RestoreDesktop.checked, RestoreExtra: f.RestoreExtra.checked, StartServices: f.StartServices.checked, InstallerFile: f.InstallerFile.value },
     });
   });
 

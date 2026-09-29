@@ -153,8 +153,23 @@
         </div>
       </header>
       <div class="upload-progress" id="uploadProgress" hidden><div class="bar"><i></i></div><span></span></div>
-      <div class="card flush"><div class="table-wrap"><table class="table" id="backupsTable">
+      <header class="page-head" style="margin-top:6px">
+        <div><h2>PRTG</h2><p class="muted">Full backups: PRTG with configuration, history, license and program, plus the VPN connections and desktop files that were selected.</p></div>
+      </header>
+      <div class="card flush"><div class="table-wrap"><table class="table backups" id="backupsTable">
         <thead><tr><th>Package</th><th>Source</th><th>Contents</th><th>Size</th><th>Created</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div></div>
+
+      <header class="page-head" style="margin-top:22px">
+        <div><h2>VPN</h2><p class="muted">VPN connections with their routes and routings: routes bound to each connection, live routes on its interface, persistent routes into it. Passwords are never part of a backup.</p></div>
+        <div class="actions">
+          <select id="vpnBackupSource" title="Server whose VPN connections and routes are backed up"></select>
+          <button class="btn primary" id="vpnBackupBtn">Back up VPN and routes</button>
+        </div>
+      </header>
+      <div class="card flush"><div class="table-wrap"><table class="table backups" id="vpnBackupsTable">
+        <thead><tr><th>Package</th><th>Source</th><th>Connections and routes</th><th>Size</th><th>Created</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div></div>
     </section>
@@ -247,6 +262,7 @@
     <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source license</label>
     <label class="check sub"><input type="checkbox" name="OpenFirewall" checked> Open firewall for PRTG ports</label>
     <label class="check"><input type="checkbox" name="RestoreVpn" checked> VPN connections</label>
+    <label class="check sub"><input type="checkbox" name="RestoreRoutes" checked> Routes of the VPN connections (missing routes are put back, nothing is removed)</label>
     <label class="check"><input type="checkbox" name="RestoreDesktop" checked> Desktop files</label>
     <label class="check"><input type="checkbox" name="RestoreExtra" checked> Extra paths</label>
     <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify web interface</label>

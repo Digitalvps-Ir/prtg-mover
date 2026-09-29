@@ -14,7 +14,7 @@ $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
 $script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram', 'IncludeLogs', 'IncludeAutoBackups'
-$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage', 'TargetAddress'
+$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreRoutes', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage', 'TargetAddress'
 
 function Get-PmOsCaption {
     <# Windows caption when CIM exists; otherwise the runtime OS description. #>
@@ -586,15 +586,29 @@ function Get-PmBackups {
         $meta = $null
         $side = "$($_.FullName).meta.json"
         if (Test-Path -LiteralPath $side) { $meta = Get-Content -LiteralPath $side -Raw -Encoding UTF8 | ConvertFrom-Json }
+        $m = if ($meta) { $meta.manifest } else { $null }
         [pscustomobject]@{
             name     = $_.Name
             size     = $_.Length
             created  = $_.LastWriteTime.ToString('o')
             source   = if ($meta) { $meta.source } else { $null }
             sha256   = if ($meta) { $meta.sha256 } else { $null }
-            manifest = if ($meta) { $meta.manifest } else { $null }
+            manifest = $m
+            kind     = Get-PmBackupKind -Manifest $m -Name $_.Name
         }
     }
+}
+
+function Get-PmBackupKind {
+    <# 'prtg': a backup with PRTG in it (full backup). 'vpn': VPN connections and routes only. 'files': neither. #>
+    param($Manifest, [string]$Name)
+    if ($Manifest) {
+        if ($Manifest.prtg -and $Manifest.prtg.included) { return 'prtg' }
+        if ($Manifest.vpn -and $Manifest.vpn.included) { return 'vpn' }
+        return 'files'
+    }
+    if ($Name -like 'VPN_*') { return 'vpn' }
+    return 'prtg'
 }
 
 function Get-PmBackupFile {
@@ -1048,10 +1062,11 @@ function Find-PmResumeStage {
 }
 
 function New-PmPackageFromStage {
-    <# Builds backups\PRTG_<computer>_<ts>.zip (+ .meta.json) from a complete staging folder on the manager. #>
+    <# Builds backups\PRTG_<computer>_<ts>.zip (VPN_... for a backup of VPN connections and routes only) and its .meta.json from a complete staging folder on the manager. #>
     param([Parameter(Mandatory)][string]$StageDir, $Job, [string]$SourceName)
     $manifest = Get-Content -LiteralPath (Join-Path $StageDir 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    $zipName = 'PRTG_{0}_{1}.zip' -f $manifest.source.computer, (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $prefix = switch (Get-PmBackupKind -Manifest $manifest) { 'vpn' { 'VPN' } 'files' { 'FILES' } default { 'PRTG' } }
+    $zipName = '{0}_{1}_{2}.zip' -f $prefix, $manifest.source.computer, (Get-Date -Format 'yyyyMMdd-HHmmss')
     $local = Join-Path (Get-PmPath Backups) $zipName
     Add-PmJobLog -Job $Job -Level STEP -Message ("Compressing the staged copy ({0:N2} GB) into {1} on the manager..." -f ($manifest.stagingBytes / 1GB), $zipName)
     $sw = [Diagnostics.Stopwatch]::StartNew()
