@@ -7,7 +7,10 @@
     manage servers, run connectivity tests, back up / migrate / restore PRTG servers,
     and download or upload backup packages.
 
-    The dashboard listens on localhost and does not ask for an access token.
+    Every API request needs an access token (data\token.txt). Opened on the manager itself
+    (http://localhost:<port>/) the page receives the token automatically, so nothing has
+    to be typed. From another computer (-ListenAll) the link with the token is needed.
+    Requests that come from other web sites are refused.
 
 .PARAMETER Port
     TCP port of the dashboard. Default 8765.
@@ -21,7 +24,7 @@
     Do not open the browser automatically.
 
 .PARAMETER NewToken
-    Kept so older start commands still run. The dashboard no longer uses a token.
+    Generate a new access token (invalidates links that contain the old one).
 
 .EXAMPLE
     .\Start-PrtgMover.ps1
@@ -34,7 +37,9 @@ param(
     [switch]$ListenAll,
     [switch]$NoBrowser,
     [switch]$NewToken,
-    [switch]$Quiet
+    [switch]$Quiet,
+    # Folder for config\, data\, backups\ and installers\. Default: the program folder.
+    [string]$DataRoot
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,14 +47,15 @@ $Root = $PSScriptRoot
 # Echo live job logs into this console (use -Quiet to turn it off).
 if (-not $Quiet) { $env:PRTGMOVER_ECHO = '1' }
 Import-Module (Join-Path $Root 'src\PrtgMover.psm1') -Force -DisableNameChecking
-Set-PmRoot -Path $Root
+if ($DataRoot) { New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null; Set-PmRoot -Path $DataRoot } else { Set-PmRoot -Path $Root }
+$DataRootPath = Get-PmPath Root
 # [string] + Trim() strips the provider NoteProperties Get-Content attaches (ConvertTo-Json would walk them).
 $Version = 'dev'
 $versionFile = Join-Path $Root 'VERSION'
 if (Test-Path $versionFile) { $Version = ([IO.File]::ReadAllText($versionFile)).Trim() }
 
-# The dashboard does not use an access token. Remove a token left by an older version.
-Remove-Item -LiteralPath (Join-Path (Get-PmPath Data) 'token.txt') -Force -ErrorAction SilentlyContinue
+# ------------------------------------------------------------------ token
+$Token = Get-PmDashboardToken -New:$NewToken
 
 # ------------------------------------------------------------------ helpers
 function Send-PmResponse {
@@ -61,6 +67,8 @@ function Send-PmResponse {
         $res.ContentType = $ContentType
         $res.Headers['Cache-Control'] = 'no-store'
         $res.Headers['X-Content-Type-Options'] = 'nosniff'
+        $res.Headers['X-Frame-Options'] = 'DENY'
+        $res.Headers['Referrer-Policy'] = 'no-referrer'
         $res.ContentLength64 = $bytes.Length
         $res.OutputStream.Write($bytes, 0, $bytes.Length)
     } finally { $res.Close() }
@@ -80,8 +88,12 @@ function Read-PmBody {
 }
 
 function Test-PmAuth {
+    <# Returns the decision of Test-PmDashboardRequest for this request. #>
     param($Ctx)
-    return $true
+    $req = $Ctx.Request
+    Test-PmDashboardRequest -Method $req.HttpMethod -Path $req.Url.AbsolutePath.TrimEnd('/') -ExpectedToken $Token `
+        -HeaderToken $req.Headers['X-PM-Token'] -QueryToken $req.QueryString['token'] `
+        -Origin $req.Headers['Origin'] -RequestOrigin $req.Url.GetLeftPart([UriPartial]::Authority)
 }
 
 function Get-PmServerView {
@@ -176,26 +188,36 @@ function Invoke-PmRoute {
     if ($path -eq '') { $path = '/' }
     $method = $req.HttpMethod
 
-    # ---- static files (no token needed; the page asks for it)
+    # ---- static files (no token needed). The page itself gets the token only on the manager.
     if ($method -eq 'GET' -and $path -notlike '/api/*') {
         $name = if ($path -eq '/') { 'index.html' } else { $path.TrimStart('/') }
         $file = Join-Path (Get-PmPath Web) $name
         if ($name -match '^[\w\-\.]+$' -and (Test-Path -LiteralPath $file -PathType Leaf)) {
             $types = @{ '.html' = 'text/html; charset=utf-8'; '.js' = 'application/javascript; charset=utf-8'; '.css' = 'text/css; charset=utf-8'; '.svg' = 'image/svg+xml' }
             $ct = $types[[IO.Path]::GetExtension($file)]; if (-not $ct) { $ct = 'application/octet-stream' }
-            Send-PmResponse -Ctx $Ctx -Body (Get-Content -LiteralPath $file -Raw -Encoding UTF8) -ContentType $ct
+            $body = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)
+            if ($name -eq 'index.html') {
+                $give = Test-PmLocalBrowser -IsLocal $req.IsLocal -HostName $req.UserHostName
+                $body = $body.Replace('<meta name="pm-token" content="">', ('<meta name="pm-token" content="{0}">' -f $(if ($give) { $Token } else { '' })))
+            }
+            Send-PmResponse -Ctx $Ctx -Body $body -ContentType $ct
         } else { Send-PmJson $Ctx @{ error = 'Not found' } 404 }
         return
     }
 
-    if (-not (Test-PmAuth $Ctx)) { Send-PmJson $Ctx @{ error = 'Unauthorized' } 401; return }
+    $auth = Test-PmAuth $Ctx
+    if (-not $auth.Allowed) {
+        Write-PmManagerLog -Level WARN -Message ("API {0} {1} refused ({2}): {3} | from {4} origin '{5}'" -f $method, $path, $auth.Status, $auth.Reason, $req.RemoteEndPoint, $req.Headers['Origin']) -Source 'api'
+        Send-PmJson $Ctx @{ error = $auth.Reason } $auth.Status
+        return
+    }
 
     $seg = @($path.Substring(1).Split('/') | ForEach-Object { [uri]::UnescapeDataString($_) })   # api, resource, id, action
 
     switch -Regex ("$method $path") {
         '^GET /api/info$' {
             Send-PmJson $Ctx @{
-                version = $Version; manager = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; root = $Root
+                version = $Version; manager = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; root = $DataRootPath
                 backupsPath = (Get-PmPath Backups); installersPath = (Get-PmPath Installers)
                 servers = @(Get-PmServers).Count; backups = @(Get-PmBackups).Count
             }
@@ -263,7 +285,7 @@ function Invoke-PmRoute {
             $leaf = Get-PmSafeLeaf -Name $req.QueryString['name'] -Extensions '.zip'
             $dest = Join-Path (Get-PmPath Backups) $leaf
             if (Test-Path -LiteralPath $dest) { Send-PmJson $Ctx @{ error = 'A backup with this name already exists.' } 409; return }
-            Start-PmIoTask -Script $UploadScript -Arguments @($Ctx, $dest, 'backup', (Join-Path $Root 'src\PrtgMover.psm1'), $Root)
+            Start-PmIoTask -Script $UploadScript -Arguments @($Ctx, $dest, 'backup', (Join-Path $Root 'src\PrtgMover.psm1'), $DataRootPath)
             return
         }
         '^GET /api/backups/[^/]+/download$' {
@@ -277,7 +299,7 @@ function Invoke-PmRoute {
         '^GET /api/installers$' { Send-PmJson $Ctx @(Get-PmInstallers); return }
         '^PUT /api/installers/upload$' {
             $leaf = Get-PmSafeLeaf -Name $req.QueryString['name'] -Extensions '.exe', '.zip'
-            Start-PmIoTask -Script $UploadScript -Arguments @($Ctx, (Join-Path (Get-PmPath Installers) $leaf), 'installer', $null, $Root)
+            Start-PmIoTask -Script $UploadScript -Arguments @($Ctx, (Join-Path (Get-PmPath Installers) $leaf), 'installer', $null, $DataRootPath)
             return
         }
         '^DELETE /api/installers/[^/]+$' {
@@ -401,8 +423,9 @@ $url = "http://localhost:$Port/"
 Write-Host ''
 Write-Host "  PRTG Mover $Version - dashboard running" -ForegroundColor Cyan
 Write-Host "  URL   : $url" -ForegroundColor Green
-if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/  (plain HTTP - trusted networks only)" -ForegroundColor Yellow }
-Write-Host "  Data  : $Root"
+if ($ListenAll) { Write-Host "  LAN   : http://$($env:COMPUTERNAME):$Port/?token=$Token  (plain HTTP - trusted networks only)" -ForegroundColor Yellow }
+Write-Host '  Access: this computer opens the dashboard without a token; every API request is checked.'
+Write-Host "  Data  : $DataRootPath"
 Write-Host '  Stop  : Ctrl+C'
 Write-Host "  Logs  : $(Join-Path (Get-PmPath Data) 'logs')  (manager, audit, robocopy) + data\jobs + data\agent\<id>\agent.log"
 Repair-PmInterruptedJobs
