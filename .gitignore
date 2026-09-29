@@ -1,0 +1,11 @@
+# Runtime data - never commit backups, credentials or local inventory
+backups/
+data/
+logs/
+config/servers.json
+config/settings.json
+*.zip
+*.cred.xml
+*.log
+Thumbs.db
+.vscode/
