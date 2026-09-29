@@ -156,7 +156,8 @@ try {
             if ($local) {
                 # a server, or a computer with VPN connections of its own: VPN Watch manages this computer directly
                 $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$VpnWatchPath\tools\Install-VpnWatchLocal.ps1`"", '-Port', $VpnWatchPort)
-                if ($NoAutostart) { $a += '-NoStart' } else { $a += '-AtLogon' }
+                # -AtBoot: the panel starts with the computer, without logon (VPN Watch 0.6.0 and newer)
+                if ($NoAutostart) { $a += '-NoStart' } else { $a += '-AtBoot' }
             } else {
                 $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$VpnWatchPath\tools\Install-VpnWatchShortcut.ps1`"", '-Port', $VpnWatchPort)
                 if ($NoAutostart) { $a += '-NoAutostart' }
