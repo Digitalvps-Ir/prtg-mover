@@ -1928,6 +1928,7 @@ function Enable-PmTunnelWinRm {
 function Open-PmTunnelWinRmSession {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Passed once over the already-authenticated command channel so this server can sign in to the peer over the tunnel. Never logged.')]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'The peer is a tunnel address. The password is turned into a PSCredential and is not logged.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'The peer password arrives once on the command channel and is wrapped only to build a PSCredential. It is not logged or stored.')]
     param(
         [Parameter(Mandatory)][string]$PeerTunnelIp,
         [Parameter(Mandatory)][string]$UserName,
