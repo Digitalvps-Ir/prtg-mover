@@ -98,6 +98,7 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
 Describe 'RDP agent transport (end to end, local)' {
     BeforeAll {
         $env:PRTGMOVER_TEST = '1'
+        $env:PRTGMOVER_TSCLIENT_ROOT = $Root   # the local "agent" reaches the manager folder directly, not via \\tsclient
         Set-PmRoot -Path $Root   # the agent resolves the manager folder from its own location
         $script:AgentSrv = Set-PmServer -Name 'PESTER-AGENT' -HostName '127.0.0.1' -Transport rdp
         $script:AgentProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
@@ -107,7 +108,7 @@ Describe 'RDP agent transport (end to end, local)' {
         if ($script:AgentProc) { Stop-Process -Id $AgentProc.Id -Force -ErrorAction SilentlyContinue }
         Remove-PmServer -Id $AgentSrv.id
         Remove-Item -LiteralPath (Join-Path $Root "data\agent\$($AgentSrv.id)") -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item Env:\PRTGMOVER_TEST -ErrorAction SilentlyContinue
+        Remove-Item Env:\PRTGMOVER_TEST, Env:\PRTGMOVER_TSCLIENT_ROOT -ErrorAction SilentlyContinue
     }
 
     It 'backs up through the agent, stores the package on the manager and restores it' {
@@ -115,15 +116,108 @@ Describe 'RDP agent transport (end to end, local)' {
         New-Item -ItemType Directory -Force -Path $src | Out-Null
         'via-agent' | Set-Content (Join-Path $src 'f.txt')
         $job = New-PmJobObject -Type 'backup' -Summary 'pester'
-        $file = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src); NoTouch = $true } -Job $job
+        $bk = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src); NoTouch = $true } -Job $job
+        $file = $bk.Zip
         try {
             Test-Path -LiteralPath $file | Should -BeTrue
+            # RDP mode stages directly on the manager
+            Test-Path -LiteralPath (Join-Path $bk.StageDir 'manifest.json') | Should -BeTrue
             Remove-Item -LiteralPath $src -Recurse -Force
-            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $file -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
+            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $file -StageDir $bk.StageDir -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
             $rep.Extra | Should -Be 'ok'
             Get-Content (Join-Path $src 'f.txt') | Should -Be 'via-agent'
-            @($job.logs | Where-Object { $_.message -like '*over RDP*' }).Count | Should -BeGreaterThan 0
-        } finally { Remove-PmBackup -Name (Split-Path $file -Leaf) }
+            @($job.logs | Where-Object { $_.message -like '*direct staging on the manager*' }).Count | Should -BeGreaterThan 0
+            Test-Path -LiteralPath (Join-Path $Root "data\agent\$($AgentSrv.id)\agent.log") | Should -BeTrue
+        } finally {
+            Remove-PmBackup -Name (Split-Path $file -Leaf)
+            Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It 'restores from a zip by extracting it on the manager for the agent' {
+        $src = Join-Path $Work 'agent-extra2'
+        New-Item -ItemType Directory -Force -Path $src | Out-Null
+        'from-zip' | Set-Content (Join-Path $src 'g.txt')
+        $job = New-PmJobObject -Type 'restore' -Summary 'pester'
+        $bk = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src) } -Job $job
+        Remove-Item -LiteralPath $bk.StageDir -Recurse -Force
+        Remove-Item -LiteralPath $src -Recurse -Force
+        try {
+            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $bk.Zip -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
+            $rep.Extra | Should -Be 'ok'
+            Get-Content (Join-Path $src 'g.txt') | Should -Be 'from-zip'
+        } finally {
+            Remove-PmBackup -Name (Split-Path $bk.Zip -Leaf)
+            Remove-Item -LiteralPath (Join-Path $Root ("data\staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($bk.Zip))) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe 'Connectivity tests keep each method separately' {
+    BeforeAll {
+        $mgr = Join-Path $Work 'manager-tests'
+        New-Item -ItemType Directory -Force -Path $mgr | Out-Null
+        Set-PmRoot -Path $mgr
+        # 127.0.0.1 with ports that are certainly closed
+        $script:T = Set-PmServer -Name 'CLOSED' -HostName '127.0.0.1' -RdpPort 1 -Port 2 -Transport rdp
+    }
+
+    It 'fails an RDP test on a closed port and records only the RDP result' {
+        { Invoke-PmTestFlow -Server (Get-PmServer -Id $T.id) -Mode rdp } | Should -Throw
+        $st = Get-Content (Join-Path $mgr "data\status\$($T.id).json") -Raw | ConvertFrom-Json
+        $st.methods.rdp.ok | Should -BeFalse
+        $st.methods.winrm | Should -BeNullOrEmpty
+    }
+
+    It 'keeps the earlier RDP result when WinRM is tested and passes if one method is OK' {
+        $sf = Join-Path $mgr "data\status\$($T.id).json"
+        $st = Get-Content $sf -Raw | ConvertFrom-Json
+        $st.methods.rdp.ok = $true      # simulate: RDP worked earlier
+        $st | ConvertTo-Json -Depth 6 | Set-Content $sf
+        { Invoke-PmTestFlow -Server (Get-PmServer -Id $T.id) -Mode winrm } | Should -Throw
+        $st = Get-Content $sf -Raw | ConvertFrom-Json
+        $st.methods.rdp.ok | Should -BeTrue
+        $st.methods.winrm.ok | Should -BeFalse
+        $st.ok | Should -BeTrue
+    }
+}
+
+Describe 'Resume' {
+    BeforeAll {
+        $mgr = Join-Path $Work 'manager-resume'
+        New-Item -ItemType Directory -Force -Path $mgr | Out-Null
+        Set-PmRoot -Path $mgr
+    }
+
+    It 'refuses to resume a job without saved parameters and resumes one that has them' {
+        $old = New-PmJobObject -Type 'test' -Summary 'old'
+        $old.status = 'failed'
+        Save-PmJobRecord -Job $old
+        { Resume-PmJob -Id $old.id } | Should -Throw '*cannot be resumed*'
+
+        $s = Set-PmServer -Name 'R' -HostName '127.0.0.1' -RdpPort 1 -Port 2
+        $j = New-PmJobObject -Type 'test' -Summary 'with params'
+        $j.status = 'failed'; $j.params = @{ ServerIds = [string[]]@($s.id); Mode = 'rdp' }
+        Save-PmJobRecord -Job $j
+        $new = Resume-PmJob -Id $j.id
+        $new.resumedFrom | Should -Be $j.id
+        $new.summary | Should -BeLike 'Resume of*'
+        # wait for the background job to finish
+        $deadline = (Get-Date).AddSeconds(30)
+        while ($new.status -in 'queued', 'running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+        $new.status | Should -Be 'failed'   # closed port -> the test fails, but the job ran
+    }
+
+    It 'writes an audit trail and a diagnostics bundle without secrets' {
+        Test-Path (Join-Path $mgr 'data\logs\audit.log') | Should -BeTrue
+        $zip = New-PmDiagnosticsBundle
+        Test-Path $zip | Should -BeTrue
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $z = [IO.Compression.ZipFile]::OpenRead($zip)
+        try {
+            @($z.Entries | Where-Object { $_.FullName -match 'cred\.xml|token\.txt' }).Count | Should -Be 0
+            @($z.Entries | Where-Object { $_.FullName -eq 'environment.txt' }).Count | Should -Be 1
+        } finally { $z.Dispose() }
     }
 }
 

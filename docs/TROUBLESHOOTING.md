@@ -1,5 +1,26 @@
 # Troubleshooting
 
+## Where to look first
+
+| What | Where |
+|---|---|
+| Everything at once | **Jobs → Download diagnostics**: a zip with all logs, job records, agent logs, test results and an environment report. It contains no passwords. |
+| One job, live | **Jobs** → select the job → tick **Show debug** to see the exact error line, stack, agent requests and timings |
+| Job log file | `data\jobs\<job-id>.log` and `.json` (the record, including resume checkpoints) |
+| Manager / API errors | `data\logs\manager-yyyyMMdd.log` |
+| Who did what | `data\logs\audit.log` |
+| File copy problems | `data\logs\robocopy\robocopy-<job>-<server>.log` |
+| Agent (RDP mode) | `data\agent\<server-id>\agent.log`, `heartbeat.json`, `requests\*.abandoned` / `*.orphaned` |
+
+## Resume
+
+If a migration fails or is cancelled, open the job and press **Resume**:
+- The package that was already built is reused, so the source is **not** contacted again.
+- Targets that already finished are skipped.
+- Server addresses are read from the inventory again, so a changed IP only needs to be updated under *Servers*.
+
+If the RDP session drops while a job runs, the job waits up to 30 minutes for the agent to come back. Reconnect with the **RDP** button and run the agent command again, and the step is repeated automatically.
+
 | Symptom | Cause / fix |
 |---|---|
 | `The client cannot connect to the destination…` | WinRM isn't enabled on the server, or the firewall blocks it. Run `tools\Enable-PrtgMoverRemoting.ps1` on the server and check TCP 5985/5986 from the manager with `Test-NetConnection <ip> -Port 5985`. |

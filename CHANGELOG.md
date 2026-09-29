@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.3.0 — 2026-09-29
+
+### Added
+- **Direct staging for RDP-mode servers.**
+  - The source copies straight onto the manager's disk (VSS snapshot → `\\tsclient`), and the manager builds the zip. The source needs **no free disk space**.
+  - RDP-mode targets read the extracted package directly from the manager (no zip copy, no extraction on the target). They only need about the size of the data.
+- **Resume / Retry** for failed or cancelled jobs:
+  - The package that was already built and targets that already finished are skipped.
+  - Server addresses are re-read from the inventory, so a changed IP is used automatically.
+  - Checkpoints are saved after every milestone.
+- **Automatic reconnect**: if an RDP session or agent window drops mid-job, the job waits up to 30 minutes for the agent to come back and repeats the step (up to 3 times).
+- **Audit and diagnostics.**
+  - `data\logs\manager-yyyyMMdd.log`: API calls, errors with file, line and stack, job warnings.
+  - `data\logs\audit.log`: server, credential, job, backup and RDP actions (no secrets).
+  - `data\logs\robocopy\*.log`: complete robocopy logs; errors are quoted in the job log.
+  - `data\agent\<id>\agent.log`: every agent request with parameters, duration and errors with stack.
+  - A DEBUG level in job logs (exact line, stack, timings, agent requests) with a *Show debug* toggle.
+  - **Download diagnostics**: one zip with all of the above plus an environment report (no passwords or token).
+- The agent reloads a newer payload automatically, and the manager warns when an agent runs an older version.
+
+### Fixed
+- Connectivity tests: **Test RDP** and **Test WinRM** results are stored separately with their own time, and one no longer erases the other. The server shows **PASS** when at least one method works, and each badge shows its detail.
+- A test no longer waits behind a busy agent.
+- The agent heartbeat uses the manager's clock, so servers with a skewed clock are handled correctly.
+- Disk space checks match the connection method (the source needs nothing in RDP mode, and the manager is checked instead).
+
 ## 1.2.0 — 2026-09-29
 
 ### Added
