@@ -1119,6 +1119,7 @@ function Get-PmPullList {
             $full = $f.FullName
             if (@($xd | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
             if (@($ExcludeFiles | Where-Object { $f.Name -like $_ }).Count) { continue }
+            if ($f.Name -in 'desktop.ini', 'Thumbs.db') { continue }   # Windows shell junk
             [void]$list.Add([pscustomobject]@{ Rel = $full.Substring($root.Length + 1); Size = $f.Length; Time = $f.LastWriteTimeUtc.Ticks })
         }
     }

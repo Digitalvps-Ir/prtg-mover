@@ -892,6 +892,7 @@ function Get-PmLocalFileList {
     if (-not (Test-Path -LiteralPath $Root)) { return $out }
     $r = (Get-Item -LiteralPath $Root).FullName.TrimEnd('\')
     foreach ($f in (Get-ChildItem -LiteralPath $r -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        if ($f.Name -in 'desktop.ini', 'Thumbs.db') { continue }   # Windows shell junk
         $out[$f.FullName.Substring($r.Length + 1).ToLowerInvariant()] = $f
     }
     return $out
@@ -940,10 +941,23 @@ function Invoke-PmTransferFiles {
                 if ($Direction -eq 'Pull') {
                     $ld = Split-Path $local -Parent
                     if (-not (Test-Path -LiteralPath $ld)) { New-Item -ItemType Directory -Force -Path $ld | Out-Null }
-                    Copy-Item -FromSession $Session -Path $remote -Destination $local -Force -ErrorAction Stop
-                    (Get-Item -LiteralPath $local).LastWriteTimeUtc = [datetime]::new([int64]$f.Time, [DateTimeKind]::Utc)
+                    try { Copy-Item -FromSession $Session -Path $remote -Destination $local -Force -ErrorAction Stop }
+                    catch {
+                        # Copy-Item over WinRM cannot see hidden/system files - read the bytes directly instead (small files).
+                        if ($_.Exception.Message -notmatch 'Could not find item|Cannot find path' -or [int64]$f.Size -gt 64MB) { throw }
+                        $bytes = Invoke-Command -Session $Session -ScriptBlock { param($p) , [IO.File]::ReadAllBytes($p) } -ArgumentList $remote -ErrorAction Stop
+                        [IO.File]::WriteAllBytes($local, [byte[]]$bytes)
+                        Add-PmJobLog -Job $Job -Level DEBUG -Message "Hidden/system file pulled directly: $rel"
+                    }
+                    (Get-Item -LiteralPath $local -Force).LastWriteTimeUtc = [datetime]::new([int64]$f.Time, [DateTimeKind]::Utc)
                 } else {
-                    Copy-Item -ToSession $Session -Path $local -Destination $remote -Force -ErrorAction Stop
+                    try { Copy-Item -ToSession $Session -Path $local -Destination $remote -Force -ErrorAction Stop }
+                    catch {
+                        if ($_.Exception.Message -notmatch 'Could not find item|Cannot find path|Access to the path' -or [int64]$f.Size -gt 64MB) { throw }
+                        $bytes = [IO.File]::ReadAllBytes($local)
+                        Invoke-Command -Session $Session -ScriptBlock { param($p, $b) [IO.File]::WriteAllBytes($p, [byte[]]$b) } -ArgumentList $remote, $bytes -ErrorAction Stop
+                        Add-PmJobLog -Job $Job -Level DEBUG -Message "Hidden/system file pushed directly: $rel"
+                    }
                 }
                 break
             } catch {
