@@ -310,7 +310,22 @@ function New-PmSession {
     if ($Server.useSsl) { $p.UseSSL = $true }
     if ($Server.authentication -and $Server.authentication -ne 'Default') { $p.Authentication = $Server.authentication }
     if ($Credential) { $p.Credential = $Credential }
-    New-PSSession @p
+    # A fresh self-signed certificate looks "expired" (not yet valid) when this manager's clock is
+    # behind the server's. Wait until it becomes valid instead of failing (sync the clock to skip the wait).
+    $deadline = (Get-Date).AddMinutes(40); $warned = $false
+    while ($true) {
+        try { return (New-PSSession @p) }
+        catch {
+            if ($_.Exception.Message -notmatch 'certificate.*(expired|not yet valid)|SSL certificate is expired' -or (Get-Date) -gt $deadline) { throw }
+            if (-not $warned) {
+                $skew = ''
+                try { $d = [datetime]::Parse((Invoke-WebRequest 'https://github.com' -Method Head -UseBasicParsing -TimeoutSec 10).Headers['Date']).ToUniversalTime(); $skew = ' (this manager is {0:N0} min behind the internet time)' -f ((((Get-Date).ToUniversalTime() - $d).TotalMinutes) * -1) } catch { }
+                Add-PmJobLog -Job $Job -Level WARN -Message "The HTTPS certificate of $($Server.name) is not valid yet from this manager's point of view - the manager clock is behind$skew. Waiting until it becomes valid (up to 40 min). Syncing the Windows clock ends the wait immediately."
+                $warned = $true
+            }
+            Start-Sleep -Seconds 30
+        }
+    }
 }
 
 function Close-PmSession {
