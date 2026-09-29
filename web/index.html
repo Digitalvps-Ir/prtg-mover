@@ -65,6 +65,7 @@
         <div class="actions">
           <button class="btn" id="checkPortsBtn">Check ports</button>
           <button class="btn" id="testAllBtn">Test all</button>
+          <button class="btn" id="addLocalBtn" title="PRTG Mover is installed on the PRTG server itself: back up and restore this computer without any connection">Add this computer</button>
           <button class="btn primary" id="addServerBtn">Add server</button>
         </div>
       </header>
@@ -152,8 +153,23 @@
         </div>
       </header>
       <div class="upload-progress" id="uploadProgress" hidden><div class="bar"><i></i></div><span></span></div>
-      <div class="card flush"><div class="table-wrap"><table class="table" id="backupsTable">
+      <header class="page-head" style="margin-top:6px">
+        <div><h2>PRTG</h2><p class="muted">Full backups: PRTG with configuration, history, license and program, plus the VPN connections and desktop files that were selected.</p></div>
+      </header>
+      <div class="card flush"><div class="table-wrap"><table class="table backups" id="backupsTable">
         <thead><tr><th>Package</th><th>Source</th><th>Contents</th><th>Size</th><th>Created</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table></div></div>
+
+      <header class="page-head" style="margin-top:22px">
+        <div><h2>VPN</h2><p class="muted">VPN connections with their routes and routings: routes bound to each connection, live routes on its interface, persistent routes into it. Passwords are never part of a backup.</p></div>
+        <div class="actions">
+          <select id="vpnBackupSource" title="Server whose VPN connections and routes are backed up"></select>
+          <button class="btn primary" id="vpnBackupBtn">Back up VPN and routes</button>
+        </div>
+      </header>
+      <div class="card flush"><div class="table-wrap"><table class="table backups" id="vpnBackupsTable">
+        <thead><tr><th>Package</th><th>Source</th><th>Connections and routes</th><th>Size</th><th>Created</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div></div>
     </section>
@@ -208,20 +224,21 @@
       <label class="field"><span>Host / IP</span><input name="host" required placeholder="10.0.0.10"></label>
       <label class="field"><span>Role</span><select name="role"><option value="both">Source &amp; target</option><option value="source">Source</option><option value="target">Target</option></select></label>
       <label class="field"><span>Connection method for the script</span><select name="transport">
+        <option value="local">Local (this computer: PRTG Mover runs on the server itself, no connection needed)</option>
         <option value="rdp">RDP (agent in a Remote Desktop session — nothing to configure on the server)</option>
         <option value="winrm">WinRM (PowerShell remoting — fully automatic, needs WinRM enabled)</option>
         <option value="wireguard">WireGuard tunnel (files between the two Windows servers on 10.66.66.0/24; commands still use RDP)</option>
         <option value="ipip">IPIP tunnel (files between the two Windows servers on 10.66.67.0/24; commands still use RDP)</option>
       </select></label>
-      <label class="field"><span>RDP port</span><input type="number" name="rdpPort" value="3389" min="1" max="65535" required></label>
-      <label class="field"><span>WinRM port (0 = default 5985 / 5986)</span><input type="number" name="port" value="0" min="0" max="65535"></label>
-      <label class="field"><span>Authentication</span><select name="authentication"><option>Default</option><option>Negotiate</option><option>Kerberos</option><option>CredSSP</option><option>Basic</option></select></label>
-      <div class="field"><span>Transport</span>
+      <label class="field remote-only"><span>RDP port</span><input type="number" name="rdpPort" value="3389" min="1" max="65535" required></label>
+      <label class="field remote-only"><span>WinRM port (0 = default 5985 / 5986)</span><input type="number" name="port" value="0" min="0" max="65535"></label>
+      <label class="field remote-only"><span>Authentication</span><select name="authentication"><option>Default</option><option>Negotiate</option><option>Kerberos</option><option>CredSSP</option><option>Basic</option></select></label>
+      <div class="field remote-only"><span>Transport</span>
         <label class="check"><input type="checkbox" name="useSsl"> HTTPS (5986)</label>
         <label class="check"><input type="checkbox" name="skipCaCheck"> Skip certificate checks</label>
       </div>
     </div>
-    <fieldset>
+    <fieldset class="remote-only">
       <legend>Administrator credential <span class="muted">(optional — leave empty to keep the saved one / use your Windows identity)</span></legend>
       <div class="grid2 tight">
         <label class="field"><span>User</span><input name="username" autocomplete="off" placeholder="HOST\Administrator"></label>
@@ -245,6 +262,7 @@
     <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source license</label>
     <label class="check sub"><input type="checkbox" name="OpenFirewall" checked> Open firewall for PRTG ports</label>
     <label class="check"><input type="checkbox" name="RestoreVpn" checked> VPN connections</label>
+    <label class="check sub"><input type="checkbox" name="RestoreRoutes" checked> Routes of the VPN connections (missing routes are put back, nothing is removed)</label>
     <label class="check"><input type="checkbox" name="RestoreDesktop" checked> Desktop files</label>
     <label class="check"><input type="checkbox" name="RestoreExtra" checked> Extra paths</label>
     <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify web interface</label>

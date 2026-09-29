@@ -53,6 +53,12 @@
 .PARAMETER StartupFolder
     Folder for the autostart shortcut. Default: the Startup folder of the current user.
 
+.PARAMETER Local
+    PRTG Mover is installed on the PRTG server itself. Adds this computer to the server list
+    (connection method "Local"), starts the dashboard with administrator rights at logon
+    (scheduled task) and makes the shortcut start it with administrator rights. Needs an
+    elevated PowerShell.
+
 .PARAMETER NoStart
     Do not start the dashboard at the end.
 
@@ -82,6 +88,7 @@ param(
     [switch]$Autostart,
     [switch]$NoAutostart,
     [string]$StartupFolder,
+    [switch]$Local,
     [switch]$NoStart,
     [switch]$Uninstall
 )
@@ -89,7 +96,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:StepNo = 0
 $ProgramItems = 'agent', 'cli', 'docs', 'src', 'tools', 'web', 'tests', '.github', 'config\servers.example.json',
-    'Start-PrtgMover.ps1', 'Start-PrtgMover.cmd', 'install.ps1', 'install.cmd', 'VERSION', 'README.md', 'README.fa.md', 'CHANGELOG.md', 'LICENSE', '.gitignore', '.gitattributes'
+    'Start-PrtgMover.ps1', 'Start-PrtgMover.cmd', 'Open-PrtgMover.ps1', 'install.ps1', 'install.cmd', 'VERSION', 'README.md', 'README.fa.md', 'CHANGELOG.md', 'LICENSE', '.gitignore', '.gitattributes'
 $RequiredFiles = 'Start-PrtgMover.ps1', 'src\PrtgMover.psm1', 'src\Remote\PrtgMover.Remote.ps1', 'web\index.html', 'web\app.js', 'VERSION'
 $DataFolders = 'config', 'data', 'backups', 'installers'
 
@@ -228,13 +235,87 @@ function New-Shortcuts {
         $s = $shell.CreateShortcut($lnk)
         $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Path 'Start-PrtgMover.ps1')`" -Port $Port"
+        if ($Local) {
+            # local mode: the dashboard runs from the start of the computer; the shortcut opens it (and starts the task when needed)
+            $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Open-PrtgMover.ps1')`" -Port $Port"
+            $s.WindowStyle = 7
+        }
         $s.WorkingDirectory = $Path
         $s.Description = 'PRTG Mover dashboard'
         $s.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll') + ',109'
         $s.Save()
+        if ($Local) {
+            # "Run as administrator" of the shortcut: jobs on this computer need administrator rights
+            $bytes = [IO.File]::ReadAllBytes($lnk); $bytes[0x15] = $bytes[0x15] -bor 0x20; [IO.File]::WriteAllBytes($lnk, $bytes)
+        }
         $made += $lnk
     }
     return $made
+}
+
+$LogonTask = 'PRTG Mover Dashboard'
+
+function Test-OwnLogonTask {
+    param([string]$Path)
+    $t = Get-ScheduledTask -TaskName $LogonTask -ErrorAction SilentlyContinue
+    if (-not $t) { return $false }
+    return [bool](@($t.Actions | Where-Object { "$($_.Arguments)".IndexOf("$($Path.TrimEnd('\'))\Start-PrtgMover.", [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count)
+}
+
+function Set-LogonTask {
+    <#
+        Local mode: the dashboard starts when the COMPUTER starts, without anybody logging on, and
+        with the rights that backup and restore of this computer need. It runs as SYSTEM, always the
+        same account, so credentials saved in the dashboard stay readable after every restart.
+    #>
+    param([string]$Path)
+    $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $Path -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Start-PrtgMover.ps1')`" -Port $Port -NoBrowser -Quiet"
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    # Credentials that a user saved in this installation can only be read by that user (Windows DPAPI).
+    # Then the dashboard has to keep running as that user, which is only possible from the logon on.
+    $saved = @(Get-ChildItem -LiteralPath (Join-Path $Path 'data\credentials') -Filter '*.cred.xml' -File -ErrorAction SilentlyContinue)
+    $bySystem = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+    if ($saved.Count -and -not $bySystem -and -not (Test-SystemTask)) {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $me
+        $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest
+        Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Mover dashboard with administrator rights at logon (local mode).' -Force | Out-Null
+        Write-Note "$($saved.Count) saved server credential(s) can only be read by $me. So the dashboard starts when $me logs on, not with the computer."
+        Write-Note 'For a start with the computer: delete the servers that have a saved credential, run the installation with -Local again and enter the credentials again in the dashboard.'
+        return "task '$LogonTask': starts at logon of $me, with administrator rights"
+    }
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Mover dashboard when the computer starts (local mode).' -Force | Out-Null
+    return "task '$LogonTask': starts with the computer, without logon"
+}
+
+function Test-SystemTask {
+    <# True when the dashboard of this computer already runs as SYSTEM: saved credentials then belong to SYSTEM. #>
+    $t = Get-ScheduledTask -TaskName $LogonTask -ErrorAction SilentlyContinue
+    return [bool]($t -and "$($t.Principal.UserId)" -match '^(SYSTEM|S-1-5-18|NT AUTHORITY\\SYSTEM)$')
+}
+
+function Start-LocalDashboard {
+    <# Starts the dashboard through its task and waits until it answers. #>
+    Start-ScheduledTask -TaskName $LogonTask
+    $until = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $until) {
+        try { if ((Invoke-RestMethod -Uri "http://localhost:$Port/api/info" -TimeoutSec 3).product -eq 'PRTG Mover') { return $true } } catch { Start-Sleep -Milliseconds 700 }
+    }
+    return $false
+}
+
+function Add-LocalServer {
+    <# Adds this computer to the server list of the installation (connection method "local"), once. #>
+    param([string]$Path)
+    Import-Module (Join-Path $Path 'src\PrtgMover.psm1') -Force -DisableNameChecking
+    Set-PmRoot -Path $Path
+    $have = @(Get-PmServers | ForEach-Object { $_ } | Where-Object { $_.transport -eq 'local' })
+    if ($have.Count) { return "this computer is already in the server list ('$($have[0].name)')" }
+    [void](Set-PmServer -Name $env:COMPUTERNAME -HostName 'localhost' -Role 'both' -Transport 'local')
+    return "this computer was added to the server list ('$env:COMPUTERNAME', connection method Local)"
 }
 
 function Get-AutostartShortcut {
@@ -293,9 +374,11 @@ if ($env:OS -ne 'Windows_NT') { throw 'PRTG Mover needs Windows.' }
 if ($PSVersionTable.PSVersion -lt [version]'5.1') { throw "Windows PowerShell 5.1 or newer is needed (found $($PSVersionTable.PSVersion)). Install Windows Management Framework 5.1." }
 Write-Ok "Windows PowerShell $($PSVersionTable.PSVersion), user $env:USERDOMAIN\$env:USERNAME$(if (Test-IsAdmin) { ' (administrator)' })"
 $InstallPath = [IO.Path]::GetFullPath($InstallPath).TrimEnd('\')
+if ($Local -and -not $Uninstall -and -not (Test-IsAdmin)) { throw 'Local mode (-Local) needs administrator rights: backup and restore of this computer work with snapshots, the registry and services. Start the installation with "Run as administrator".' }
 
 if ($Uninstall) {
     Write-Step 'Removing shortcuts'
+    if (Test-OwnLogonTask -Path $InstallPath) { Unregister-ScheduledTask -TaskName $LogonTask -Confirm:$false; Write-Ok "removed the logon task '$LogonTask'" }
     $r = @(Remove-Shortcuts -Path $InstallPath)
     if ($r.Count) { $r | ForEach-Object { Write-Ok "removed $_" } } else { Write-Info 'no shortcuts found' }
     Write-Step 'Removing program files'
@@ -343,7 +426,7 @@ try {
     if (Test-Path -LiteralPath $vf) { $before = ([IO.File]::ReadAllText($vf)).Trim() }
     $running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*$InstallPath\Start-PrtgMover.ps1*" -and $_.CommandLine -notlike '*-DataRoot*' })
     if ($from -ne $InstallPath) {
-        if ($running.Count) { throw "The dashboard is running from $InstallPath. Close its window, then run the installation again." }
+        if ($running.Count) { throw "The dashboard is running from $InstallPath. Close its window (in local mode: stop the task '$LogonTask' in an elevated PowerShell with Stop-ScheduledTask), then run the installation again." }
         Copy-Program -From $from -To $InstallPath
         Write-Ok "program files copied to $InstallPath"
     } else { Write-Ok 'the program is already in this folder - nothing to copy' }
@@ -368,9 +451,14 @@ try {
     $exists = Test-Path -LiteralPath $auto
     $own = Test-OwnShortcut -Link $auto -Path $InstallPath
     if ($NoAutostart) {
+        if (Test-OwnLogonTask -Path $InstallPath) { Unregister-ScheduledTask -TaskName $LogonTask -Confirm:$false; Write-Ok 'logon task removed' }
         if ($own) { Remove-Item -LiteralPath $auto -Force; Write-Ok 'switched off' }
         elseif ($exists) { Write-Note 'another installation of PRTG Mover starts with Windows - left as it is' }
         else { Write-Info 'was not switched on' }
+    } elseif ($Local) {
+        # with administrator rights: a scheduled task instead of the Startup shortcut
+        if ($own) { Remove-Item -LiteralPath $auto -Force }
+        Write-Ok "the dashboard comes up by itself after a restart ($(Set-LogonTask -Path $InstallPath))"
     } elseif ($Autostart) {
         if ($exists -and -not $own) { Write-Note 'the start with Windows belonged to another installation - it starts this one now' }
         Write-Ok "the dashboard starts when you log on ($(Set-AutostartShortcut -Path $InstallPath))"
@@ -378,6 +466,10 @@ try {
         Write-Ok "the dashboard starts when you log on ($(Set-AutostartShortcut -Path $InstallPath))"
     } elseif ($exists) { Write-Info 'another installation of PRTG Mover starts with Windows - left as it is' }
     else { Write-Info 'not switched on (use -Autostart)' }
+
+    Write-Step 'This computer as a server (local mode)'
+    if ($Local) { Write-Ok (Add-LocalServer -Path $InstallPath) }
+    else { Write-Info 'skipped - use -Local when PRTG Mover is installed on the PRTG server itself' }
 
     Write-Step 'WinRM on this computer'
     if (-not $TrustedHosts.Count) { Write-Info 'skipped - only needed for servers reached over plain WinRM (HTTP). RDP and WinRM over HTTPS need nothing here.' }
@@ -399,7 +491,10 @@ try {
     Write-Step 'Starting the dashboard'
     if ($NoStart) { Write-Info 'skipped (-NoStart)' }
     elseif ($running.Count) { Write-Ok "the dashboard is already running: http://localhost:$Port/" }
-    else {
+    elseif ($Local -and -not $NoAutostart) {
+        if (Start-LocalDashboard) { Write-Ok "http://localhost:$Port/ is up (started by the task '$LogonTask')"; Start-Process "http://localhost:$Port/" }
+        else { Write-Note "The dashboard did not answer within 60 seconds. Open it with the 'PRTG Mover' shortcut." }
+    } else {
         Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -WorkingDirectory $InstallPath -ArgumentList @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$(Join-Path $InstallPath 'Start-PrtgMover.ps1')`"", '-Port', $Port)
         Write-Ok "http://localhost:$Port/ opens in your browser"

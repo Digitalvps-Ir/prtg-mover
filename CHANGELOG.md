@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.0 — 2026-09-29
+
+### Added
+- **Connection method "Local (this computer)".** PRTG Mover can be installed on the PRTG server itself and back up or restore that server without any connection: no RDP, no WinRM, no credential. On the Servers page: **Add this computer**, or *Local* as the connection method. The test of such a server passes when PRTG Mover has administrator rights; without them the dashboard says so on the server row.
+- `install.ps1 -Local` (needs an elevated PowerShell): adds this computer to the server list and registers the scheduled task *PRTG Mover Dashboard*, which starts the dashboard **when the computer starts, without anybody logging on**. It runs as SYSTEM, always the same account, so what is saved in the dashboard stays readable after every restart. The shortcut opens the running dashboard and starts the task when it is not running (`Open-PrtgMover.ps1`). The RDP button needs a desktop and is not available in a dashboard started this way; WinRM and Local work.
+- **Backups of VPN connections and their routes.** Every backup that contains VPN connections now also contains, per connection, the routes bound to the connection, the live routes on its interface and the persistent routes that point into it (`vpn\routes\routes-<vpn>.json`, format `vpn-routes/1`, the same format VPN Watch uses). A restore puts missing routes back and removes nothing (*Routes of the VPN connections* in the restore dialog).
+- **Backups page with two sections, PRTG and VPN.** *PRTG* lists the full backups. *VPN* lists backups of VPN connections and routes only, with the number of bound, live and persistent routes per connection; **Back up VPN and routes** makes one for the chosen server. Such a package is named `VPN_<computer>_<time>.zip`.
+- `Setup-All.cmd` chooses local mode by itself when it runs as administrator on a computer where PRTG is installed, and sets VPN Watch up in local mode on a server.
+- `/api/info` reports `elevated`.
+
+### Fixed
+- **`Setup-All.cmd` stopped after PRTG Mover and never installed VPN Watch.** The setup waited for the installer and for everything the installer had started, which included the dashboard that keeps running. It now waits for the installer only and starts the dashboards itself.
+
 ## 1.8.0 — 2026-09-29
 
 ### Added

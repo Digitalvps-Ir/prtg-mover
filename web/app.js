@@ -71,7 +71,8 @@
   function renderSideAgents() {
     $('#sideAgents').innerHTML = state.servers.length ? '<b style="color:var(--muted)">Servers</b>' + state.servers.map((s) => {
       const on = s.agent && s.agent.connected;
-      const tag = s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
+      const tag = s.transport === 'local' ? '<span class="badge ok">this computer</span>'
+        : s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
         : s.transport === 'wireguard' ? '<span class="badge info">WireGuard</span>'
         : s.transport === 'ipip' ? '<span class="badge info">IPIP</span>'
         : on ? `<span class="badge ok">agent ${esc(s.agent.state || 'on')}</span>` : '<span class="badge">agent off</span>';
@@ -80,6 +81,7 @@
   }
   function serverLine(s) {
     if (!s) return '';
+    if (s.transport === 'local') return `<div class="srvline"><span class="badge info">Local</span> this computer · no connection needed${state.info && !state.info.elevated ? ' · <span class="badge err">PRTG Mover is not running as administrator</span>' : ''}</div>`;
     if (s.transport === 'winrm') return `<div class="srvline"><span class="badge info">WinRM</span> ${esc(s.host)}</div>`;
     if (s.transport === 'wireguard') return `<div class="srvline"><span class="badge info">WireGuard</span> ${esc(s.host)} · commands over RDP</div>`;
     if (s.transport === 'ipip') return `<div class="srvline"><span class="badge info">IPIP</span> ${esc(s.host)} · commands over RDP</div>`;
@@ -92,6 +94,7 @@
   // ------------------------------------------------------------ info / overview
   async function loadInfo() {
     const i = await api('GET', '/api/info');
+    state.info = i;
     $('#version').textContent = `v${i.version}`;
     $('#managerInfo').innerHTML = `Manager: <b>${esc(i.manager)}</b><br>${esc(i.user)}`;
     $('#backupsPath').textContent = `Packages stored on the manager in ${i.backupsPath}`;
@@ -160,7 +163,7 @@
       if (st) {
         const m = st.methods || {};
         test = `${st.ok ? '<span class="badge ok" title="at least one connection method works">PASS</span>' : `<span class="badge err" title="${esc(st.error)}">FAIL</span>`}
-          <div class="ports" style="margin-top:4px">${methodResult('RDP', m.rdp)}${methodResult('WinRM', m.winrm)}</div>`;
+          <div class="ports" style="margin-top:4px">${s.transport === 'local' ? methodResult('Local', m.local) : methodResult('RDP', m.rdp) + methodResult('WinRM', m.winrm)}</div>`;
       }
       let prtg = '–';
       // PRTG answers only on the server itself (127.0.0.1): the web server is still bound to another server's address.
@@ -181,22 +184,25 @@
           prtg = `${esc(info.Prtg.Version)}<span class="sub-text">${esc(info.PrtgDataGB)} GB data · ${esc(info.Prtg.CoreStatus)}</span><div class="ports" style="margin-top:4px">${lic}${net}</div>`;
         } else { prtg = '<span class="badge warn">not installed</span>'; }
       }
-      const cred = s.hasCredential ? '<span class="badge ok">saved</span>' : '<span class="badge" title="The current Windows identity of the manager is used">Windows identity</span>';
-      const method = s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
+      const cred = s.transport === 'local' ? '<span class="badge" title="PRTG Mover works on this computer with its own rights">not needed</span>' : s.hasCredential ? '<span class="badge ok">saved</span>' : '<span class="badge" title="The current Windows identity of the manager is used">Windows identity</span>';
+      const method = s.transport === 'local' ? '<span class="badge info">Local</span>'
+        : s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
         : s.transport === 'wireguard' ? '<span class="badge info">WireGuard</span>'
         : s.transport === 'ipip' ? '<span class="badge info">IPIP</span>'
         : '<span class="badge info">RDP</span>';
       const ag = s.agent && s.agent.connected
         ? `<span class="badge ok" title="${esc(s.agent.computer)} · ${esc(s.agent.user)}">agent ${esc(s.agent.state || 'on')}</span>`
-        : (s.transport === 'winrm' ? '' : '<span class="badge" title="Only needed while a job runs">agent off</span>');
+        : (s.transport === 'winrm' || s.transport === 'local' ? '' : '<span class="badge" title="Only needed while a job runs">agent off</span>');
+      const needsAdmin = s.transport === 'local' && state.info && !state.info.elevated
+        ? '<div class="ports" style="margin-top:4px"><span class="badge err" title="Backup and restore of this computer need administrator rights. Close PRTG Mover and start it with Run as administrator.">start PRTG Mover as administrator</span></div>' : '';
       return `<tr>
         <td><b>${esc(s.name)}</b>${info ? `<span class="sub-text">${esc(info.OS)}</span>` : ''}</td>
         <td class="num">${esc(s.host)}${s.useSsl ? ' <span class="badge info">HTTPS</span>' : ''}</td>
-        <td>${esc(s.role)}<span class="sub-text">${method} ${ag}</span></td><td>${portBadges(s)}</td><td>${cred}</td><td>${test}</td><td>${prtg}</td>
+        <td>${esc(s.role)}<span class="sub-text">${method} ${ag}</span>${needsAdmin}</td><td>${s.transport === 'local' ? '–' : portBadges(s)}</td><td>${cred}</td><td>${test}</td><td>${prtg}</td>
         <td><div class="btn-group">
-          <button class="btn small" data-act="rdp" data-id="${esc(s.id)}" title="Open Remote Desktop to ${esc(s.host)}:${esc(s.rdpPort || 3389)} and start the agent">RDP</button>
+          ${s.transport === 'local' ? `<button class="btn small" data-act="test-local" data-id="${esc(s.id)}">Test</button>` : `<button class="btn small" data-act="rdp" data-id="${esc(s.id)}" title="Open Remote Desktop to ${esc(s.host)}:${esc(s.rdpPort || 3389)} and start the agent">RDP</button>
           <button class="btn small" data-act="test-rdp" data-id="${esc(s.id)}">Test RDP</button>
-          <button class="btn small" data-act="test-winrm" data-id="${esc(s.id)}">Test WinRM</button>
+          <button class="btn small" data-act="test-winrm" data-id="${esc(s.id)}">Test WinRM</button>`}
           ${localOnly && s.role !== 'source' && s.transport === 'winrm' ? `<button class="btn small primary" data-act="rebind" data-id="${esc(s.id)}" title="PRTG on this server only answers on 127.0.0.1 because its web server is still bound to the old server's address. This binds it to this server's address and restarts PRTG. New migrations do this automatically.">Make PRTG reachable</button>` : ''}
           ${s.role !== 'source' && s.transport === 'winrm' && info && info.Prtg && info.Prtg.Installed && info.PrtgLicenseState && info.PrtgLicenseState.Known && info.PrtgLicenseState.Name ? `<button class="btn small danger" data-act="unlicense" data-id="${esc(s.id)}" title="Removes the license name and key from the PRTG on this server. A copy is kept on the server. Not available for source servers.">Remove license</button>` : ''}
           <button class="btn small" data-act="edit" data-id="${esc(s.id)}">Edit</button>
@@ -212,6 +218,7 @@
   $('#serversTable').addEventListener('click', async (e) => {
     const b = e.target.closest('button[data-act]'); if (!b) return;
     const s = state.servers.find((x) => x.id === b.dataset.id);
+    if (b.dataset.act === 'test-local') startJob({ type: 'test', mode: 'auto', serverIds: [s.id] });
     if (b.dataset.act === 'test-rdp') startJob({ type: 'test', mode: 'rdp', serverIds: [s.id] });
     if (b.dataset.act === 'test-winrm') startJob({ type: 'test', mode: 'winrm', serverIds: [s.id] });
     if (b.dataset.act === 'unlicense' && confirm(`Remove the PRTG license from "${s.name}" (${s.host})?\n\nPRTG is restarted there without a license. License name and key are removed; a copy is kept on the server. Configuration and monitoring data stay.\n\nThe source server is not contacted.`)) startJob({ type: 'unlicense', serverIds: [s.id] });
@@ -233,6 +240,21 @@
   });
   $('#copyAgentCmd').addEventListener('click', async () => { toast((await copyText($('#agentCmd').textContent)) ? 'Copied' : 'Copy failed — select the text manually'); });
   $('#addServerBtn').addEventListener('click', () => openServerDialog(null));
+  $('#addLocalBtn').addEventListener('click', async () => {
+    if (state.servers.some((s) => s.transport === 'local')) return toast('This computer is already in the list');
+    try {
+      await api('POST', '/api/servers', { name: (state.info && state.info.manager) || 'This computer', host: 'localhost', role: 'both', transport: 'local' });
+      toast('This computer was added'); await loadServers();
+    } catch (err) { toast(err.message, true); }
+  });
+  function syncServerForm() {
+    const f = $('#serverForm');
+    const local = f.transport.value === 'local';
+    $$('#serverForm .remote-only').forEach((el) => { el.hidden = local; });
+    if (local) f.host.value = 'localhost';
+    f.host.readOnly = local;
+  }
+  $('#serverForm').transport.addEventListener('change', syncServerForm);
   $('#testAllBtn').addEventListener('click', () => {
     if (!state.servers.length) return toast('Add a server first', true);
     startJob({ type: 'test', mode: 'auto', serverIds: state.servers.map((s) => s.id) });
@@ -245,9 +267,10 @@
     f.transport.value = 'rdp';
     if (s) {
       f.name.value = s.name; f.host.value = s.host; f.role.value = s.role || 'both'; f.port.value = s.port || 0; f.rdpPort.value = s.rdpPort || 3389;
-      f.transport.value = ['winrm', 'wireguard', 'ipip'].includes(s.transport) ? s.transport : 'rdp';
+      f.transport.value = ['local', 'winrm', 'wireguard', 'ipip'].includes(s.transport) ? s.transport : 'rdp';
       f.authentication.value = s.authentication || 'Default'; f.useSsl.checked = !!s.useSsl; f.skipCaCheck.checked = !!s.skipCaCheck; f.notes.value = s.notes || '';
     }
+    syncServerForm();
     $('#serverDialog').showModal();
   }
   $('#serverDialog').addEventListener('close', async () => {
@@ -388,14 +411,35 @@
   // ------------------------------------------------------------ backups
   async function loadBackups() { state.backups = arr(await api('GET', '/api/backups')); renderBackups(); renderOverview(); }
 
+  function routeBadges(m) {
+    // one line per VPN connection: how many routes of each kind the backup holds
+    const routes = arr(m.vpn && m.vpn.routes);
+    if (!routes.length) return arr(m.vpn && m.vpn.allUsers).map((n) => `<span class="badge">${esc(n)}</span>`).join(' ');
+    return routes.map((r) => `<div class="ports" style="margin:2px 0"><span class="badge info">${esc(r.vpn)}</span>`
+      + `<span class="badge" title="routes bound to the connection">bound ${esc(r.connection)}</span>`
+      + `<span class="badge ${r.connected ? '' : 'warn'}" title="${r.connected ? 'routes on the interface of the VPN at the time of the backup' : 'the VPN was not connected at the time of the backup, so its live routes could not be read'}">live ${r.connected ? esc(r.live) : '–'}</span>`
+      + `<span class="badge" title="persistent routes that point into the VPN">persistent ${esc(r.persistent)}</span></div>`).join('');
+  }
+
   function renderBackups() {
-    const tb = $('#backupsTable tbody');
-    if (!state.backups.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">No backups yet. Run a backup or migration, or upload a package.</td></tr>'; return; }
-    tb.innerHTML = state.backups.map((b) => {
+    const sel = $('#vpnBackupSource');
+    const keep = sel.value;
+    const sources = state.servers.filter((s) => s.role !== 'target');
+    sel.innerHTML = sources.length ? sources.map((s) => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('') : '<option value="">— add a server first —</option>';
+    if (keep && sources.some((s) => s.id === keep)) sel.value = keep;
+    const full = state.backups.filter((b) => b.kind !== 'vpn');
+    const vpn = state.backups.filter((b) => b.kind === 'vpn');
+    $('#backupsTable tbody').innerHTML = full.length ? full.map(backupRow).join('') : '<tr><td colspan="6" class="empty">No PRTG backups yet. Run a backup or migration, or upload a package.</td></tr>';
+    $('#vpnBackupsTable tbody').innerHTML = vpn.length ? vpn.map(backupRow).join('') : '<tr><td colspan="6" class="empty">No VPN backups yet. Choose a server and press "Back up VPN and routes".</td></tr>';
+  }
+
+  function backupRow(b) {
+    {
       const m = b.manifest || {};
       const parts = [];
       if (m.prtg && m.prtg.included) parts.push(`<span class="badge info">PRTG ${esc(m.prtg.version || '')}</span>`);
-      if (m.vpn && m.vpn.included) parts.push(`<span class="badge">VPN ×${arr(m.vpn.allUsers).length}</span>`);
+      if (b.kind === 'vpn') parts.push(routeBadges(m));
+      else if (m.vpn && m.vpn.included) parts.push(`<span class="badge" title="${esc(arr(m.vpn.routes).map((r) => `${r.vpn}: ${r.connection} bound, ${r.connected ? r.live : 'no'} live, ${r.persistent} persistent routes`).join(' · '))}">VPN ×${arr(m.vpn.allUsers).length}${arr(m.vpn.routes).length ? ' + routes' : ''}</span>`);
       if (m.desktop && m.desktop.included) parts.push(`<span class="badge">Desktop ×${arr(m.desktop.users).length}</span>`);
       if (arr(m.extra).length) parts.push(`<span class="badge">Extra ×${arr(m.extra).length}</span>`);
       const dl = `/api/backups/${encodeURIComponent(b.name)}/download`;
@@ -410,16 +454,25 @@
           <button class="btn small" data-act="restore" data-name="${esc(b.name)}">Restore…</button>
           <button class="btn small danger" data-act="del" data-name="${esc(b.name)}">Delete</button>
         </div></td></tr>`;
-    }).join('');
+    }
   }
 
-  $('#backupsTable').addEventListener('click', async (e) => {
+  async function onBackupClick(e) {
     const b = e.target.closest('button[data-act]'); if (!b) return;
     const name = b.dataset.name;
     if (b.dataset.act === 'del' && confirm(`Delete backup ${name} from the manager?`)) {
       try { await api('DELETE', `/api/backups/${encodeURIComponent(name)}`); toast('Backup deleted'); loadBackups(); } catch (err) { toast(err.message, true); }
     }
     if (b.dataset.act === 'restore') openRestore(name);
+  }
+  $('#backupsTable').addEventListener('click', onBackupClick);
+  $('#vpnBackupsTable').addEventListener('click', onBackupClick);
+  $('#vpnBackupBtn').addEventListener('click', () => {
+    const id = $('#vpnBackupSource').value;
+    const s = state.servers.find((x) => x.id === id);
+    if (!s) return toast('Add a server first', true);
+    if (!confirm(`Back up the VPN connections and routes of ${s.name}?\n\nNothing is stopped or changed on the server. PRTG and desktop files are not part of this backup. Passwords are never saved.`)) return;
+    startJob({ type: 'backup', sourceId: id, options: { IncludePrtg: false, IncludeHistory: false, IncludeProgram: false, IncludeDesktop: false, IncludeVpn: true, NoTouch: true, SourceAfter: 'Restart' } });
   });
 
   function openRestore(name) {
@@ -437,7 +490,7 @@
     if (!targets.length) return toast('Select at least one target', true);
     startJob({
       type: 'restore', backupName: f.dataset.name, targetIds: targets,
-      options: { CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked, RestorePrtg: f.RestorePrtg.checked, RestoreVpn: f.RestoreVpn.checked, RestoreDesktop: f.RestoreDesktop.checked, RestoreExtra: f.RestoreExtra.checked, StartServices: f.StartServices.checked, InstallerFile: f.InstallerFile.value },
+      options: { CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked, RestorePrtg: f.RestorePrtg.checked, RestoreVpn: f.RestoreVpn.checked, RestoreRoutes: f.RestoreRoutes.checked, RestoreDesktop: f.RestoreDesktop.checked, RestoreExtra: f.RestoreExtra.checked, StartServices: f.StartServices.checked, InstallerFile: f.InstallerFile.value },
     });
   });
 

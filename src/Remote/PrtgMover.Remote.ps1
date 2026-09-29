@@ -295,6 +295,124 @@ function Merge-PmPbk {
     return [string[]]$added.ToArray()
 }
 
+# ---- routes of a VPN connection (format "vpn-routes/1", shared with VPN Watch; contains no secrets)
+
+function ConvertTo-PmIPv4Number {
+    param([string]$Address)
+    $b = ([Net.IPAddress]::Parse($Address)).GetAddressBytes()
+    return ([uint32]$b[0] * 16777216) + ([uint32]$b[1] * 65536) + ([uint32]$b[2] * 256) + [uint32]$b[3]
+}
+
+function ConvertTo-PmIPv4Mask {
+    param([int]$PrefixLength)
+    $bits = ('1' * $PrefixLength).PadRight(32, '0')
+    return ((0..3 | ForEach-Object { [Convert]::ToInt32($bits.Substring($_ * 8, 8), 2) }) -join '.')
+}
+
+function ConvertTo-PmPrefixLength {
+    param([string]$Mask)
+    $n = 0
+    foreach ($b in ([Net.IPAddress]::Parse($Mask)).GetAddressBytes()) { $n += ([Convert]::ToString($b, 2) -replace '0', '').Length }
+    return $n
+}
+
+function Test-PmAddressInPrefix {
+    param([string]$Address, [string]$Prefix)
+    try {
+        $net, $len = $Prefix -split '/'
+        if ([int]$len -eq 0) { return $true }
+        $shift = [uint32][math]::Pow(2, 32 - [int]$len)
+        return ([math]::Floor((ConvertTo-PmIPv4Number $Address) / $shift) -eq [math]::Floor((ConvertTo-PmIPv4Number $net) / $shift))
+    } catch { return $false }
+}
+
+function Get-PmPersistentRoutes {
+    <# The persistent IPv4 routes of this computer: prefix, mask, gateway, metric. #>
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes'
+    $p = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+    if (-not $p) { return @() }
+    @($p.PSObject.Properties | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+,\d+\.\d+\.\d+\.\d+,\d+\.\d+\.\d+\.\d+,\d+$' } | ForEach-Object {
+            $dest, $mask, $gw, $metric = $_.Name -split ','
+            [ordered]@{ prefix = "$dest/$(ConvertTo-PmPrefixLength $mask)"; mask = $mask; gateway = $gw; metric = [int]$metric }
+        })
+}
+
+function Get-PmVpnRouteBackup {
+    <# The routes that belong to one Windows VPN connection. #>
+    param([Parameter(Mandatory)][string]$Name, [bool]$AllUsers = $true)
+    $conn = $null
+    if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) {
+        try { $conn = if ($AllUsers) { Get-VpnConnection -Name $Name -AllUserConnection -ErrorAction Stop } else { Get-VpnConnection -Name $Name -ErrorAction Stop } } catch { }
+    }
+    $connectionRoutes = @()
+    if ($conn) { $connectionRoutes = @($conn.Routes | Where-Object { $_ } | ForEach-Object { [ordered]@{ prefix = [string]$_.DestinationPrefix; metric = [int]$_.RouteMetric } }) }
+    $tunnelIp = $null; $live = @(); $onLink = @(); $hops = @()
+    if (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue) {
+        $addr = @(Get-NetIPAddress -InterfaceAlias $Name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(0\.|169\.254\.)' })
+        if ($addr.Count) {
+            $tunnelIp = [string]$addr[0].IPAddress
+            $routes = @(Get-NetRoute -InterfaceAlias $Name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -notmatch '^(224\.|255\.255\.255\.255/)' -and $_.DestinationPrefix -ne "$tunnelIp/32" })
+            $live = @($routes | ForEach-Object { [ordered]@{ prefix = [string]$_.DestinationPrefix; nextHop = [string]$_.NextHop; metric = [int]$_.RouteMetric } })
+            $onLink = @($routes | Where-Object { $_.NextHop -eq '0.0.0.0' } | ForEach-Object { [string]$_.DestinationPrefix })
+            $hops = @($routes | Where-Object { $_.NextHop -ne '0.0.0.0' } | ForEach-Object { [string]$_.NextHop } | Select-Object -Unique)
+        }
+    }
+    if ($tunnelIp) {
+        # persistent routes that point into this VPN
+        $persistent = @(Get-PmPersistentRoutes | Where-Object { $gw = $_.gateway; ($hops -contains $gw) -or [bool]@($onLink | Where-Object { Test-PmAddressInPrefix -Address $gw -Prefix $_ }).Count })
+    } else {
+        # The VPN is down, so its interface cannot tell which persistent routes are its own. Kept are the
+        # persistent routes whose gateway no connected network reaches: they wait for a VPN. Marked as assumed.
+        $reachable = @()
+        if (Get-Command Get-NetRoute -ErrorAction SilentlyContinue) { $reachable = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq '0.0.0.0' -and $_.DestinationPrefix -notmatch '^(0\.0\.0\.0/0|224\.|255\.255\.255\.255/|127\.)' } | ForEach-Object { [string]$_.DestinationPrefix }) }
+        $persistent = @(Get-PmPersistentRoutes | Where-Object { $gw = $_.gateway; -not [bool]@($reachable | Where-Object { Test-PmAddressInPrefix -Address $gw -Prefix $_ }).Count } | ForEach-Object { $_['assumed'] = $true; $_ })
+    }
+    return [ordered]@{
+        format = 'vpn-routes/1'; computer = $env:COMPUTERNAME; vpn = $Name; created = (Get-Date).ToString('o'); tunnelIp = $tunnelIp
+        scope = $(if ($AllUsers) { 'AllUsers' } else { 'User' })
+        connectionRoutes = $connectionRoutes; liveRoutes = $live; persistentRoutes = $persistent
+    }
+}
+
+function Restore-PmVpnRoutes {
+    <#
+        Puts the routes of a route backup back: routes bound to the connection and persistent
+        routes. Routes that are already there are left alone; nothing is removed.
+    #>
+    param([Parameter(Mandatory)]$Backup, [bool]$AllUsers = $true)
+    $name = [string]$Backup.vpn
+    $added = 0; $kept = 0; $failed = 0
+    $conn = $null
+    if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) {
+        try { $conn = if ($AllUsers) { Get-VpnConnection -Name $name -AllUserConnection -ErrorAction Stop } else { Get-VpnConnection -Name $name -ErrorAction Stop } } catch { }
+    }
+    foreach ($r in @($Backup.connectionRoutes | Where-Object { $_ })) {
+        if (-not $conn) { Write-PmLog "Routes of '$name': the connection does not exist on this computer - route $($r.prefix) skipped." 'WARN'; $failed++; continue }
+        if (@($conn.Routes | Where-Object { $_.DestinationPrefix -eq $r.prefix }).Count) { $kept++; continue }
+        try {
+            $p = @{ ConnectionName = $name; DestinationPrefix = [string]$r.prefix; RouteMetric = [int]$r.metric; PassThru = $true; ErrorAction = 'Stop' }
+            if ($AllUsers) { $p.AllUserConnection = $true }
+            [void](Add-VpnConnectionRoute @p); $added++
+        } catch { $failed++; Write-PmLog "Routes of '$name': $($r.prefix) could not be bound to the connection: $($_.Exception.Message)" 'WARN' }
+    }
+    $have = @(Get-PmPersistentRoutes | ForEach-Object { "$($_.prefix)|$($_.gateway)" })
+    foreach ($r in @($Backup.persistentRoutes | Where-Object { $_ })) {
+        if ($have -contains "$($r.prefix)|$($r.gateway)") { $kept++; continue }
+        $net = ([string]$r.prefix -split '/')[0]
+        & route.exe -p add $net mask ([string]$r.mask) ([string]$r.gateway) metric ([int]$r.metric) 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0 -and (@(Get-PmPersistentRoutes | Where-Object { $_.prefix -eq $r.prefix -and $_.gateway -eq $r.gateway }).Count)) { $added++; continue }
+        # the gateway is only reachable while the VPN is up: keep the route for the next connect / restart
+        try {
+            $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes'
+            New-ItemProperty -Path $key -Name ("{0},{1},{2},{3}" -f $net, $r.mask, $r.gateway, [int]$r.metric) -Value '' -PropertyType String -Force -ErrorAction Stop | Out-Null
+            $added++
+            Write-PmLog "Routes of '$name': persistent route $($r.prefix) via $($r.gateway) is saved; it becomes active when the VPN is connected." 'INFO'
+        } catch { $failed++; Write-PmLog "Routes of '$name': persistent route $($r.prefix) via $($r.gateway) could not be saved: $($_.Exception.Message)" 'WARN' }
+    }
+    Write-PmLog "Routes of '$name': $added put back, $kept were already there, $failed failed." $(if ($failed) { 'WARN' } else { 'OK' })
+    return [ordered]@{ vpn = $name; added = $added; kept = $kept; failed = $failed }
+}
+
 function Invoke-PmReg {
     <# Runs reg.exe without letting its stderr chatter turn into PowerShell errors. Returns the exit code. #>
     param([Parameter(Mandatory)][ValidateSet('export', 'import')][string]$Verb, [Parameter(Mandatory)][string]$File, [string]$Key)
@@ -1096,6 +1214,25 @@ function Invoke-PmRemoteBackup {
             Get-VpnConnection -AllUserConnection -ErrorAction Stop | Select-Object Name, ServerAddress, TunnelType, AuthenticationMethod, EncryptionLevel, SplitTunneling, RememberCredential |
                 ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $vpnStage 'vpn-connections.json') -Encoding UTF8
         } catch { }
+        # routes of every connection: bound to the connection, live on its interface, persistent into it
+        $routeDir = Join-Path $vpnStage 'routes'
+        New-Item -ItemType Directory -Force -Path $routeDir | Out-Null
+        $manifest.vpn.routes = @()
+        $all = @($manifest.vpn.allUsers | Select-Object -Unique)
+        # connections of single users too: their interface and the persistent routes are read the same way;
+        # routes bound to the connection can only be read for the account this backup runs as
+        $perUser = @($manifest.vpn.users.Values | ForEach-Object { $_ } | Where-Object { $_ -and ($all -notcontains $_) } | Select-Object -Unique)
+        foreach ($item in (@($all | ForEach-Object { @{ Name = $_; AllUsers = $true } }) + @($perUser | ForEach-Object { @{ Name = $_; AllUsers = $false } }))) {
+            $n = $item.Name
+            try {
+                $rb = Get-PmVpnRouteBackup -Name $n -AllUsers $item.AllUsers
+                $file = 'routes-{0}.json' -f ($n -replace '[^\w\.-]', '_')
+                ConvertTo-Json -InputObject $rb -Depth 5 | Set-Content -Path (Join-Path $routeDir $file) -Encoding UTF8
+                $manifest.vpn.routes += [ordered]@{ vpn = $n; file = $file; scope = $rb.scope; connected = [bool]$rb.tunnelIp; connection = @($rb.connectionRoutes).Count; live = @($rb.liveRoutes).Count; persistent = @($rb.persistentRoutes).Count }
+                if ($rb.tunnelIp) { Write-PmLog ("VPN '{0}': routes saved - {1} bound to the connection, {2} live, {3} persistent." -f $n, @($rb.connectionRoutes).Count, @($rb.liveRoutes).Count, @($rb.persistentRoutes).Count) }
+                else { Write-PmLog ("VPN '{0}' is NOT connected: its live routes cannot be read. Saved: {1} route(s) bound to the connection and {2} persistent route(s) whose gateway no connected network reaches (assumed to belong to a VPN). Connect the VPN and back up again for a complete route backup." -f $n, @($rb.connectionRoutes).Count, @($rb.persistentRoutes).Count) 'WARN' }
+            } catch { Write-PmLog "VPN '$n': routes could not be read: $($_.Exception.Message)" 'WARN' }
+        }
         $manifest.vpn.included = $true
         $userCount = ($manifest.vpn.users.Values | ForEach-Object { $_ } | Measure-Object).Count
         Write-PmLog "VPN: $($manifest.vpn.allUsers.Count) all-user and $userCount per-user connection(s) exported." 'OK'
@@ -1188,6 +1325,8 @@ function Invoke-PmRemoteRestore {
         [string]$WorkRoot,
         [bool]$RestorePrtg = $true,
         [bool]$RestoreVpn = $true,
+        # with the VPN connections: the routes bound to them and the persistent routes into them
+        [bool]$RestoreRoutes = $true,
         [bool]$RestoreDesktop = $true,
         [bool]$RestoreExtra = $true,
         [string]$InstallerPath,
@@ -1489,6 +1628,12 @@ function Invoke-PmRemoteRestore {
                 }
             }
             Write-PmLog "VPN connections added: $(if ($added.Count) { $added -join ', ' } else { 'none (already present)' })" 'OK'
+            if ($RestoreRoutes) {
+                foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $stage 'vpn\routes') -Filter 'routes-*.json' -File -ErrorAction SilentlyContinue)) {
+                    try { $rb = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json; [void](Restore-PmVpnRoutes -Backup $rb -AllUsers ("$($rb.scope)" -ne 'User')) }
+                    catch { Write-PmLog "Routes from $($f.Name) could not be put back: $($_.Exception.Message)" 'WARN' }
+                }
+            }
             if ($ConnectVpn) {
                 foreach ($name in @($manifest.vpn.allUsers)) {
                     & rasdial.exe $name | Out-Null

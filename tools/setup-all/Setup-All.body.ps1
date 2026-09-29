@@ -9,6 +9,7 @@ param(
     [switch]$NoAutostart,
     [switch]$NoShortcut,
     [switch]$NoStart,
+    [switch]$NoBrowser,
     [string]$ShortcutFolder,
     [string]$StartupFolder
 )
@@ -22,6 +23,24 @@ function Ok { param([string]$t) Write-Host "    $t" -ForegroundColor Green }
 function Note { param([string]$t) Write-Host "    $t" -ForegroundColor Yellow }
 function Test-Admin { (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
 function Get-FreePort { $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $p = $l.LocalEndpoint.Port; $l.Stop(); $p }
+function Invoke-Script {
+    # Runs a script in its own PowerShell and waits for THAT process only. Start-Process -Wait would also
+    # wait for everything the script starts, for example a dashboard, and the setup would never go on.
+    param([string[]]$Arguments)
+    $p = Start-Process -FilePath $ps -ArgumentList $Arguments -PassThru -NoNewWindow
+    $null = $p.Handle
+    $p.WaitForExit()
+    return $p.ExitCode
+}
+function Start-VpnWatchPanel {
+    # opens the panel (starting it first when needed); with -NoBrowser it is only started
+    param([bool]$Local)
+    $script = if ($NoBrowser) { 'Start-VpnWatch.ps1' } else { 'Open-VpnWatch.ps1' }
+    $o = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$VpnWatchPath\$script`"", '-Port', $VpnWatchPort)
+    if ($NoBrowser) { $o += '-NoBrowser' }
+    if ($Local) { $o += '-Local' }
+    Start-Process -FilePath $ps -ArgumentList $o -WindowStyle Hidden -WorkingDirectory $VpnWatchPath
+}
 function Get-Dashboard {
     # processes that run a dashboard from an installation folder
     param([string]$Folder, [string]$Script)
@@ -60,14 +79,30 @@ try {
             Ok "the running dashboard on port $port was stopped for the update (no job was running)"
         }
         if ($run.Count) { Start-Sleep -Seconds 1 }
-        $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tmp\files\PrtgMover\install.ps1`"", '-Source', "`"$tmp\files\PrtgMover`"", '-InstallPath', "`"$PrtgMoverPath`"", '-Port', $PrtgMoverPort)
-        if (-not $NoAutostart) { $a += '-Autostart' }
+        # PRTG is installed on this computer and the setup has administrator rights: local mode
+        $pmLocal = $admin -and -not $NoShortcut -and [bool](Get-Service -Name PRTGCoreService -ErrorAction SilentlyContinue)
+        $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$tmp\files\PrtgMover\install.ps1`"", '-Source', "`"$tmp\files\PrtgMover`"", '-InstallPath', "`"$PrtgMoverPath`"", '-Port', $PrtgMoverPort, '-NoStart')
+        if ($NoAutostart) { $a += '-NoAutostart' } elseif (-not $pmLocal) { $a += '-Autostart' }
+        if ($pmLocal) { $a += '-Local' }
         if ($NoShortcut) { $a += '-NoShortcut' }
-        if ($NoStart) { $a += '-NoStart' }
         if ($ShortcutFolder) { $a += @('-ShortcutFolder', "`"$ShortcutFolder`"") }
         if ($StartupFolder) { $a += @('-StartupFolder', "`"$StartupFolder`"") }
-        $p = Start-Process -FilePath $ps -ArgumentList $a -Wait -PassThru -NoNewWindow
-        if ($p.ExitCode -ne 0) { throw "The installation of PRTG Mover failed (code $($p.ExitCode)). See the message above." }
+        $rc = Invoke-Script $a
+        if ($rc -ne 0) { throw "The installation of PRTG Mover failed (code $rc). See the message above." }
+        if (-not $NoStart) {
+            # started here, without waiting for it: the setup has to go on with VPN Watch
+            if ($pmLocal -and -not $NoAutostart) {
+                # local mode: always through the task, so the dashboard runs under the same account as after a restart
+                Start-ScheduledTask -TaskName 'PRTG Mover Dashboard'
+                if (-not $NoBrowser) { Start-Process -FilePath $ps -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$PrtgMoverPath\Open-PrtgMover.ps1`"", '-Port', $PrtgMoverPort) }
+            } else {
+                $d = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$PrtgMoverPath\Start-PrtgMover.ps1`"", '-Port', $PrtgMoverPort)
+                if ($NoBrowser) { $d += '-NoBrowser' }
+                Start-Process -FilePath $ps -WorkingDirectory $PrtgMoverPath -ArgumentList $d
+            }
+        }
+        if ($pmLocal) { Ok 'local mode: this computer is in the server list, PRTG Mover backs it up without any connection' }
+        elseif (Get-Service -Name PRTGCoreService -ErrorAction SilentlyContinue) { Note "PRTG is installed on this computer. To back it up from here, run this setup once with 'Run as administrator'." }
         Ok "PRTG Mover is installed: http://localhost:$PrtgMoverPort/"
     }
 
@@ -108,33 +143,31 @@ try {
         if ($NoShortcut) {
             # the shortcut and the start with Windows of VPN Watch are created together by its own installer
             Note 'VPN Watch: no shortcut and no start with Windows (-NoShortcut)'
-            if (-not $NoStart) {
-                Start-Process -FilePath $ps -WindowStyle Hidden -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$VpnWatchPath\Open-VpnWatch.ps1`"", '-Port', $VpnWatchPort)
-            }
+            if (-not $NoStart) { Start-VpnWatchPanel -Local $false }
         } else {
             $own = 0
             if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) {
                 try { $own += @(Get-VpnConnection -AllUserConnection -ErrorAction Stop).Count } catch { }
                 try { $own += @(Get-VpnConnection -ErrorAction Stop).Count } catch { }
             }
-            $local = ($own -gt 0 -and $admin)
+            $isServer = $false
+            try { $isServer = ((Get-CimInstance Win32_OperatingSystem).ProductType -ne 1) } catch { }
+            $local = ($admin -and ($own -gt 0 -or $isServer))
             if ($local) {
-                # this computer has VPN connections of its own: VPN Watch manages them directly
+                # a server, or a computer with VPN connections of its own: VPN Watch manages this computer directly
                 $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$VpnWatchPath\tools\Install-VpnWatchLocal.ps1`"", '-Port', $VpnWatchPort)
-                if ($NoAutostart) { $a += '-NoStart' } else { $a += '-AtLogon' }
+                # -AtBoot: the panel starts with the computer, without logon (VPN Watch 0.6.0 and newer)
+                if ($NoAutostart) { $a += '-NoStart' } else { $a += '-AtBoot' }
             } else {
                 $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$VpnWatchPath\tools\Install-VpnWatchShortcut.ps1`"", '-Port', $VpnWatchPort)
                 if ($NoAutostart) { $a += '-NoAutostart' }
             }
-            $p = Start-Process -FilePath $ps -ArgumentList $a -Wait -PassThru -NoNewWindow
-            if ($p.ExitCode -ne 0) { throw "Shortcut / start with Windows of VPN Watch failed (code $($p.ExitCode)). See the message above." }
+            $rc = Invoke-Script $a
+            if ($rc -eq 2) { Note 'VPN Watch is installed, but its panel did not answer yet. Open it with the "VPN Watch" shortcut.' }
+            elseif ($rc -ne 0) { throw "Shortcut / start with Windows of VPN Watch failed (code $rc). See the message above." }
             if ($local) { Ok "local mode: VPN Watch manages the $own VPN connection(s) of this computer" }
             elseif ($own -gt 0) { Note "This computer has $own VPN connection(s) of its own. To manage them here, run this setup once with 'Run as administrator'." }
-            if (-not $NoStart) {
-                $o = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$VpnWatchPath\Open-VpnWatch.ps1`"", '-Port', $VpnWatchPort)
-                if ($local) { $o += '-Local' }
-                Start-Process -FilePath $ps -ArgumentList $o -WindowStyle Hidden
-            }
+            if (-not $NoStart) { Start-VpnWatchPanel -Local $local }
         }
         Ok "VPN Watch is installed: http://localhost:$VpnWatchPort/ (open it with the 'VPN Watch' shortcut)"
     }

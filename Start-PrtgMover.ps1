@@ -231,6 +231,8 @@ function Invoke-PmRoute {
                 product = 'PRTG Mover'; version = $Version; manager = $env:COMPUTERNAME; user = "$env:USERDOMAIN\$env:USERNAME"; root = $DataRootPath
                 backupsPath = (Get-PmPath Backups); installersPath = (Get-PmPath Installers)
                 servers = @(Get-PmServers).Count; backups = @(Get-PmBackups).Count
+                # jobs on this computer itself (connection method "local") need administrator rights
+                elevated = [bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
             }
             return
         }
@@ -242,11 +244,15 @@ function Invoke-PmRoute {
             $role = if ($b.role) { [string]$b.role } else { 'both' }
             $rdp = if ([int]$b.rdpPort -gt 0) { [int]$b.rdpPort } else { 3389 }
             if ([int]$b.port -gt 0 -and [int]$b.port -eq $rdp) { Send-PmJson $Ctx @{ error = "WinRM port $rdp is the RDP port. Put $rdp in 'RDP port' and leave the WinRM port at 0 (default 5985/5986)." } 400; return }
-            $transport = switch ([string]$b.transport) { 'winrm' { 'winrm' } 'wireguard' { 'wireguard' } 'ipip' { 'ipip' } default { 'rdp' } }
-            $srv = Set-PmServer -Id ([string]$b.id) -Name $b.name -HostName $b.host -Port ([int]$b.port) -UseSsl ([bool]$b.useSsl) `
+            $transport = switch ([string]$b.transport) { 'local' { 'local' } 'winrm' { 'winrm' } 'wireguard' { 'wireguard' } 'ipip' { 'ipip' } default { 'rdp' } }
+            # "local" is this computer: PRTG Mover is installed on the PRTG server itself
+            $isLocal = ($transport -eq 'local')
+            $hostName = if ($isLocal) { 'localhost' } else { [string]$b.host }
+            $saveCred = (-not $isLocal) -and $b.username -and $b.password   # no credential is needed or kept for this computer
+            $srv = Set-PmServer -Id ([string]$b.id) -Name $b.name -HostName $hostName -Port ([int]$b.port) -UseSsl ([bool]$b.useSsl) `
                 -SkipCaCheck ([bool]$b.skipCaCheck) -Authentication $auth -Role $role -Notes ([string]$b.notes) -RdpPort $rdp -Transport $transport
-            if ($b.username -and $b.password) { Save-PmCredential -ServerId $srv.id -Credential (New-PmCredential -UserName $b.username -Password $b.password) }
-            Write-PmAudit -Action $(if ($b.id) { 'server.updated' } else { 'server.added' }) -Data @{ id = $srv.id; name = $srv.name; host = $srv.host; transport = $srv.transport; rdpPort = $srv.rdpPort; winrmPort = $srv.port; credentialChanged = [bool]($b.username -and $b.password) }
+            if ($saveCred) { Save-PmCredential -ServerId $srv.id -Credential (New-PmCredential -UserName $b.username -Password $b.password) }
+            Write-PmAudit -Action $(if ($b.id) { 'server.updated' } else { 'server.added' }) -Data @{ id = $srv.id; name = $srv.name; host = $srv.host; transport = $srv.transport; rdpPort = $srv.rdpPort; winrmPort = $srv.port; credentialChanged = [bool]$saveCred }
             Send-PmJson $Ctx $srv
             return
         }

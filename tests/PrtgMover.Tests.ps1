@@ -362,6 +362,52 @@ Describe 'Connectivity tests keep each method separately' {
     }
 }
 
+Describe 'Connection method "local": PRTG Mover on the server itself' {
+    BeforeAll {
+        $script:LocalRoot = Join-Path $Work 'manager-local'
+        New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
+        Set-PmRoot -Path $LocalRoot
+        $script:Me = Set-PmServer -Name 'THIS' -HostName 'localhost' -Transport local -Role both
+        $script:OldTestFlag = $env:PRTGMOVER_TEST
+    }
+    AfterAll { $env:PRTGMOVER_TEST = $script:OldTestFlag }
+
+    It 'is stored as a connection method of its own' {
+        (Get-PmServer -Id $Me.id).transport | Should -Be 'local'
+        Get-PmTransport (Get-PmServer -Id $Me.id) | Should -Be 'local'
+    }
+
+    It 'tests this computer without any connection and records the result as "local"' {
+        $env:PRTGMOVER_TEST = '1'
+        $st = Invoke-PmTestFlow -Server (Get-PmServer -Id $Me.id)
+        $st.ok | Should -BeTrue
+        $st.methods.local.ok | Should -BeTrue
+        $st.info.Computer | Should -Be $env:COMPUTERNAME
+        $saved = Get-Content (Join-Path $LocalRoot "data\status\$($Me.id).json") -Raw | ConvertFrom-Json
+        $saved.lastMode | Should -Be 'local'
+        $saved.methods.local.ok | Should -BeTrue
+    }
+
+    It 'fails with a clear message when PRTG Mover has no administrator rights' -Skip:([bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $env:PRTGMOVER_TEST = $null
+        { Invoke-PmTestFlow -Server (Get-PmServer -Id $Me.id) } | Should -Throw '*Run as administrator*'
+        $saved = Get-Content (Join-Path $LocalRoot "data\status\$($Me.id).json") -Raw | ConvertFrom-Json
+        $saved.ok | Should -BeFalse
+    }
+
+    It 'backs up this computer into a package without any connection' {
+        $env:PRTGMOVER_TEST = '1'
+        $x = Join-Path $Work 'local-extra'
+        New-Item -ItemType Directory -Force -Path $x | Out-Null
+        'local' | Set-Content (Join-Path $x 'l.txt')
+        $job = New-PmJobObject -Type 'backup' -Summary 'local backup test'
+        $r = Invoke-PmBackupFlow -Server (Get-PmServer -Id $Me.id) -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($x); NoTouch = $true } -Job $job
+        Test-Path -LiteralPath $r.Zip | Should -BeTrue
+        $r.Zip | Should -BeLike "$LocalRoot\backups\*"
+        Test-PmStageComplete -StageDir $r.StageDir | Should -BeTrue
+    }
+}
+
 Describe 'Resume' {
     BeforeAll {
         $mgr = Join-Path $Work 'manager-resume'
@@ -530,6 +576,27 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
 
     It 'serves API requests without any check' {
         & $StatusOf POST "$Dash/api/servers" @{ 'Content-Type' = 'application/json'; 'Origin' = 'http://other.example' } '{"name":"T1","host":"192.0.2.10","role":"target"}' | Should -Be 200
+    }
+
+    It 'accepts this computer as a server with the connection method "local"' {
+        $r = Invoke-RestMethod -Method Post -Uri "$Dash/api/servers" -ContentType 'application/json' -Body '{"name":"ME","host":"something-else","role":"both","transport":"local","username":"x","password":"y"}'
+        $r.transport | Should -Be 'local'
+        $r.host | Should -Be 'localhost'
+        Test-Path (Join-Path $DashData "data\credentials\$($r.id).cred.xml") | Should -BeFalse
+        (Invoke-RestMethod "$Dash/api/info").PSObject.Properties.Name | Should -Contain 'elevated'
+    }
+
+    It 'adds this computer with the few fields the button "Add this computer" sends, and tests it' {
+        $r = Invoke-RestMethod -Method Post -Uri "$Dash/api/servers" -ContentType 'application/json' -Body '{"name":"ME2","host":"localhost","role":"both","transport":"local"}'
+        $r.transport | Should -Be 'local'
+        $j = Invoke-RestMethod -Method Post -Uri "$Dash/api/jobs" -ContentType 'application/json' -Body (@{ type = 'test'; mode = 'auto'; serverIds = @($r.id) } | ConvertTo-Json)
+        $deadline = (Get-Date).AddSeconds(90)
+        do { Start-Sleep -Seconds 1; $st = Invoke-RestMethod "$Dash/api/jobs/$($j.id)" } while ($st.status -in 'queued', 'running' -and (Get-Date) -lt $deadline)
+        # with administrator rights the test of this computer succeeds, without them it fails with a clear message
+        $st.status | Should -BeIn 'succeeded', 'failed'
+        $text = (@($st.logs | ForEach-Object { $_ }) | ForEach-Object { $_.message }) -join "`n"
+        $text | Should -Match 'Local test: (PASS|FAIL)'
+        $text | Should -Match ([regex]::Escape($env:COMPUTERNAME))
     }
 
     It 'a second start on the same port ends without an error and leaves the dashboard running' {
@@ -718,5 +785,100 @@ Describe 'WireGuard tunnel config' {
         { Measure-PmTunnelWinRm -PeerTunnelIp '203.0.113.8' -UserName '.\Administrator' -Password 'x' } | Should -Throw
         { Send-PmTunnelWinRmCopy -PeerTunnelIp '10.66.66.2' -UserName '.\Administrator' -Password 'x' -Destination 'D:\data' } | Should -Throw
         { Send-PmTunnelWinRmCopy -PeerTunnelIp '203.0.113.8' -UserName '.\Administrator' -Password 'x' -Destination 'C:\PrtgMover\tunnel\job' } | Should -Throw
+    }
+}
+
+Describe 'Routes of a VPN connection (format vpn-routes/1)' {
+    It 'converts prefix lengths and masks' {
+        ConvertTo-PmIPv4Mask 24 | Should -Be '255.255.255.0'
+        ConvertTo-PmIPv4Mask 32 | Should -Be '255.255.255.255'
+        ConvertTo-PmIPv4Mask 0 | Should -Be '0.0.0.0'
+        ConvertTo-PmPrefixLength '255.255.255.0' | Should -Be 24
+        ConvertTo-PmPrefixLength '255.255.255.255' | Should -Be 32
+    }
+
+    It 'knows whether a gateway lies inside a network' {
+        Test-PmAddressInPrefix -Address '192.168.25.1' -Prefix '192.168.25.0/24' | Should -BeTrue
+        Test-PmAddressInPrefix -Address '192.168.26.1' -Prefix '192.168.25.0/24' | Should -BeFalse
+        Test-PmAddressInPrefix -Address '10.0.0.2' -Prefix '10.0.0.2/32' | Should -BeTrue
+        Test-PmAddressInPrefix -Address 'not-an-address' -Prefix '10.0.0.0/8' | Should -BeFalse
+    }
+
+    It 'writes a backup in the shared format, also for a VPN that does not exist or is not connected' {
+        $b = Get-PmVpnRouteBackup -Name 'no-such-vpn-for-the-test'
+        $b.format | Should -Be 'vpn-routes/1'
+        $b.vpn | Should -Be 'no-such-vpn-for-the-test'
+        $b.computer | Should -Be $env:COMPUTERNAME
+        $b.tunnelIp | Should -BeNullOrEmpty
+        @($b.liveRoutes).Count | Should -Be 0
+        $json = ConvertTo-Json -InputObject $b -Depth 5 | ConvertFrom-Json
+        foreach ($k in 'format', 'computer', 'vpn', 'created', 'tunnelIp', 'connectionRoutes', 'liveRoutes', 'persistentRoutes') { $json.PSObject.Properties.Name | Should -Contain $k }
+        [datetimeoffset]::Parse($json.created) | Should -Not -BeNullOrEmpty
+    }
+
+    It 'keeps persistent routes that wait for a VPN when the VPN is not connected, marked as assumed' {
+        Mock Get-PmPersistentRoutes { @(
+                [ordered]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '203.0.113.77'; metric = 1 },   # no connected network reaches this gateway
+                [ordered]@{ prefix = '10.99.0.0/16'; mask = '255.255.0.0'; gateway = '198.51.100.5'; metric = 1 }) }   # reachable over a connected network: not a VPN route
+        Mock Get-NetRoute { @([pscustomobject]@{ NextHop = '0.0.0.0'; DestinationPrefix = '127.0.0.0/8' }, [pscustomobject]@{ NextHop = '0.0.0.0'; DestinationPrefix = '198.51.100.0/24' }) }
+        $b = Get-PmVpnRouteBackup -Name 'no-such-vpn-for-the-test'
+        $b.scope | Should -Be 'AllUsers'
+        @($b.persistentRoutes).Count | Should -Be 1
+        $b.persistentRoutes[0].prefix | Should -Be '192.168.91.0/24'
+        $b.persistentRoutes[0].assumed | Should -BeTrue
+    }
+
+    It 'reads a credential of another Windows account as a clear error, not as a missing password' {
+        $root = Join-Path $Work 'manager-foreign-credential'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Set-PmRoot -Path $root
+        $srv = Set-PmServer -Name 'REMOTE' -HostName '192.0.2.20' -Transport winrm
+        # a credential file whose protected part this account cannot decrypt
+        $good = Join-Path $root 'good.xml'
+        (New-PmCredential -UserName 'u' -Password 'p') | Export-Clixml -LiteralPath $good
+        $xml = [IO.File]::ReadAllText($good) -replace '(<SS N="Password">)[0-9a-f]{40}', '${1}0000000000000000000000000000000000000000'
+        [IO.File]::WriteAllText((Join-Path (Get-PmPath Credentials) "$($srv.id).cred.xml"), $xml)
+        { Get-PmCredential -ServerId $srv.id } | Should -Throw '*another Windows account*'
+    }
+
+    It 'leaves routes alone that are already there and reports a connection that does not exist' {
+        Mock Get-PmPersistentRoutes { @([ordered]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '10.0.0.2'; metric = 1 }) }
+        Mock Write-PmLog { }
+        $backup = [pscustomobject]@{ vpn = 'no-such-vpn-for-the-test'; connectionRoutes = @([pscustomobject]@{ prefix = '8.8.8.8/32'; metric = 1 })
+            persistentRoutes = @([pscustomobject]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '10.0.0.2'; metric = 1 }) }
+        $r = Restore-PmVpnRoutes -Backup $backup
+        $r.kept | Should -Be 1
+        $r.added | Should -Be 0
+        $r.failed | Should -Be 1
+    }
+}
+
+Describe 'Backups are listed as PRTG or VPN' {
+    It 'tells the kind of a backup from its contents' {
+        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $true }; vpn = [pscustomobject]@{ included = $true } }) | Should -Be 'prtg'
+        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $false }; vpn = [pscustomobject]@{ included = $true } }) | Should -Be 'vpn'
+        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $false }; vpn = [pscustomobject]@{ included = $false } }) | Should -Be 'files'
+        Get-PmBackupKind -Manifest $null -Name 'VPN_SERVER_20260101-000000.zip' | Should -Be 'vpn'
+        Get-PmBackupKind -Manifest $null -Name 'PRTG_SERVER_20260101-000000.zip' | Should -Be 'prtg'
+    }
+
+    It 'makes a VPN backup of this computer with the routes of every connection' {
+        $root = Join-Path $Work 'manager-vpn-backup'
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Set-PmRoot -Path $root
+        $me = Set-PmServer -Name 'THIS' -HostName 'localhost' -Transport local -Role both
+        $old = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'
+        try {
+            $job = New-PmJobObject -Type 'backup' -Summary 'vpn backup test'
+            $r = Invoke-PmBackupFlow -Server (Get-PmServer -Id $me.id) -Options @{ IncludePrtg = $false; IncludeVpn = $true; IncludeDesktop = $false; NoTouch = $true } -Job $job
+        } finally { $env:PRTGMOVER_TEST = $old }
+        (Split-Path $r.Zip -Leaf) | Should -BeLike 'VPN_*'
+        $b = @(Get-PmBackups | ForEach-Object { $_ }) | Where-Object { $_.name -eq (Split-Path $r.Zip -Leaf) }
+        $b.kind | Should -Be 'vpn'
+        $b.manifest.vpn.included | Should -BeTrue
+        foreach ($route in @($b.manifest.vpn.routes | Where-Object { $_ })) {
+            Test-Path -LiteralPath (Join-Path $r.StageDir "vpn\routes\$($route.file)") | Should -BeTrue
+            (Get-Content -LiteralPath (Join-Path $r.StageDir "vpn\routes\$($route.file)") -Raw | ConvertFrom-Json).format | Should -Be 'vpn-routes/1'
+        }
     }
 }
