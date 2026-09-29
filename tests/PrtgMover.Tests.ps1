@@ -586,6 +586,18 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         (Invoke-RestMethod "$Dash/api/info").PSObject.Properties.Name | Should -Contain 'elevated'
     }
 
+    It 'adds this computer with the few fields the button "Add this computer" sends, and tests it' {
+        $r = Invoke-RestMethod -Method Post -Uri "$Dash/api/servers" -ContentType 'application/json' -Body '{"name":"ME2","host":"localhost","role":"both","transport":"local"}'
+        $r.transport | Should -Be 'local'
+        $j = Invoke-RestMethod -Method Post -Uri "$Dash/api/jobs" -ContentType 'application/json' -Body (@{ type = 'test'; mode = 'auto'; serverIds = @($r.id) } | ConvertTo-Json)
+        $deadline = (Get-Date).AddSeconds(90)
+        do { Start-Sleep -Seconds 1; $st = Invoke-RestMethod "$Dash/api/jobs/$($j.id)" } while ($st.status -in 'queued', 'running' -and (Get-Date) -lt $deadline)
+        $st.status | Should -BeIn 'completed', 'failed'
+        $text = (@($st.logs | ForEach-Object { $_ }) | ForEach-Object { $_.message }) -join "`n"
+        $text | Should -Match 'Local test: (PASS|FAIL)'
+        $text | Should -Match ([regex]::Escape($env:COMPUTERNAME))
+    }
+
     It 'a second start on the same port ends without an error and leaves the dashboard running' {
         $out = Join-Path $Work 'second-start.txt'
         $second = Start-Process powershell -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
