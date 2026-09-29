@@ -592,7 +592,8 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         $j = Invoke-RestMethod -Method Post -Uri "$Dash/api/jobs" -ContentType 'application/json' -Body (@{ type = 'test'; mode = 'auto'; serverIds = @($r.id) } | ConvertTo-Json)
         $deadline = (Get-Date).AddSeconds(90)
         do { Start-Sleep -Seconds 1; $st = Invoke-RestMethod "$Dash/api/jobs/$($j.id)" } while ($st.status -in 'queued', 'running' -and (Get-Date) -lt $deadline)
-        $st.status | Should -BeIn 'completed', 'failed'
+        # with administrator rights the test of this computer succeeds, without them it fails with a clear message
+        $st.status | Should -BeIn 'succeeded', 'failed'
         $text = (@($st.logs | ForEach-Object { $_ }) | ForEach-Object { $_.message }) -join "`n"
         $text | Should -Match 'Local test: (PASS|FAIL)'
         $text | Should -Match ([regex]::Escape($env:COMPUTERNAME))
