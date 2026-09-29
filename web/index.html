@@ -20,7 +20,9 @@
       <a href="#migrate" data-view="migrate">Backup &amp; Migrate</a>
       <a href="#backups" data-view="backups">Backups</a>
       <a href="#jobs" data-view="jobs">Jobs <span class="pill" id="runningPill" hidden>0</span></a>
+      <a href="#logs" data-view="logs">Logs &amp; Audit</a>
     </nav>
+    <div class="side-agents" id="sideAgents"></div>
     <div class="sidebar-foot" id="managerInfo"></div>
   </aside>
 
@@ -41,10 +43,11 @@
         <div class="card">
           <h2>How it works</h2>
           <ol class="steps">
-            <li><b>Add servers</b> — the source PRTG server and one or more targets (WinRM must be enabled, see README).</li>
-            <li><b>Test</b> — verifies remoting, admin rights, PRTG version, disk space and VPN list.</li>
-            <li><b>Migrate</b> — stops PRTG on the source, packages data + registry + customisations + VPN + desktops, stores the package on this manager, restores it on every target and starts PRTG.</li>
-            <li><b>Verify</b> — the job waits until the PRTG web interface answers on each target.</li>
+            <li><b>Servers</b> — add the source PRTG server and the target(s). Choose the connection method: <span class="badge info">RDP</span> (nothing to configure on the server) or <span class="badge info">WinRM</span>.</li>
+            <li><b>Test</b> — <i>Test RDP</i> / <i>Test WinRM</i>. A server is <span class="badge ok">PASS</span> when at least one method works.</li>
+            <li><b>Agent</b> (RDP method) — press <i>RDP</i>, log in, run the copied command in an elevated PowerShell. Keep the RDP window open or minimized — <b>do not close it</b> while a job runs.</li>
+            <li><b>Migrate</b> — pre-flight checks → copy PRTG from a snapshot straight to this manager (source untouched) → package → restore on each target → start PRTG and verify it is fully up.</li>
+            <li><b>Backups / Jobs / Logs</b> — download the package, follow every step live, resume failed jobs, download diagnostics.</li>
           </ol>
         </div>
         <div class="card">
@@ -83,12 +86,18 @@
           <div id="targetList" class="checklist"></div>
           <p class="hint">Leave all targets unchecked to create a backup only.</p>
           <h2 class="mt">3 · What to include</h2>
-          <label class="check"><input type="checkbox" name="IncludePrtg" checked> PRTG (configuration, registry, certificates, custom sensors, lookups, MIBs…)</label>
-          <label class="check sub"><input type="checkbox" name="IncludeProgram" checked> Clone the <b>PRTG program itself</b> (program files + services) — targets without PRTG need no installer</label>
-          <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source <b>license</b> to the target(s)</label>
-          <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> Historic monitoring data &amp; logs</label>
-          <label class="check"><input type="checkbox" name="IncludeVpn" checked> Windows VPN connections (all-user + per-user phonebooks)</label>
-          <label class="check"><input type="checkbox" name="IncludeDesktop" checked> Desktop files of all user profiles + Public desktop</label>
+          <div class="group">
+            <label class="check"><input type="checkbox" name="IncludePrtg" checked> <span><b>PRTG</b> — configuration (all sensors, notifications, triggers, users, maps, reports…), registry, SSL certificate, custom sensors, lookups, MIBs</span></label>
+            <label class="check sub"><input type="checkbox" name="IncludeProgram" checked> Clone the <b>PRTG program</b> (program files + services) — no installer needed on the target</label>
+            <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source <b>license</b></label>
+            <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> <b>Historic monitoring data</b> (graphs &amp; tables of the past)</label>
+            <label class="check sub"><input type="checkbox" name="IncludeLogs"> PRTG log files <span class="muted">(not needed — usually large)</span></label>
+            <label class="check sub"><input type="checkbox" name="IncludeAutoBackups"> Old automatic configuration copies <span class="muted">(not needed)</span></label>
+          </div>
+          <div class="group">
+            <label class="check"><input type="checkbox" name="IncludeVpn" checked> <span><b>Windows VPN connections</b> (all-user + per-user)</span></label>
+            <label class="check"><input type="checkbox" name="IncludeDesktop" checked> <span><b>Desktop files</b> of every user + Public desktop (.bat, VPN files, notes…)</span></label>
+          </div>
           <label class="field"><span>Extra paths on the source (one per line, optional)</span><textarea name="ExtraPaths" rows="3" placeholder="D:\Scripts&#10;C:\Tools\prtg-helper.ps1"></textarea></label>
         </div>
         <div class="card">
@@ -115,6 +124,7 @@
             <label class="btn small">Upload installer<input type="file" id="installerUpload" accept=".exe,.zip" hidden></label>
             <span class="hint" id="installerUploadStatus"></span>
           </div>
+          <div class="summary" id="migrateSummary"></div>
           <div class="form-actions">
             <button type="submit" class="btn primary" id="runMigrate">Start</button>
           </div>
@@ -145,6 +155,33 @@
       <div class="jobs-layout">
         <div class="card flush"><div id="jobsList" class="list jobs"></div></div>
         <div class="card" id="jobDetail"><p class="muted">Select a job to see its progress and log.</p></div>
+      </div>
+    </section>
+    <!-- ======================= LOGS & AUDIT -->
+    <section id="view-logs" class="view">
+      <header class="page-head">
+        <div><h1>Logs &amp; Audit</h1><p class="muted">Everything the manager did and every change made through the dashboard. Use <b>Download diagnostics</b> to send all logs at once.</p></div>
+        <div class="actions">
+          <button class="btn" id="refreshLogs">Refresh</button>
+          <button class="btn primary" id="diagBtn2">Download diagnostics</button>
+        </div>
+      </header>
+      <div class="card">
+        <h2>Where things are logged</h2>
+        <div class="kv">
+          <dt>Job logs</dt><dd>Jobs page (tick <i>Show debug</i> for exact error line, stack, timings) · <code>data\jobs\&lt;id&gt;.log</code></dd>
+          <dt>Manager / API</dt><dd><code>data\logs\manager-yyyyMMdd.log</code> (below)</dd>
+          <dt>Audit trail</dt><dd><code>data\logs\audit.log</code> (below)</dd>
+          <dt>File copies</dt><dd><code>data\logs\robocopy\robocopy-&lt;job&gt;-&lt;server&gt;.log</code></dd>
+          <dt>Agents (RDP)</dt><dd><code>data\agent\&lt;server-id&gt;\agent.log</code></dd>
+        </div>
+      </div>
+      <div class="card flush mt16"><div class="table-wrap"><table class="table" id="auditTable">
+        <thead><tr><th>Time</th><th>Action</th><th>Details</th><th>User</th></tr></thead><tbody></tbody>
+      </table></div></div>
+      <div class="card mt16">
+        <h2>Manager log (today, last 300 lines)</h2>
+        <div class="log" id="managerLog" style="height:360px"></div>
       </div>
     </section>
   </main>

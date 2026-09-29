@@ -63,6 +63,44 @@
     $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${view}`));
     $$('nav a').forEach((a) => a.classList.toggle('active', a.dataset.view === view));
     if (view === 'jobs') loadJobs();
+    if (view === 'logs') loadLogs();
+  }
+
+  // ------------------------------------------------------------ logs & audit
+  async function loadLogs() {
+    try {
+      const [audit, mlog] = await Promise.all([api('GET', '/api/logs/audit'), api('GET', '/api/logs/manager')]);
+      const rows = arr(audit);
+      $('#auditTable tbody').innerHTML = rows.length ? rows.map((a) => {
+        const d = a.data || {};
+        const details = Object.keys(d).filter((k) => d[k] !== null && d[k] !== '').map((k) => `${esc(k)}=<b>${esc(Array.isArray(d[k]) ? d[k].join(',') : d[k])}</b>`).join(' · ');
+        return `<tr><td class="num">${esc(fmtDate(a.time))}</td><td><span class="badge info">${esc(a.action)}</span></td><td>${details}</td><td>${esc(a.user)}</td></tr>`;
+      }).join('') : '<tr><td colspan="4" class="empty">No audit entries yet.</td></tr>';
+      const box = $('#managerLog');
+      box.innerHTML = arr(mlog.lines).map((l) => {
+        const cls = /\[ERROR/.test(l) ? 'ERROR' : /\[WARN/.test(l) ? 'WARN' : /\[AUDIT/.test(l) ? 'OK' : '';
+        return `<div class="${cls}">${esc(l)}</div>`;
+      }).join('') || '<div>Empty.</div>';
+      box.scrollTop = box.scrollHeight;
+    } catch (err) { toast(err.message, true); }
+  }
+  $('#refreshLogs').addEventListener('click', loadLogs);
+  $('#diagBtn2').addEventListener('click', () => { toast('Building diagnostics bundle…'); location.href = `/api/diagnostics?token=${encodeURIComponent(token)}`; });
+
+  // ------------------------------------------------------------ agents in the sidebar
+  function renderSideAgents() {
+    $('#sideAgents').innerHTML = state.servers.length ? '<b style="color:var(--muted)">Servers</b>' + state.servers.map((s) => {
+      const on = s.agent && s.agent.connected;
+      const tag = s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
+        : on ? `<span class="badge ok">agent ${esc(s.agent.state || 'on')}</span>` : '<span class="badge">agent off</span>';
+      return `<div class="row"><span>${esc(s.name)}</span>${tag}</div>`;
+    }).join('') : '';
+  }
+  function serverLine(s) {
+    if (!s) return '';
+    if (s.transport === 'winrm') return `<div class="srvline"><span class="badge info">WinRM</span> ${esc(s.host)}</div>`;
+    const on = s.agent && s.agent.connected;
+    return `<div class="srvline"><span class="badge info">RDP</span> ${esc(s.host)}:${esc(s.rdpPort || 3389)} · ${on ? `<span class="badge ok">agent connected (${esc(s.agent.computer)})</span>` : '<span class="badge warn">agent not running — press RDP on the Servers page</span>'}</div>`;
   }
   window.addEventListener('hashchange', () => show(location.hash.slice(1) || 'overview'));
   $$('[data-goto]').forEach((b) => b.addEventListener('click', () => { location.hash = b.dataset.goto; }));
@@ -224,22 +262,55 @@
     const sources = state.servers.filter((s) => s.role !== 'target');
     f.sourceId.innerHTML = sources.length ? sources.map((s) => `<option value="${esc(s.id)}">${esc(s.name)} (${esc(s.host)})</option>`).join('') : '<option value="">— add a server first —</option>';
     if (prev && sources.some((s) => s.id === prev)) f.sourceId.value = prev;
+    let line = $('#sourceLine');
+    if (!line) { line = document.createElement('div'); line.id = 'sourceLine'; f.sourceId.closest('.field').after(line); }
+    line.innerHTML = serverLine(state.servers.find((s) => s.id === f.sourceId.value));
     renderTargets();
+    renderSideAgents();
   }
   function renderTargets() {
     const f = $('#migrateForm');
     const checked = new Set($$('#targetList input:checked').map((i) => i.value));
     const targets = state.servers.filter((s) => s.role !== 'source' && s.id !== f.sourceId.value);
-    $('#targetList').innerHTML = targets.length ? targets.map((s) => `<label class="check"><input type="checkbox" value="${esc(s.id)}" ${checked.has(s.id) ? 'checked' : ''}> ${esc(s.name)} <span class="muted">(${esc(s.host)})</span></label>`).join('')
+    $('#targetList').innerHTML = targets.length ? targets.map((s) => `<label class="check"><input type="checkbox" value="${esc(s.id)}" ${checked.has(s.id) ? 'checked' : ''}> <span><b>${esc(s.name)}</b>${serverLine(s)}</span></label>`).join('')
       : '<div class="empty">No target servers.</div>';
     updateMigrateButton();
   }
   function updateMigrateButton() {
     const n = $$('#targetList input:checked').length;
     $('#runMigrate').textContent = n ? `Migrate to ${n} server${n > 1 ? 's' : ''}` : 'Create backup';
+    renderMigrateSummary();
   }
-  $('#migrateForm').sourceId.addEventListener('change', renderTargets);
+
+  // Plain-language summary of exactly what the job will do / copy / skip.
+  function renderMigrateSummary() {
+    const f = $('#migrateForm');
+    const src = state.servers.find((s) => s.id === f.sourceId.value);
+    const targets = $$('#targetList input:checked').map((i) => state.servers.find((s) => s.id === i.value)).filter(Boolean);
+    const yes = (on, text) => `<li class="${on ? '' : 'no'}">${on ? '✓' : '✗'} ${text}</li>`;
+    const prtg = f.IncludePrtg.checked;
+    let html = '<h3>What this job will do</h3><ul>';
+    html += `<li><b>Source:</b> ${src ? esc(src.name) : '–'} — ${f.NoTouch.checked ? '<b>not touched</b> (PRTG keeps running, copied from a snapshot straight to this manager)' : `PRTG is stopped (${esc(f.SourceAfter.value)})`}</li>`;
+    html += `<li><b>Target(s):</b> ${targets.length ? targets.map((t) => esc(t.name)).join(', ') : '<i>none — backup only</i>'}</li></ul>`;
+    html += '<h3>Copied</h3><ul>';
+    html += yes(prtg, 'PRTG configuration — all probes, groups, devices, sensors, <b>notifications</b>, <b>triggers</b>, users, schedules, maps, reports');
+    html += yes(prtg, 'PRTG registry, SSL certificate, custom sensors, notification scripts, lookups, MIBs, device templates');
+    html += yes(prtg && f.IncludeProgram.checked, 'PRTG program files + Windows services (clone, no installer)');
+    html += yes(prtg && f.CopyLicense.checked, 'PRTG license');
+    html += yes(prtg && f.IncludeHistory.checked, 'Historic monitoring data');
+    html += yes(f.IncludeVpn.checked, 'Windows VPN connections');
+    html += yes(f.IncludeDesktop.checked, 'Desktop files of every user (.bat, VPN files, …)');
+    const extra = f.ExtraPaths.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (extra.length) html += yes(true, `Extra: ${extra.map(esc).join(', ')}`);
+    html += '</ul><h3>Not copied</h3><ul>';
+    html += `<li class="no">${f.IncludeLogs.checked ? '' : '✗ PRTG log files · '}${f.IncludeAutoBackups.checked ? '' : '✗ old automatic config copies · '}✗ cache &amp; temp files · ✗ anything else on the disk</li></ul>`;
+    if (targets.length) html += `<h3>On the target(s)</h3><ul><li>${f.OpenFirewall.checked ? 'open firewall · ' : ''}${f.StartServices.checked ? 'start PRTG and verify it is fully up' : 'do not start PRTG'} · rollback copy of any existing PRTG data</li></ul>`;
+    $('#migrateSummary').innerHTML = html;
+  }
+  $('#migrateForm').sourceId.addEventListener('change', () => { renderMigrateForm(); });
   $('#targetList').addEventListener('change', updateMigrateButton);
+  $('#migrateForm').addEventListener('change', renderMigrateSummary);
+  $('#migrateForm').addEventListener('input', renderMigrateSummary);
 
   function renderInstallers() {
     const opts = '<option value="">— none (use the clone) —</option>' + state.installers.map((i) => `<option>${esc(i.name)}</option>`).join('');
@@ -255,7 +326,7 @@
     const options = {
       IncludePrtg: f.IncludePrtg.checked, IncludeHistory: f.IncludeHistory.checked, IncludeVpn: f.IncludeVpn.checked, IncludeDesktop: f.IncludeDesktop.checked,
       ExtraPaths: f.ExtraPaths.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
-      NoTouch: f.NoTouch.checked, IncludeProgram: f.IncludeProgram.checked, CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked,
+      NoTouch: f.NoTouch.checked, IncludeProgram: f.IncludeProgram.checked, IncludeLogs: f.IncludeLogs.checked, IncludeAutoBackups: f.IncludeAutoBackups.checked, CopyLicense: f.CopyLicense.checked, OpenFirewall: f.OpenFirewall.checked,
       StartServices: f.StartServices.checked, HealthTimeoutMinutes: Number(f.HealthTimeoutMinutes.value) || 15, ConnectVpn: f.ConnectVpn.checked,
       AllowDowngrade: f.AllowDowngrade.checked, InstallerFile: f.InstallerFile.value, InstallerArgs: f.InstallerArgs.value,
       RestorePrtg: true, RestoreVpn: true, RestoreDesktop: true, RestoreExtra: true,
@@ -411,6 +482,7 @@
       $('#jobDetail').innerHTML = `
         <div class="page-head" style="margin:0"><div><h2 style="margin:0">${esc(j.summary || j.type)}</h2><span class="sub-text">${esc(j.id)}</span></div>
         <div class="actions" id="jobActions"></div></div>
+        <div class="stepper" id="jobStepper"></div>
         <div class="progress" id="jobProgress"><i></i></div>
         <div class="sub-text" id="jobStep"></div>
         <dl class="kv" id="jobKv"></dl>
@@ -442,6 +514,25 @@
       try { const r = await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/resume`); toast('Resumed'); await loadJobs(); selectJob(r.id); } catch (err) { toast(err.message, true); }
     };
     renderResult(j);
+
+    // ---- phase stepper (derived from the log lines)
+    const phases = {
+      migrate: [['Pre-flight', /Pre-flight checks/], ['Copy from source', /Backup started|RESUME: the package/], ['Package', /Compressing the staged copy|Downloading .* to the manager|RESUME: the package/], ['Restore on target', /Restore started/], ['Start & verify', /Starting PRTG and waiting/]],
+      backup: [['Pre-flight', /Pre-flight checks/], ['Copy from source', /Backup started/], ['Package', /Compressing the staged copy|Downloading .* to the manager/]],
+      restore: [['Restore on target', /Restore started|Connecting to target/], ['Start & verify', /Starting PRTG and waiting/]],
+    }[j.type];
+    if (first) state.phaseIdx = -1;
+    if (phases) {
+      arr(j.logs).forEach((l) => { phases.forEach((p, i) => { if (i > state.phaseIdx && p[1].test(l.message)) state.phaseIdx = i; }); });
+      const done = j.status === 'succeeded';
+      const bad = ['failed', 'cancelled', 'interrupted'].includes(j.status);
+      $('#jobStepper').innerHTML = phases.map((p, i) => {
+        let cls = '';
+        if (done || i < state.phaseIdx) cls = 'done';
+        else if (i === state.phaseIdx) cls = bad ? 'fail' : 'now';
+        return `<div class="st ${cls}">${i + 1}. ${esc(p[0])}</div>`;
+      }).join('') + `<div class="st ${done ? 'done' : ''}">✓ Done</div>`;
+    } else { $('#jobStepper').innerHTML = ''; }
 
     const log = $('#jobLog');
     const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
@@ -492,4 +583,6 @@
   show(location.hash.slice(1) || 'overview');
   if (!token) askToken(); else refreshAll();
   setInterval(() => { if (token && document.visibilityState === 'visible') loadJobs().catch(() => {}); }, 5000);
+  // agent status / test results change in the background - refresh the server views every 10 s (not while a dialog is open)
+  setInterval(() => { if (token && document.visibilityState === 'visible' && !document.querySelector('dialog[open]')) loadServers().catch(() => {}); }, 10000);
 })();

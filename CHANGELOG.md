@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.4.0 — 2026-09-29
+
+### Added
+- **Logs & Audit page**: audit trail table, the day's manager log, and diagnostics download.
+- Migrate page:
+  - a plain-language **What this job will do** summary (copied, not copied, what happens on the targets)
+  - each server's connection method and agent status
+- Job view: a **phase stepper** (Pre-flight → Copy from source → Package → Restore → Start & verify → Done).
+- Sidebar: live agent status of every server.
+- The dashboard console echoes every job's progress, so one console shows everything.
+- The agent keeps running when the RDP window is closed and continues automatically after reconnecting. RDP files enable auto-reconnect.
+- The desktop copy report lists scripts and VPN files (.bat, .cmd, .ps1, .pbk, .ovpn, .rdp).
+
+### Changed
+- Only what PRTG needs is copied by default: PRTG log files, cache/temp files and old automatic configuration copies are skipped. They are optional in the UI.
+- Resume reuses the partial staging copy of an interrupted run.
+
+### Fixed
+- PRTG 64-bit installs: the program folder is the install dir, not its `64 bit` subfolder.
+- The dashboard hung on the manager-log endpoint (Get-Content NoteProperties).
+- Jobs interrupted by a dashboard restart become resumable.
+
 ## 1.3.0 — 2026-09-29
 
 ### Added

@@ -355,14 +355,15 @@ function Invoke-PmRoute {
         '^GET /api/logs/audit$' {
             $af = Join-Path (Get-PmPath Data) 'logs\audit.log'
             $items = @()
-            if (Test-Path -LiteralPath $af) { $items = @(Get-Content -LiteralPath $af -Tail 200 -Encoding UTF8 | ForEach-Object { try { $_ | ConvertFrom-Json } catch { } }) }
+            if (Test-Path -LiteralPath $af) { $items = @(Get-Content -LiteralPath $af -Tail 200 -Encoding UTF8 | ForEach-Object { try { [string]$_ | ConvertFrom-Json } catch { } }) }
             [array]::Reverse($items)
             Send-PmJson $Ctx @($items)
             return
         }
         '^GET /api/logs/manager$' {
             $lf = Join-Path (Get-PmPath Data) ('logs\manager-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
-            $lines = @(); if (Test-Path -LiteralPath $lf) { $lines = @(Get-Content -LiteralPath $lf -Tail 300 -Encoding UTF8) }
+            # [string] strips the provider NoteProperties Get-Content attaches (ConvertTo-Json would walk them and hang).
+            $lines = @(); if (Test-Path -LiteralPath $lf) { $lines = [string[]]@(Get-Content -LiteralPath $lf -Tail 300 -Encoding UTF8 | ForEach-Object { [string]$_ }) }
             Send-PmJson $Ctx @{ file = $lf; lines = $lines }
             return
         }
