@@ -830,6 +830,31 @@ function ConvertTo-PmTsClientPath {
     return (Join-Path (Get-PmTsClientRoot) (Get-PmManagerRelative $LocalPath))
 }
 
+function Test-PmStageComplete {
+    <#
+        A staging copy is complete ONLY when the transfer finished (marker written afterwards)
+        AND PRTG Configuration.dat matches the checksum recorded on the source.
+    #>
+    param([Parameter(Mandatory)][string]$StageDir)
+    $marker = Join-Path $StageDir '.staging-complete'
+    $man = Join-Path $StageDir 'manifest.json'
+    if (-not (Test-Path -LiteralPath $marker) -or -not (Test-Path -LiteralPath $man)) { return $false }
+    try {
+        $m = Get-Content -LiteralPath $man -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($m.prtg.included -and $m.prtg.configSha256) {
+            $cfg = Join-Path $StageDir 'prtg\data\PRTG Configuration.dat'
+            if (-not (Test-Path -LiteralPath $cfg)) { return $false }
+            if ((Get-FileHash -LiteralPath $cfg -Algorithm SHA256).Hash -ne $m.prtg.configSha256) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Set-PmStageComplete {
+    param([Parameter(Mandatory)][string]$StageDir)
+    Set-Content -LiteralPath (Join-Path $StageDir '.staging-complete') -Value (Get-Date).ToString('o') -Encoding ASCII
+}
+
 function Find-PmResumeStage {
     <#
         Walks the resume chain (job -> resumedFrom -> ...) and returns the newest staging copy
@@ -842,7 +867,7 @@ function Find-PmResumeStage {
         $seen[$id] = $true
         $p = Join-Path (Get-PmPath Data) "staging\$id"
         if (Test-Path -LiteralPath $p) {
-            return [pscustomobject]@{ Path = $p; JobId = $id; Complete = (Test-Path -LiteralPath (Join-Path $p 'manifest.json')) }
+            return [pscustomobject]@{ Path = $p; JobId = $id; Complete = (Test-PmStageComplete -StageDir $p) }
         }
         $rec = Join-Path (Get-PmPath Jobs) "$id.json"
         $id = $null
@@ -898,18 +923,45 @@ function Get-PmLocalFileList {
     return $out
 }
 
+function New-PmLocalChunk {
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string[]]$Files, [Parameter(Mandatory)][string]$ChunkPath)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    if (Test-Path -LiteralPath $ChunkPath) { Remove-Item -LiteralPath $ChunkPath -Force }
+    $zip = [IO.Compression.ZipFile]::Open($ChunkPath, [IO.Compression.ZipArchiveMode]::Create)
+    try { foreach ($rel in $Files) { [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $Source $rel), $rel.Replace('\', '/'), [IO.Compression.CompressionLevel]::Optimal) } }
+    finally { $zip.Dispose() }
+}
+
+function Expand-PmLocalChunk {
+    param([Parameter(Mandatory)][string]$ChunkPath, [Parameter(Mandatory)][string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($ChunkPath)
+    try {
+        foreach ($e in $zip.Entries) {
+            if (-not $e.Name) { continue }
+            $target = Join-Path $Destination ($e.FullName.Replace('/', '\'))
+            $dir = Split-Path $target -Parent
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+        }
+    } finally { $zip.Dispose() }
+}
+
 function Invoke-PmTransferFiles {
     <#
-        Resumable file-by-file transfer over a WinRM session.
+        Resumable, compressed transfer over a WinRM session.
           -Direction Pull : RemoteRoot -> LocalRoot (files: remote list)
           -Direction Push : LocalRoot  -> RemoteRoot (files: local list)
-        Files that already exist with the same size (and, for pull, the same timestamp) are skipped,
-        so an interrupted transfer continues where it stopped.
+        Files are packed into compressed chunks (~256 MB of data each) on the sending side,
+        copied in one piece and unpacked on the receiving side - far fewer round trips and
+        4-5x less traffic for PRTG data. Files that already exist with the same size (pull:
+        and timestamp) are skipped, so an interrupted transfer continues where it stopped.
     #>
     param(
         [Parameter(Mandatory)]$Session, [Parameter(Mandatory)][ValidateSet('Pull', 'Push')][string]$Direction,
         [Parameter(Mandatory)][string]$RemoteRoot, [Parameter(Mandatory)][string]$LocalRoot,
-        [object[]]$Files = @(), $Job, [string]$Label = 'files', [int]$ProgressBase = 0, [double]$ProgressSpan = 0
+        [object[]]$Files = @(), $Job, [string]$Label = 'files', [int]$ProgressBase = 0, [double]$ProgressSpan = 0,
+        [int64]$ChunkBytes = 256MB, [int]$ChunkFiles = 3000
     )
     $existing = @{}
     if ($Direction -eq 'Pull') {
@@ -917,8 +969,7 @@ function Invoke-PmTransferFiles {
     } else {
         $rl = Invoke-PmRemote -Session $Session -Function 'Get-PmPullList' -Parameters @{ Source = $RemoteRoot } -Job $Job
         foreach ($f in @($rl.Files)) { $existing[([string]$f.Rel).ToLowerInvariant()] = $f }
-        $dirs = @($Files | ForEach-Object { Split-Path ([string]$_.Rel) -Parent } | Where-Object { $_ } | Sort-Object -Unique)
-        [void](Invoke-PmRemote -Session $Session -Function 'New-PmRemoteDirectories' -Parameters @{ Root = $RemoteRoot; Relative = [string[]]$dirs } -Job $Job)
+        [void](Invoke-PmRemote -Session $Session -Function 'New-PmRemoteDirectories' -Parameters @{ Root = $RemoteRoot } -Job $Job)
     }
     $total = [int64](($Files | Measure-Object -Property Size -Sum).Sum)
     $todo = @($Files | Where-Object {
@@ -931,52 +982,62 @@ function Invoke-PmTransferFiles {
         })
     $todoBytes = [int64](($todo | Measure-Object -Property Size -Sum).Sum)
     Add-PmJobLog -Job $Job -Level STEP -Message ("{0} {1}: {2} file(s), {3:N2} GB in total - {4} file(s), {5:N2} GB still to transfer{6}." -f $Direction, $Label, @($Files).Count, ($total / 1GB), $todo.Count, ($todoBytes / 1GB), $(if ($todo.Count -lt @($Files).Count) { ' (resuming - the rest is already there)' } else { '' }))
-    $done = [int64]0; $sw = [Diagnostics.Stopwatch]::StartNew(); $lastLog = [Diagnostics.Stopwatch]::StartNew(); $n = 0
+    if (-not $todo.Count) { return }
+
+    # batches
+    $batches = New-Object System.Collections.ArrayList
+    $cur = New-Object System.Collections.ArrayList; $curBytes = [int64]0
     foreach ($f in $todo) {
-        $rel = [string]$f.Rel
-        $remote = Join-Path $RemoteRoot $rel
-        $local = Join-Path $LocalRoot $rel
+        if ($cur.Count -and (($curBytes + [int64]$f.Size) -gt $ChunkBytes -or $cur.Count -ge $ChunkFiles)) { [void]$batches.Add($cur); $cur = New-Object System.Collections.ArrayList; $curBytes = 0 }
+        [void]$cur.Add($f); $curBytes += [int64]$f.Size
+    }
+    if ($cur.Count) { [void]$batches.Add($cur) }
+
+    $chunkDir = Join-Path (Get-PmPath Data) 'chunks'
+    if (-not (Test-Path -LiteralPath $chunkDir)) { New-Item -ItemType Directory -Force -Path $chunkDir | Out-Null }
+    $done = [int64]0; $wire = [int64]0; $n = 0; $b = 0
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    foreach ($batch in $batches) {
+        $b++
+        $rels = [string[]]@($batch | ForEach-Object { [string]$_.Rel })
+        $bytes = [int64](($batch | Measure-Object -Property Size -Sum).Sum)
+        $localChunk = Join-Path $chunkDir ('{0}.zip' -f [guid]::NewGuid().ToString('N'))
         for ($try = 1; $try -le 3; $try++) {
+            $remoteChunk = $null
             try {
                 if ($Direction -eq 'Pull') {
-                    $ld = Split-Path $local -Parent
-                    if (-not (Test-Path -LiteralPath $ld)) { New-Item -ItemType Directory -Force -Path $ld | Out-Null }
-                    try { Copy-Item -FromSession $Session -Path $remote -Destination $local -Force -ErrorAction Stop }
-                    catch {
-                        # Copy-Item over WinRM cannot see hidden/system files - read the bytes directly instead (small files).
-                        if ($_.Exception.Message -notmatch 'Could not find item|Cannot find path' -or [int64]$f.Size -gt 64MB) { throw }
-                        $bytes = Invoke-Command -Session $Session -ScriptBlock { param($p) , [IO.File]::ReadAllBytes($p) } -ArgumentList $remote -ErrorAction Stop
-                        [IO.File]::WriteAllBytes($local, [byte[]]$bytes)
-                        Add-PmJobLog -Job $Job -Level DEBUG -Message "Hidden/system file pulled directly: $rel"
-                    }
-                    (Get-Item -LiteralPath $local -Force).LastWriteTimeUtc = [datetime]::new([int64]$f.Time, [DateTimeKind]::Utc)
+                    $c = Invoke-PmRemote -Session $Session -Function 'New-PmTransferChunk' -Parameters @{ Source = $RemoteRoot; Files = $rels } -Job $Job
+                    $remoteChunk = $c.Path
+                    Copy-Item -FromSession $Session -Path $remoteChunk -Destination $localChunk -Force -ErrorAction Stop
+                    [void](Invoke-PmRemote -Session $Session -Function 'Remove-PmTransferChunk' -Parameters @{ ChunkPath = $remoteChunk } -Job $Job)
+                    $remoteChunk = $null
+                    if (-not (Test-Path -LiteralPath $LocalRoot)) { New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null }
+                    Expand-PmLocalChunk -ChunkPath $localChunk -Destination $LocalRoot
+                    foreach ($f in $batch) { try { (Get-Item -LiteralPath (Join-Path $LocalRoot ([string]$f.Rel)) -Force).LastWriteTimeUtc = [datetime]::new([int64]$f.Time, [DateTimeKind]::Utc) } catch { } }
                 } else {
-                    try { Copy-Item -ToSession $Session -Path $local -Destination $remote -Force -ErrorAction Stop }
-                    catch {
-                        if ($_.Exception.Message -notmatch 'Could not find item|Cannot find path|Access to the path' -or [int64]$f.Size -gt 64MB) { throw }
-                        $bytes = [IO.File]::ReadAllBytes($local)
-                        Invoke-Command -Session $Session -ScriptBlock { param($p, $b) [IO.File]::WriteAllBytes($p, [byte[]]$b) } -ArgumentList $remote, $bytes -ErrorAction Stop
-                        Add-PmJobLog -Job $Job -Level DEBUG -Message "Hidden/system file pushed directly: $rel"
-                    }
+                    New-PmLocalChunk -Source $LocalRoot -Files $rels -ChunkPath $localChunk
+                    $remoteChunk = Join-Path $RemoteRoot ('..\chunk-{0}.zip' -f [guid]::NewGuid().ToString('N'))
+                    Copy-Item -ToSession $Session -Path $localChunk -Destination $remoteChunk -Force -ErrorAction Stop
+                    [void](Invoke-PmRemote -Session $Session -Function 'Expand-PmTransferChunk' -Parameters @{ ChunkPath = $remoteChunk; Destination = $RemoteRoot } -Job $Job)
+                    $remoteChunk = $null
                 }
+                $wire += (Get-Item -LiteralPath $localChunk).Length
                 break
             } catch {
-                if ($try -eq 3) { throw "Transfer of '$rel' failed 3 times: $($_.Exception.Message)" }
-                Add-PmJobLog -Job $Job -Level WARN -Message "Transfer of '$rel' failed ($($_.Exception.Message)) - retry $($try + 1)/3"
-                Start-Sleep -Seconds (5 * $try)
-            }
+                if ($remoteChunk) { try { [void](Invoke-PmRemote -Session $Session -Function 'Remove-PmTransferChunk' -Parameters @{ ChunkPath = $remoteChunk } -Job $Job) } catch { } }
+                if ($try -eq 3) { throw "Transfer of chunk $b/$($batches.Count) ($($rels.Count) files, first: $($rels[0])) failed 3 times: $($_.Exception.Message)" }
+                Add-PmJobLog -Job $Job -Level WARN -Message "Chunk $b/$($batches.Count) failed ($($_.Exception.Message)) - retry $($try + 1)/3"
+                Start-Sleep -Seconds (10 * $try)
+            } finally { Remove-Item -LiteralPath $localChunk -Force -ErrorAction SilentlyContinue }
         }
-        $done += [int64]$f.Size; $n++
-        if ($lastLog.Elapsed.TotalSeconds -ge 20 -or $n -eq $todo.Count) {
-            $pct = if ($todoBytes) { [int](100 * $done / $todoBytes) } else { 100 }
-            $rate = ($done / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)
-            $eta = if ($rate -gt 0) { [TimeSpan]::FromSeconds((($todoBytes - $done) / 1MB) / $rate) } else { [TimeSpan]::Zero }
-            Add-PmJobLog -Job $Job -Message ("{0} {1}: {2}% ({3:N2} / {4:N2} GB, {5} files) - {6:N1} MB/s, about {7:hh\:mm\:ss} left" -f $Direction, $Label, $pct, ($done / 1GB), ($todoBytes / 1GB), $n, $rate, $eta)
-            if ($ProgressSpan -gt 0) { Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * $pct / 100)) -Step ("{0} {1}: {2}%" -f $Direction, $Label, $pct) }
-            $lastLog.Restart()
-        }
+        $done += $bytes; $n += $rels.Count
+        $pct = if ($todoBytes) { [int](100 * $done / $todoBytes) } else { 100 }
+        $rate = ($done / 1MB) / [math]::Max(1, $sw.Elapsed.TotalSeconds)
+        $eta = if ($rate -gt 0) { [TimeSpan]::FromSeconds((($todoBytes - $done) / 1MB) / $rate) } else { [TimeSpan]::Zero }
+        Add-PmJobLog -Job $Job -Message ("{0} {1}: {2}% ({3:N2} / {4:N2} GB, {5} files, chunk {6}/{7}) - {8:N1} MB/s effective, {9:N1}x compression, about {10:hh\:mm\:ss} left" -f $Direction, $Label, $pct, ($done / 1GB), ($todoBytes / 1GB), $n, $b, $batches.Count, $rate, ($done / [math]::Max(1, $wire)), $eta)
+        if ($ProgressSpan -gt 0) { Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * $pct / 100)) -Step ("{0} {1}: {2}%" -f $Direction, $Label, $pct) }
     }
-    Add-PmJobLog -Job $Job -Level OK -Message ("{0} {1} complete ({2:N2} GB transferred in {3:hh\:mm\:ss})." -f $Direction, $Label, ($done / 1GB), $sw.Elapsed)
+    Add-PmJobLog -Job $Job -Level OK -Message ("{0} {1} complete: {2:N2} GB of data in {3:hh\:mm\:ss} ({4:N2} GB on the wire)." -f $Direction, $Label, ($done / 1GB), $sw.Elapsed, ($wire / 1GB))
 }
 
 function Invoke-PmBackupFlow {
@@ -1043,6 +1104,12 @@ function Invoke-PmBackupFlow {
             }
         }
 
+        # Only now is the copy known to be whole - mark it (Resume may adopt it later).
+        if ($manifest.prtg.included -and $manifest.prtg.configSha256 -and $agent) {
+            $h = (Get-FileHash -LiteralPath (Join-Path $stageLocal 'prtg\data\PRTG Configuration.dat') -Algorithm SHA256).Hash
+            if ($h -ne $manifest.prtg.configSha256) { throw 'PRTG Configuration.dat staged on the manager does not match the source (checksum) - run Resume.' }
+        }
+        Set-PmStageComplete -StageDir $stageLocal
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.75)) -Step 'Building the package on the manager'
         $local = New-PmPackageFromStage -StageDir $stageLocal -Job $Job -SourceName $Server.name
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]$ProgressSpan) -Step 'Backup complete'
@@ -1057,13 +1124,14 @@ function Invoke-PmBackupFlow {
 function Get-PmExtractedStage {
     <# Local extracted copy of a package (read by RDP targets via \\tsclient, pushed to WinRM targets). #>
     param([Parameter(Mandatory)][string]$ZipPath, [string]$StageDir, $Job)
-    if ($StageDir -and (Test-Path -LiteralPath (Join-Path $StageDir 'manifest.json'))) { return $StageDir }
+    if ($StageDir -and (Test-PmStageComplete -StageDir $StageDir)) { return $StageDir }
     $dir = Join-Path (Get-PmPath Data) ("staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($ZipPath))
-    if (Test-Path -LiteralPath (Join-Path $dir 'manifest.json')) { return $dir }
+    if (Test-PmStageComplete -StageDir $dir) { return $dir }
     if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
     Add-PmJobLog -Job $Job -Level STEP -Message "Extracting $(Split-Path $ZipPath -Leaf) on the manager..."
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $dir)
+    Set-PmStageComplete -StageDir $dir
     return $dir
 }
 
@@ -1103,6 +1171,7 @@ function Invoke-PmRestoreFlow {
         } else {
             # Stable folder name per package, so Resume continues the push instead of starting again.
             $remoteStage = Join-Path $init.WorkRoot ('restore\' + [IO.Path]::GetFileNameWithoutExtension($BackupPath))
+            [void](Invoke-PmRemote -Session $s -Function 'Clear-PmRemoteStages' -Parameters @{ Keep = $remoteStage } -Job $Job)
             $files = @((Get-PmLocalFileList -Root $stageLocal).GetEnumerator() | ForEach-Object { [pscustomobject]@{ Rel = $_.Value.FullName.Substring($stageLocal.TrimEnd('\').Length + 1); Size = $_.Value.Length; Time = $_.Value.LastWriteTimeUtc.Ticks } })
             $bytes = [int64](($files | Measure-Object -Property Size -Sum).Sum)
             if ($init.FreeBytes -and $init.FreeBytes -lt ($bytes + 2GB)) {

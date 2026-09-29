@@ -120,6 +120,25 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         Test-Path $stage | Should -BeFalse
     }
 
+    It 'packs and unpacks transfer chunks (remote and manager side, hidden files included)' {
+        $src = Join-Path $Work 'chunk-src'
+        New-Item -ItemType Directory -Force -Path (Join-Path $src 'sub') | Out-Null
+        ('x' * 100000) | Set-Content (Join-Path $src 'sub\big.txt')
+        'hidden' | Set-Content (Join-Path $src 'h.dat')
+        (Get-Item (Join-Path $src 'h.dat')).Attributes = 'Hidden'
+        $c = (New-PmTransferChunk -Source $src -Files @('sub\big.txt', 'h.dat')) | Where-Object PmType -eq 'result'
+        $c.Size | Should -BeLessThan 100000
+        $dst = Join-Path $Work 'chunk-dst'
+        [void](Expand-PmTransferChunk -ChunkPath $c.Path -Destination $dst)
+        Get-Content (Join-Path $dst 'h.dat') | Should -Be 'hidden'
+        (Get-Item (Join-Path $dst 'sub\big.txt')).Length | Should -Be (Get-Item (Join-Path $src 'sub\big.txt')).Length
+        Test-Path $c.Path | Should -BeFalse
+        $lc = Join-Path $Work 'local.zip'
+        New-PmLocalChunk -Source $src -Files @('sub\big.txt') -ChunkPath $lc
+        Expand-PmLocalChunk -ChunkPath $lc -Destination (Join-Path $Work 'chunk-dst2')
+        Test-Path (Join-Path $Work 'chunk-dst2\sub\big.txt') | Should -BeTrue
+    }
+
     It 'emits only log / progress / result records' {
         $out = @(Invoke-PmRemoteBackup -JobId 'rt3' -WorkRoot (Join-Path $Work 'wr3') -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false)
         @($out | Where-Object { $_.PmType -notin 'log', 'progress', 'result' }).Count | Should -Be 0
@@ -248,6 +267,9 @@ Describe 'Resume' {
         'cfg' | Set-Content (Join-Path $stageA 'prtg\data\PRTG Configuration.dat')
         @{ tool = 'prtg-mover'; source = @{ computer = 'OLDSRV' }; stagingBytes = 10; prtg = @{ included = $true } } | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $stageA 'manifest.json')
         $c = New-PmJobObject -Type 'migrate' -Summary 'C'; $c.resumedFrom = $b.id
+        # without the completion marker the copy is NOT adopted (it may be partial)
+        Use-PmCompletedStage -Job $c -SourceName 'OLD' | Should -BeNullOrEmpty
+        Set-PmStageComplete -StageDir $stageA
         $r = Use-PmCompletedStage -Job $c -SourceName 'OLD'
         $r | Should -Not -BeNullOrEmpty
         Test-Path $r.Zip | Should -BeTrue

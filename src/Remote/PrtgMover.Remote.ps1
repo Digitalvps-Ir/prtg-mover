@@ -1127,6 +1127,66 @@ function Get-PmPullList {
     New-PmResult @{ Root = $Source; Files = @($list); Count = $list.Count; Bytes = [int64](($list | Measure-Object -Property Size -Sum).Sum) }
 }
 
+function New-PmTransferChunk {
+    <#
+        Packs a batch of files (relative to $Source) into one compressed zip so the manager can
+        transfer many files - compressed - in a single copy. PRTG data compresses ~4-5x.
+        Reads through .NET, so hidden/system files work too. The chunk is temporary.
+    #>
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string[]]$Files, [string]$ChunkPath)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    if (-not $ChunkPath) { $ChunkPath = Join-Path $env:SystemDrive ("PrtgMover\chunks\{0}.zip" -f [guid]::NewGuid().ToString('N')) }
+    New-Item -ItemType Directory -Force -Path (Split-Path $ChunkPath -Parent) | Out-Null
+    if (Test-Path -LiteralPath $ChunkPath) { Remove-Item -LiteralPath $ChunkPath -Force }
+    $zip = [IO.Compression.ZipFile]::Open($ChunkPath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($rel in $Files) {
+            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, (Join-Path $Source $rel), $rel.Replace('\', '/'), [IO.Compression.CompressionLevel]::Optimal)
+        }
+    } finally { $zip.Dispose() }
+    New-PmResult @{ Path = $ChunkPath; Size = (Get-Item -LiteralPath $ChunkPath).Length; Count = $Files.Count }
+}
+
+function Expand-PmTransferChunk {
+    <# Unpacks a chunk into $Destination (overwriting) and deletes the chunk. #>
+    param([Parameter(Mandatory)][string]$ChunkPath, [Parameter(Mandatory)][string]$Destination)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $n = 0
+    $zip = [IO.Compression.ZipFile]::OpenRead($ChunkPath)
+    try {
+        foreach ($e in $zip.Entries) {
+            if (-not $e.Name) { continue }
+            $target = Join-Path $Destination ($e.FullName.Replace('/', '\'))
+            $dir = Split-Path $target -Parent
+            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+            $n++
+        }
+    } finally { $zip.Dispose() }
+    Remove-Item -LiteralPath $ChunkPath -Force -ErrorAction SilentlyContinue
+    New-PmResult @{ Count = $n }
+}
+
+function Remove-PmTransferChunk {
+    param([Parameter(Mandatory)][string]$ChunkPath)
+    Remove-Item -LiteralPath $ChunkPath -Force -ErrorAction SilentlyContinue
+    New-PmResult @{ Removed = $ChunkPath }
+}
+
+function Clear-PmRemoteStages {
+    <# Removes PRTG Mover's own temporary restore folders / chunks of earlier (cancelled) runs, except $Keep. #>
+    param([string]$Keep)
+    $root = Join-Path $env:SystemDrive 'PrtgMover\restore'
+    $removed = @()
+    foreach ($d in (Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue)) {
+        if ($Keep -and $d.FullName -eq $Keep.TrimEnd('\')) { continue }
+        Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+        $removed += $d.Name
+    }
+    if ($removed.Count) { Write-PmLog "Removed leftovers of earlier runs: $($removed -join ', ')" 'INFO' }
+    New-PmResult @{ Removed = $removed }
+}
+
 function New-PmRemoteDirectories {
     param([Parameter(Mandatory)][string]$Root, [string[]]$Relative = @())
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
@@ -1140,6 +1200,8 @@ function Complete-PmRemotePull {
     if ($ShadowId) { Remove-PmShadowCopy -Shadow ([pscustomobject]@{ Id = $ShadowId; Link = $ShadowLink }); Write-PmLog 'VSS snapshot removed.' 'OK' }
     if ($StageDir -and (Test-Path -LiteralPath $StageDir)) { Remove-Item -LiteralPath $StageDir -Recurse -Force -ErrorAction SilentlyContinue }
     $root = Join-Path $env:SystemDrive 'PrtgMover'
+    $chunks = Join-Path $root 'chunks'
+    if (Test-Path -LiteralPath $chunks) { Remove-Item -LiteralPath $chunks -Recurse -Force -ErrorAction SilentlyContinue }
     foreach ($d in (Join-Path $root 'staging'), (Join-Path $root 'out'), $root) {
         if ((Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue }
     }
