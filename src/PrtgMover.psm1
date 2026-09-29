@@ -1499,7 +1499,7 @@ function Invoke-PmDirectTunnelMigrate {
                 $need = if ($kind -eq 'wireguard') { "UDP $($plan.Port)" } else { 'IP protocol 4' }
                 throw "$label between $($Source.name) ($($plan.Source)) and $($row.Server.name) ($($row.TunnelIp)) is not passing traffic. $need must be open between their public addresses."
             }
-            Add-PmJobLog -Job $Job -Level OK -Message "Tunnel $($plan.Source) ↔ $($row.TunnelIp) is up. The file copy will not touch this computer."
+            Add-PmJobLog -Job $Job -Level OK -Message "Tunnel $($plan.Source) <-> $($row.TunnelIp) is up. The file copy will not touch this computer."
         }
         Set-PmJobProgress -Job $Job -Percent 15 -Step "$label tunnel is up"
         $n = 0
@@ -1520,7 +1520,7 @@ function Invoke-PmDirectTunnelMigrate {
                 $params.StageDir = $uncStage
                 $params.TunnelCopy = $true
                 $params.PullMode = $false
-                Add-PmJobLog -Job $Job -Level STEP -Message "Copying $($Source.name) → $($row.Server.name) over $uncStage"
+                Add-PmJobLog -Job $Job -Level STEP -Message "Copying $($Source.name) -> $($row.Server.name) over $uncStage"
                 $copied = Invoke-PmRemote -Session $srcSession -Function 'Invoke-PmRemoteBackup' -Parameters $params -Job $Job -ProgressBase 15 -ProgressSpan 25
                 if (-not $copied) { throw "Tunnel copy to $($row.Server.name) returned no result." }
                 if ($copied.SourceHealth -and -not $copied.SourceHealth.Healthy) { throw "PRTG on $($Source.name) did not come back up ($($copied.SourceHealth.Message))." }

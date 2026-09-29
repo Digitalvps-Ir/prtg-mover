@@ -1331,7 +1331,7 @@ function Test-PmTunnelShare {
 function New-PmWireGuardConfigText {
     <#
         Split tunnel: AllowedIPs is only the other server's tunnel address (/32).
-        A full tunnel (0.0.0.0/0) is refused — it would replace the server's default route.
+        A full tunnel (0.0.0.0/0) is refused - it would replace the server's default route.
     #>
     param(
         [Parameter(Mandatory)][string]$PrivateKey,
