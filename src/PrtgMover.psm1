@@ -78,7 +78,7 @@ function Get-PmPath {
         'Status'      { Join-Path $script:PmRoot 'data\status' }
         'Installers'  { Join-Path $script:PmRoot 'installers' }
         'Config'      { Join-Path $script:PmRoot 'config' }
-        'Web'         { Join-Path $script:PmRoot 'web' }
+        'Web'         { Join-Path (Split-Path $PSScriptRoot -Parent) 'web' }   # part of the program, not of the data root
         'Remote'      { Join-Path $PSScriptRoot 'Remote\PrtgMover.Remote.ps1' }   # part of the program, not of the data root
     }
     if ($Name -notin 'Root', 'Remote', 'Web' -and -not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
@@ -181,7 +181,7 @@ function Remove-PmCredential {
 function New-PmCredential {
     <#
         Builds a PSCredential from the dashboard form. The password arrives once over the
-        token-protected localhost API; it is turned into a SecureString immediately and
+        localhost API; it is turned into a SecureString immediately and
         only ever persisted DPAPI-encrypted (Save-PmCredential).
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingUsernameAndPasswordParams', '', Justification = 'Entry point for the web form; converted to SecureString immediately.')]

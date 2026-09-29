@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.2 — 2026-09-29
+
+### Changed
+- **The dashboard uses no access token.** A token file left by an older version is removed when the dashboard starts.
+- **No access protection at all**, as the owner wants: no token and no check of where a request comes from. Every program on the manager, every web page that is open in a browser on the manager and, with `-ListenAll`, everyone who can reach the port can use the dashboard.
+
+### Added
+- `Start-PrtgMover.ps1 -DataRoot <folder>` keeps `config\`, `data\`, `backups\` and `installers\` outside the program folder.
+- Response headers `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`.
+
 ## 1.6.1 — 2026-09-29
 
 ### Added

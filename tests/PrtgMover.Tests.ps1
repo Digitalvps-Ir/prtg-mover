@@ -494,6 +494,45 @@ Describe 'Removing the PRTG license from a migrated server' -Skip:($env:OS -ne '
     }
 }
 
+Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT') {
+    BeforeAll {
+        $script:DashData = Join-Path $Work 'dash-data'
+        New-Item -ItemType Directory -Force -Path (Join-Path $DashData 'data') | Out-Null
+        'old-token-of-an-earlier-version' | Set-Content (Join-Path $DashData 'data\token.txt')
+        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $script:DashPort = $l.LocalEndpoint.Port; $l.Stop()
+        $script:DashProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $DashPort, '-NoBrowser', '-Quiet', '-DataRoot', $DashData
+        $script:Dash = "http://localhost:$DashPort"
+        $deadline = (Get-Date).AddSeconds(40)
+        $script:DashPage = $null
+        while (-not $script:DashPage -and (Get-Date) -lt $deadline) {
+            try { $script:DashPage = (Invoke-WebRequest "$Dash/" -UseBasicParsing -TimeoutSec 3).Content } catch { Start-Sleep -Milliseconds 500 }
+        }
+        $script:StatusOf = {
+            param([string]$Method, [string]$Url, [hashtable]$Headers = @{}, [string]$Body)
+            $req = [Net.HttpWebRequest]::Create($Url); $req.Method = $Method; $req.Timeout = 10000
+            foreach ($k in $Headers.Keys) { if ($k -eq 'Content-Type') { $req.ContentType = $Headers[$k] } else { $req.Headers.Add($k, $Headers[$k]) } }
+            if ($Body) { $b = [Text.Encoding]::UTF8.GetBytes($Body); $req.ContentLength = $b.Length; $s = $req.GetRequestStream(); $s.Write($b, 0, $b.Length); $s.Dispose() }
+            try { $r = $req.GetResponse(); $c = [int]$r.StatusCode; $r.Close(); $c } catch [Net.WebException] { if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { throw } }
+        }
+    }
+    AfterAll {
+        if ($script:DashProc) { Stop-Process -Id $script:DashProc.Id -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'opens without a token and removes the token file of an earlier version' {
+        $DashPage | Should -Not -BeNullOrEmpty
+        $DashPage | Should -Not -Match 'pm-token'
+        Test-Path (Join-Path $DashData 'data\token.txt') | Should -BeFalse
+        & $StatusOf GET "$Dash/api/info" | Should -Be 200
+        & $StatusOf GET "$Dash/api/servers" | Should -Be 200
+    }
+
+    It 'serves API requests without any check' {
+        & $StatusOf POST "$Dash/api/servers" @{ 'Content-Type' = 'application/json'; 'Origin' = 'http://other.example' } '{"name":"T1","host":"192.0.2.10","role":"target"}' | Should -Be 200
+    }
+}
+
 Describe 'Manager module' {
     BeforeAll {
         $mgr = Join-Path $Work 'manager'

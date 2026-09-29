@@ -275,7 +275,7 @@ The manager keeps `<package>.zip.meta.json` next to each package (SHA-256 and ma
 ## Security
 
 - **Passwords are never written in plain text.** Credentials saved in the dashboard are encrypted with Windows DPAPI (`Export-Clixml`). Only the same Windows user on the same manager machine can decrypt them. `config\servers.json` holds no secrets.
-- **The dashboard listens on `localhost` by default** and does not ask for an access token.
+- **The dashboard listens on `localhost` by default and has no access protection**: no token, and no check of where a request comes from. Every program on the manager, and every web page that is open in a browser on the manager, can call the dashboard and start jobs with the saved server credentials. With `-ListenAll`, everyone who can reach the port can do the same. Run the dashboard only while you need it.
 - **Restrict WinRM** to the manager's IP (`-ManagerAddress`), and use **HTTPS (5986)** whenever servers are reached over the internet. When the migration is done, you can remove the firewall rule or disable WinRM again.
 - **The RDP agent** only runs while you keep its window open, and it only accepts the functions PRTG Mover needs.
 - **Backups contain sensitive data**: the PRTG configuration (including encrypted device credentials), the license and the SSL private key. Store and share them like a password vault export.
@@ -311,7 +311,7 @@ tests\                           Pester 5 tests
 docs\                            architecture, troubleshooting
 ```
 
-Runtime folders created automatically: `backups\`, `installers\`, `data\` (token, credentials, jobs, logs, agent files, staging) and `config\servers.json`.
+Runtime folders created automatically: `backups\`, `installers\`, `data\` (credentials, jobs, logs, agent files, staging) and `config\servers.json`.
 
 ## Development
 
