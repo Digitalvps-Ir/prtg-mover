@@ -52,7 +52,8 @@ Each server uses **one** connection method, chosen in *Servers → Edit → Conn
 | What you need on the server | Nothing: only Remote Desktop access | PowerShell remoting enabled (`tools\Enable-PrtgMoverRemoting.ps1`) |
 | Changes on the server | None | WinRM service and firewall rule |
 | How it runs | **RDP** opens Remote Desktop with the manager's drive redirected. In an elevated PowerShell you paste one command (it's copied for you), and the **agent** takes its jobs from the dashboard. | Fully automatic from the manager |
-| File transfer | Through the redirected drive (`\\tsclient\…`) | Through the WinRM session |
+| File transfer | Through the redirected drive (`\\tsclient\…`) | Over WinRM in compressed chunks, several streams in parallel, resumable |
+| Disk space needed on the source | None (staged on the manager) | None (pulled from the snapshot) |
 | Best for | Servers you must not reconfigure, and internet-facing servers without WinRM | Many servers, and unattended or scheduled backups |
 
 Both methods run exactly the same payload (`src\Remote\PrtgMover.Remote.ps1`) with the same checks and logs.
