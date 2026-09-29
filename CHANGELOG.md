@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8.0 — 2026-09-29
+
+### Added
+- **One file that installs everything**: `tools\Build-SetupAll.ps1 -VpnWatchSource <folder>` builds `Setup-All.cmd`. The file contains PRTG Mover and VPN Watch (program files only, no servers, no credentials) and installs or updates both with a double-click: PRTG Mover to `C:\PrtgMover`, VPN Watch to `C:\VpnWatchDashboard`, shortcuts, start with Windows, and a test of both dashboards. A running PRTG Mover is only stopped for an update when no job is running.
+- On a computer that has VPN connections of its own, and when the file is run as administrator, VPN Watch is set up in local mode and manages those connections directly.
+
 ## 1.7.1 — 2026-09-29
 
 ### Fixed

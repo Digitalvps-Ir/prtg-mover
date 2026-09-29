@@ -193,6 +193,8 @@ Administrator rights are not needed. The installer
 
 `install.ps1` on its own, without the other files, downloads the program from GitHub. The repository is private, so that only works on a computer where `git` or the GitHub CLI is signed in.
 
+**PRTG Mover and VPN Watch in one file:** `tools\Build-SetupAll.ps1 -VpnWatchSource <folder of VPN Watch>` builds `Setup-All.cmd`. Copy that single file to a Windows computer and double-click it: it installs or updates both programs (PRTG Mover in `C:\PrtgMover`, VPN Watch in `C:\VpnWatchDashboard`), creates the shortcuts, starts both with Windows and tests both dashboards. The file contains program files only; servers, users and passwords are entered in the dashboards. Options: `-SkipPrtgMover`, `-SkipVpnWatch`, `-PrtgMoverPath`, `-VpnWatchPath`, `-NoAutostart`. When the computer has VPN connections of its own, run the file with *Run as administrator* so that VPN Watch manages them directly.
+
 Without the installer: `powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1` (or a double-click on `Start-PrtgMover.cmd`) starts the dashboard right from the folder the files are in.
 
 ### 2. Choose the connection method

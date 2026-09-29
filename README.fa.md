@@ -88,6 +88,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 اگر فقط فایل `install.ps1` را داشته باشید، برنامه را خودش از GitHub دانلود می‌کند. ریپو خصوصی است، پس این کار فقط روی سیستمی جواب می‌دهد که `git` یا GitHub CLI در آن لاگین باشد.
 
+**PRTG Mover و VPN Watch در یک فایل:** دستور `tools\Build-SetupAll.ps1 -VpnWatchSource <پوشهٔ VPN Watch>` فایل `Setup-All.cmd` را می‌سازد. همین یک فایل را روی ویندوز کپی و دوبار کلیک کنید: هر دو برنامه را نصب یا به‌روز می‌کند (PRTG Mover در `C:\PrtgMover` و VPN Watch در `C:\VpnWatchDashboard`)، میانبرها را می‌سازد، هر دو را با ویندوز اجرا می‌کند و هر دو داشبورد را تست می‌کند. داخل فایل فقط برنامه است؛ سرورها، یوزرها و پسوردها را خودتان در داشبوردها وارد می‌کنید. اگر آن ویندوز خودش اتصال VPN دارد، فایل را با *Run as administrator* اجرا کنید تا VPN Watch همان اتصال‌ها را مستقیم مدیریت کند.
+
 بدون نصب‌کننده هم می‌شود: با `powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1` یا دوبار کلیک روی `Start-PrtgMover.cmd` داشبورد از همان پوشه اجرا می‌شود.
 
 ### ۲. انتخاب روش اتصال
