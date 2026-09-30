@@ -7,6 +7,9 @@ BeforeAll {
     Import-Module (Join-Path $Root 'src\PrtgManager.psm1') -Force -DisableNameChecking
     $script:Work = Join-Path ([IO.Path]::GetTempPath()) ("pm-tests-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $Work | Out-Null
+    # data (config, backups, jobs, logs, audit) of the tests lives in the test folder, never in the real manager folder
+    New-Item -ItemType Directory -Path (Join-Path $Work 'manager') | Out-Null
+    Set-PmRoot -Path (Join-Path $Work 'manager')
 }
 
 AfterAll {
@@ -146,13 +149,18 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
 Describe 'RDP agent transport (end to end, local)' {
     BeforeAll {
         $env:PRTGMOVER_TEST = '1'
-        $env:PRTGMOVER_TSCLIENT_ROOT = $Root   # the local "agent" reaches the manager folder directly, not via \\tsclient
-        Set-PmRoot -Path $Root   # the agent resolves the manager folder from its own location
+        # The agent resolves the manager folder from its own location. It runs from a copy of the program in the
+        # test folder, so the test never adds a server to, or writes packages / logs into, the real manager folder.
+        $script:AgentRoot = Join-Path $Work 'agent-manager'
+        New-Item -ItemType Directory -Force -Path $AgentRoot | Out-Null
+        foreach ($part in 'src', 'agent', 'VERSION') { Copy-Item -LiteralPath (Join-Path $Root $part) -Destination $AgentRoot -Recurse -Force }
+        $env:PRTGMOVER_TSCLIENT_ROOT = $AgentRoot   # the local "agent" reaches the manager folder directly, not via \\tsclient
+        Set-PmRoot -Path $AgentRoot
         $script:AgentSrv = Set-PmServer -Name 'PESTER-AGENT' -HostName '127.0.0.1' -Transport rdp
         $agentStart = @{
             FilePath = (Get-Process -Id $PID).Path
             PassThru = $true
-            ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'agent\PrtgManager-Agent.ps1'), '-ServerId', $script:AgentSrv.id, '-AllowNonAdmin')
+            ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $AgentRoot 'agent\PrtgManager-Agent.ps1'), '-ServerId', $script:AgentSrv.id, '-AllowNonAdmin')
         }
         # -WindowStyle is Windows PowerShell 5.1 only. PowerShell 7 rejects the parameter.
         if ($PSVersionTable.PSEdition -eq 'Desktop') { $agentStart.WindowStyle = 'Hidden' }
@@ -161,7 +169,7 @@ Describe 'RDP agent transport (end to end, local)' {
     AfterAll {
         if ($script:AgentProc) { Stop-Process -Id $AgentProc.Id -Force -ErrorAction SilentlyContinue }
         Remove-PmServer -Id $AgentSrv.id
-        Remove-Item -LiteralPath (Join-Path $Root "data\agent\$($AgentSrv.id)") -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $AgentRoot "data\agent\$($AgentSrv.id)") -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item Env:\PRTGMOVER_TEST, Env:\PRTGMOVER_TSCLIENT_ROOT -ErrorAction SilentlyContinue
     }
 
@@ -181,7 +189,7 @@ Describe 'RDP agent transport (end to end, local)' {
             $rep.Extra | Should -Be 'ok'
             Get-Content (Join-Path $src 'f.txt') | Should -Be 'via-agent'
             @($job.logs | Where-Object { $_.message -like '*direct staging on the manager*' }).Count | Should -BeGreaterThan 0
-            Test-Path -LiteralPath (Join-Path $Root "data\agent\$($AgentSrv.id)\agent.log") | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $AgentRoot "data\agent\$($AgentSrv.id)\agent.log") | Should -BeTrue
         } finally {
             Remove-PmBackup -Name (Split-Path $file -Leaf)
             Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -202,7 +210,7 @@ Describe 'RDP agent transport (end to end, local)' {
             Get-Content (Join-Path $src 'g.txt') | Should -Be 'from-zip'
         } finally {
             Remove-PmBackup -Name (Split-Path $bk.Zip -Leaf)
-            Remove-Item -LiteralPath (Join-Path $Root ("data\staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($bk.Zip))) -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $AgentRoot ("data\staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($bk.Zip))) -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }

@@ -7,7 +7,10 @@
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmtSize = (b) => { if (!b && b !== 0) return '–'; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; } return `${b.toFixed(i ? 1 : 0)} ${u[i]}`; };
-  const fmtDate = (s) => { if (!s) return '–'; const d = new Date(s); return isNaN(d) ? s : d.toLocaleString(); };
+  // dates and times always with the digits 0-9 and one fixed order (DigitalVPS UI rule), whatever the browser language
+  const p2 = (n) => String(n).padStart(2, '0');
+  const fmtTime = (d) => (isNaN(d) ? '' : `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`);
+  const fmtDate = (s) => { if (!s) return '–'; const d = new Date(s); return isNaN(d) ? s : `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`; };
   const ago = (s) => { if (!s) return ''; const m = Math.round((Date.now() - new Date(s)) / 60000); if (m < 1) return 'just now'; if (m < 60) return `${m} min ago`; const h = Math.round(m / 60); return h < 24 ? `${h} h ago` : `${Math.round(h / 24)} d ago`; };
   const arr = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -24,6 +27,57 @@
     setTimeout(() => el.remove(), isErr ? 9000 : 3500);
   }
   const fail = (err) => toast(err, true);
+
+  // Confirmation in a dialog of the page (not the browser's confirm box): the first line is the question,
+  // the rest explains the consequences. opts: ok (button text), danger (red button), type (text the user
+  // has to type first - for changes that replace data), title.
+  function ask(message, opts = {}) {
+    const d = $('#confirmDialog');
+    if (!d || typeof d.showModal !== 'function') return Promise.resolve(window.confirm(message));
+    const lines = String(message).split('\n');
+    $('#cfTitle').textContent = opts.title || lines[0];
+    $('#cfBody').textContent = (opts.title ? lines : lines.slice(1)).join('\n').trim();
+    const ok = $('#cfOk'); const box = $('#cfTypeBox'); const inp = $('#cfTypeInput');
+    ok.textContent = opts.ok || 'Confirm';
+    ok.className = `btn ${opts.danger ? 'destructive' : 'primary'}`;
+    box.hidden = !opts.type; inp.value = '';
+    if (opts.type) { $('#cfTypeWord').textContent = opts.type; ok.disabled = true; inp.oninput = () => { ok.disabled = inp.value.trim() !== opts.type; }; } else { ok.disabled = false; inp.oninput = null; }
+    return new Promise((resolve) => {
+      d.returnValue = '';
+      d.addEventListener('close', () => resolve(d.returnValue === 'ok' && (!opts.type || inp.value.trim() === opts.type)), { once: true });
+      d.showModal();
+      (opts.type ? inp : (opts.danger ? $('#cfCancel') : ok)).focus();
+    });
+  }
+
+  // ------------------------------------------------------------ DigitalVPS shell: theme, menu on small screens
+  function setTheme(t) {
+    const dark = t === 'dark' || (t !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    const b = $('#themeBtn'); b.innerHTML = `<svg><use href="#i-${dark ? 'sun' : 'moon'}"/></svg>`;
+    b.title = dark ? 'Light mode' : 'Dark mode'; b.setAttribute('aria-label', b.title);
+  }
+  let savedTheme = ''; try { savedTheme = localStorage.getItem('dv-theme') || ''; } catch (e) { /* no storage */ }
+  setTheme(savedTheme);
+  $('#themeBtn').addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    try { localStorage.setItem('dv-theme', next); } catch (e) { /* no storage */ }
+    setTheme(next);
+  });
+  const small = window.matchMedia('(max-width: 900px)');
+  const setNav = (open) => { $('#app').classList.toggle('nav-open', open); $('#navOpen').setAttribute('aria-expanded', String(open)); if (open) $('#sidebar nav a.active')?.focus(); };
+  const setFold = (folded) => { $('#app').classList.toggle('nav-folded', folded); $$('#sidebar nav a').forEach((a) => { a.title = folded ? a.textContent.trim() : ''; }); };
+  try { setFold(localStorage.getItem('dv-nav') === 'folded'); } catch (e) { /* no storage */ }
+  // one button: a drawer on small screens, fold / unfold the menu on large ones
+  $('#navOpen').addEventListener('click', () => {
+    if (small.matches) { setNav(true); return; }
+    const folded = !$('#app').classList.contains('nav-folded'); setFold(folded);
+    try { localStorage.setItem('dv-nav', folded ? 'folded' : 'open'); } catch (e) { /* no storage */ }
+  });
+  $('#navClose').addEventListener('click', () => setNav(false));
+  $('#navScrim').addEventListener('click', () => setNav(false));
+  $$('#sidebar nav a').forEach((a) => a.addEventListener('click', () => setNav(false)));
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && $('#app').classList.contains('nav-open')) setNav(false); });
 
   async function api(method, path, body) {
     const opts = { method, headers: {} };
@@ -64,7 +118,7 @@
   // ------------------------------------------------------------ navigation
   function show(view) {
     $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${view}`));
-    $$('nav a').forEach((a) => a.classList.toggle('active', a.dataset.view === view));
+    $$('nav a').forEach((a) => { a.classList.toggle('active', a.dataset.view === view); if (a.dataset.view === view) { a.setAttribute('aria-current', 'page'); $('#crumbTitle').textContent = a.textContent.trim().replace(/\s*\d+$/, ''); document.title = `${$('#crumbTitle').textContent} · PRTG Manager`; } else a.removeAttribute('aria-current'); });
     if (view === 'jobs') loadJobs().catch(fail);
     if (view === 'logs') loadLogs();
     if (view === 'backups') loadBackups().catch(fail);
@@ -79,7 +133,7 @@
       $('#auditTable tbody').innerHTML = rows.length ? rows.map((a) => {
         const d = a.data || {};
         const details = Object.keys(d).filter((k) => d[k] !== null && d[k] !== '').map((k) => `${esc(k)}=<b>${esc(Array.isArray(d[k]) ? d[k].join(',') : (typeof d[k] === 'object' ? JSON.stringify(d[k]) : d[k]))}</b>`).join(' · ');
-        return `<tr><td class="num">${esc(fmtDate(a.time))}</td><td><span class="badge info">${esc(a.action)}</span></td><td>${details}</td><td>${esc(a.user)}</td></tr>`;
+        return `<tr><td class="num">${esc(fmtDate(a.time))}</td><td><span class="badge info">${esc(a.action)}</span></td><td class="wrap">${details}</td><td class="nowrap">${esc(a.user)}</td></tr>`;
       }).join('') : '<tr><td colspan="4" class="empty">No audit entries yet.</td></tr>';
       const box = $('#managerLog');
       box.innerHTML = arr(mlog.lines).map((l) => {
@@ -94,7 +148,7 @@
 
   // ------------------------------------------------------------ servers in the sidebar
   function renderSideAgents() {
-    $('#sideAgents').innerHTML = state.servers.length ? '<b style="color:var(--muted)">Servers</b>' + state.servers.map((s) => {
+    $('#sideAgents').innerHTML = state.servers.length ? '<b style="color:var(--nav-dim);font-weight:600">Servers</b>' + state.servers.map((s) => {
       const on = s.agent && s.agent.connected;
       const tag = s.transport === 'local' ? '<span class="badge ok">this computer</span>'
         : s.transport === 'winrm' ? '<span class="badge info">WinRM</span>'
@@ -121,18 +175,33 @@
     const i = await api('GET', '/api/info');
     state.info = i;
     $('#version').textContent = `v${i.version}`;
-    $('#managerInfo').innerHTML = `Manager: <b>${esc(i.manager)}</b><br>${esc(i.user)}`;
+    const initials = (s, d) => String(s || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 2).toUpperCase() || d;
+    const user = String(i.user || '').split('\\').pop();
+    $('#managerInfo').innerHTML = `<span class="avatar" aria-hidden="true">${esc(initials(i.manager, 'PM'))}</span><div><b>${esc(i.manager)}</b><span class="role">Manager computer</span><br>${esc(i.user)}</div>`;
+    $('#identityName').textContent = user || 'Manager';
+    $('#identityUser').textContent = i.elevated === false ? 'not running as administrator' : `administrator on ${i.manager}`;
+    $('#identityAvatar').textContent = initials(user, 'PM');
     $('#backupsPath').textContent = `Packages stored on the manager in ${i.backupsPath}`;
   }
 
   function renderOverview() {
     $('#statServers').textContent = state.servers.length;
+    const src = state.servers.filter((s) => s.role === 'source').length; const tgt = state.servers.filter((s) => s.role === 'target').length;
+    const both = state.servers.length - src - tgt;
+    $('#statServersNote').textContent = state.servers.length ? [src && `${src} source`, tgt && `${tgt} target`, both && `${both} source & target`].filter(Boolean).join(' · ') : 'none added yet';
     $('#statBackups').textContent = state.backups.length;
-    const running = state.jobs.filter((j) => j.status === 'running' || j.status === 'queued').length;
+    const total = state.backups.reduce((n, b) => n + (Number(b.size) || 0), 0);
+    $('#statBackupsNote').textContent = state.backups.length ? `${fmtSize(total)} in total` : 'no packages yet';
+    const runningJobs = state.jobs.filter((j) => j.status === 'running' || j.status === 'queued');
+    const running = runningJobs.length;
     $('#statRunning').textContent = running;
+    $('#statRunningNote').textContent = running ? (runningJobs[0].summary || runningJobs[0].type) : 'nothing is running';
     const pill = $('#runningPill'); pill.hidden = !running; pill.textContent = running;
     const last = state.jobs[0];
-    $('#statLast').innerHTML = last ? statusBadge(last.status) : '–';
+    $('#statLast').innerHTML = last ? statusBadge(last.status) : '';
+    $('#statLastWhen').textContent = last ? (ago(last.created) || fmtDate(last.created)) : '–';
+    $('#statLastNote').textContent = last ? (last.summary || last.type) : 'no jobs yet';
+    $('#statLastTone').className = `tone ${last ? ({ succeeded: 'green', failed: 'red', running: 'blue', queued: 'blue', cancelled: 'amber', interrupted: 'amber' }[last.status] || '') : ''}`;
     const recent = state.jobs.slice(0, 6);
     $('#recentJobs').innerHTML = recent.length ? recent.map((j) => `
       <div class="item" data-job="${esc(j.id)}"><div style="min-width:0"><div class="t">${esc(j.summary || j.type)}</div>
@@ -244,7 +313,7 @@
     if (b.dataset.act === 'test-rdp') startJob({ type: 'test', mode: 'rdp', serverIds: [s.id] }, b);
     if (b.dataset.act === 'test-winrm') startJob({ type: 'test', mode: 'winrm', serverIds: [s.id] }, b);
     if (b.dataset.act === 'license') { state.license.serverId = s.id; location.hash = 'license'; }
-    if (b.dataset.act === 'rebind' && confirm(`Bind the PRTG web server on "${s.name}" to this server's address (${s.host}) and restart PRTG there?`)) startJob({ type: 'rebind', serverIds: [s.id] }, b);
+    if (b.dataset.act === 'rebind' && await ask(`Bind the PRTG web server on "${s.name}" to this server's address (${s.host}) and restart PRTG there?\n\nPRTG is unavailable for about a minute while it restarts.`, { ok: 'Bind and restart PRTG' })) startJob({ type: 'rebind', serverIds: [s.id] }, b);
     if (b.dataset.act === 'rdp') {
       await busy(b, async () => {
         try {
@@ -258,7 +327,7 @@
       });
     }
     if (b.dataset.act === 'edit') openServerDialog(s);
-    if (b.dataset.act === 'del' && confirm(`Delete server "${s.name}" and its saved credential?\n\nBackups of this server stay on the manager.`)) {
+    if (b.dataset.act === 'del' && await ask(`Delete server "${s.name}" and its saved credential?\n\nOnly the entry in PRTG Manager is removed - nothing changes on the server itself. Backups of this server stay on the manager.`, { ok: 'Delete server', danger: true })) {
       await busy(b, async () => { try { await api('DELETE', `/api/servers/${encodeURIComponent(s.id)}`); toast('Server deleted'); await loadServers(); } catch (err) { fail(err); } });
     }
   });
@@ -430,7 +499,7 @@
     return { ok: true, secrets: { password: pw } };
   }
 
-  $('#migrateForm').addEventListener('submit', (e) => {
+  $('#migrateForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = e.target;
     const t = backupType();
@@ -441,12 +510,12 @@
     const clearPw = () => { f.BackupPassword.value = ''; f.BackupPassword2.value = ''; };
     if (t === 'graphs') {
       const days = Number(f.HistoryDays.value) || 0;
-      if (!confirm(`Back up the history of ${src}${days ? ` (last ${days} days)` : ''}?\n\nPRTG keeps running - the files are copied from a VSS snapshot.`)) return;
+      if (!(await ask(`Back up the history of ${src}${days ? ` (last ${days} days)` : ''}?\n\nPRTG keeps running - the files are copied from a VSS snapshot.`, { ok: 'Start backup' }))) return;
       startJob({ type: 'backup', sourceId: f.sourceId.value, options: { Scope: 'graphs', HistoryDays: days, NoTouch: true, IncludePrtg: true, IncludeDesktop: false, SourceAfter: 'Restart' }, secrets: sec.secrets }, $('#runMigrate')).then(clearPw);
       return;
     }
     if (t !== 'full') {
-      if (!confirm(`Back up the ${TYPE_LABEL[t].toLowerCase()} of ${src}?\n\nNothing is stopped or written on the server.`)) return;
+      if (!(await ask(`Back up the ${TYPE_LABEL[t].toLowerCase()} of ${src}?\n\nNothing is stopped or written on the server.`, { ok: 'Start backup' }))) return;
       startJob({ type: 'section-backup', sourceId: f.sourceId.value, sectionType: t, secrets: sec.secrets }, $('#runMigrate')).then(clearPw);
       return;
     }
@@ -469,18 +538,27 @@
       const path = options.transfer === 'wireguard' ? 'Files go over WinRM from the source to the target tunnel address on 10.66.66.0/24.'
         : options.transfer === 'ipip' ? 'Files go over WinRM from the source to the target tunnel address on 10.66.67.0/24.'
         : options.transfer === 'rdp' ? 'Files are copied through this computer over RDP.' : options.transfer === 'winrm' ? 'Files are copied through this computer over WinRM.' : 'Files are copied with each server\'s saved method.';
-      if (!confirm(`Migrate ${src} → ${names}?\n\n${path}\n${srcLine}\n${lic}\nThe PRTG data on each target is replaced (a rollback copy is kept on the target${options.AutoRollback ? ' and put back automatically if PRTG does not come up' : ''}).\n\nPre-flight checks run first — nothing is changed if they fail.`)) return;
+      const typeWord = targets.length === 1 ? names : 'MIGRATE';
+      if (!(await ask(`Migrate ${src} → ${names}?\n\n${path}\n${srcLine}\n${lic}\nThe PRTG data on each target is replaced (a rollback copy is kept on the target${options.AutoRollback ? ' and put back automatically if PRTG does not come up' : ''}).\n\nPre-flight checks run first — nothing is changed if they fail.`, { ok: 'Migrate and replace', danger: true, type: typeWord }))) return;
       startJob({ type: 'migrate', sourceId: f.sourceId.value, targetIds: targets, options, secrets: sec.secrets }, $('#runMigrate')).then(clearPw);
     } else {
       if (options.transfer === 'wireguard' || options.transfer === 'ipip') return fail(new Error('A tunnel needs a target server. It copies between the two Windows servers and does not store the backup here. Pick a target, or use RDP / WinRM.'));
       options.SourceAfter = 'Restart';
-      if (!confirm(`Back up ${src}?\n\n${srcText || 'PRTG is stopped briefly for a consistent copy, then restarted and verified fully up.'}`)) return;
+      if (!(await ask(`Back up ${src}?\n\n${srcText || 'PRTG is stopped briefly for a consistent copy, then restarted and verified fully up.'}`, { ok: 'Start backup' }))) return;
       startJob({ type: 'backup', sourceId: f.sourceId.value, options, secrets: sec.secrets }, $('#runMigrate')).then(clearPw);
     }
   });
-  $('#migrateForm').NoTouch.addEventListener('change', (e) => {
-    if (!e.target.checked && !confirm('Allow PRTG Manager to STOP PRTG on the source server during the backup?')) e.target.checked = true;
-    $('#sourceAfterBox').classList.toggle('disabled', e.target.checked);
+  $('#migrateForm').NoTouch.addEventListener('change', async (e) => {
+    const cb = e.target;
+    if (!cb.checked) {
+      // stays ticked until the user agrees in the dialog
+      cb.checked = true;
+      if (await ask('Allow PRTG Manager to STOP PRTG on the source server during the backup?\n\nPRTG on the source is down while the files are copied. With the tick kept, PRTG keeps running and a VSS snapshot is copied instead.', { ok: 'Allow stopping PRTG', danger: true })) {
+        cb.checked = false;
+        cb.form.dispatchEvent(new Event('change'));   // the summary follows
+      }
+    }
+    $('#sourceAfterBox').classList.toggle('disabled', cb.checked);
   });
 
   $('#installerUpload').addEventListener('change', (e) => {
@@ -520,23 +598,22 @@
     $('#backupsTable tbody').innerHTML = list.length ? list.map((b) => {
       const dl = `/api/backups/${encodeURIComponent(b.name)}/download`;
       const valid = b.valid === true ? `<span class="badge ok" title="checked ${esc(fmtDate(b.validated))}">valid</span>` : b.valid === false ? `<span class="badge err" title="${esc(arr(b.validationErrors).join(' | '))}">invalid</span>` : '<span class="badge" title="not checked yet - press Validate">not checked</span>';
-      const enc = b.encrypted ? '<span class="badge info">package</span>' : b.secretsEncrypted ? '<span class="badge info" title="The license key inside is encrypted">license key</span>' : '<span class="badge">no</span>';
+      const enc = b.encrypted ? '<span class="badge info" title="The whole package is encrypted with its backup password">encrypted</span>' : b.secretsEncrypted ? '<span class="badge info" title="The license key inside is encrypted">key encrypted</span>' : '<span class="badge">not encrypted</span>';
       const ver = `${b.formatVersion ? `format ${esc(b.formatVersion)}` : 'format ?'}${b.prtgVersion ? `<span class="sub-text">PRTG ${esc(b.prtgVersion)}</span>` : ''}${b.appVersion ? `<span class="sub-text">made by ${esc(b.appVersion)}</span>` : ''}`;
       return `<tr>
-        <td><b>${esc(b.name)}</b>${contentBadges(b)}${b.sha256 ? `<span class="sub-text" title="SHA-256 of the file">${esc(b.sha256.slice(0, 16))}…</span>` : ''}</td>
-        <td><span class="badge info">${esc(TYPE_LABEL[b.type] || b.type)}</span></td>
-        <td>${esc(b.source || '–')}</td>
-        <td class="num">${esc(fmtDate(b.created))}</td>
-        <td class="num">${fmtSize(b.size)}</td>
-        <td>${ver}</td><td>${enc}</td><td>${valid}</td>
-        <td><div class="btn-group">
+        <td class="name"><span class="badge info">${esc(TYPE_LABEL[b.type] || b.type)}</span> <b>${esc(b.name)}</b>${contentBadges(b)}${b.sha256 ? `<span class="sub-text" title="SHA-256 of the file">${esc(b.sha256.slice(0, 16))}…</span>` : ''}</td>
+        <td class="nowrap">${esc(b.source || '–')}</td>
+        <td class="num">${esc(fmtDate(b.created))}<span class="sub-text">${fmtSize(b.size)}</span></td>
+        <td class="nowrap">${ver}</td>
+        <td><div class="stack"><span title="Encryption">${enc}</span><span title="Validation">${valid}</span></div></td>
+        <td class="row-actions"><div class="btn-group">
           <a class="btn small" href="${dl}" download>Download</a>
           <button class="btn small" data-act="validate" data-name="${esc(b.name)}">Validate</button>
           <button class="btn small" data-act="inspect" data-name="${esc(b.name)}">Inspect</button>
           ${['full', 'graphs', 'devices', 'notifications', 'triggers', 'license', 'files'].includes(b.type) ? `<button class="btn small primary" data-act="restore" data-name="${esc(b.name)}">Restore…</button>` : ''}
           <button class="btn small danger" data-act="del" data-name="${esc(b.name)}">Delete</button>
         </div></td></tr>`;
-    }).join('') : `<tr><td colspan="9" class="empty">${filter ? 'No backups of this type.' : 'No backups yet. Run a backup or migration, or upload a package.'}</td></tr>`;
+    }).join('') : `<tr><td colspan="6" class="empty">${filter ? 'No backups of this type.' : 'No backups yet. Run a backup or migration, or upload a package.'}</td></tr>`;
   }
 
   $('#backupsTable').addEventListener('click', async (e) => {
@@ -544,7 +621,7 @@
     const name = b.dataset.name; const bk = state.backups.find((x) => x.name === name);
     if (!bk) return fail(new Error('This backup is no longer there - press Refresh.'));
     if (b.dataset.act === 'del') {
-      if (!confirm(`Delete backup ${name}?\n\nIt is moved to the Recycle Bin of this computer (you can restore it from there).`)) return;
+      if (!(await ask(`Delete backup ${name}?\n\nIt is moved to the Recycle Bin of this computer (you can restore it from there).`, { ok: 'Move to Recycle Bin', danger: true }))) return;
       await busy(b, async () => { try { await api('DELETE', `/api/backups/${encodeURIComponent(name)}`); toast('Backup moved to the Recycle Bin'); await loadBackups(); } catch (err) { fail(err); } });
     }
     if (b.dataset.act === 'restore') openRestore(bk);
@@ -683,21 +760,24 @@
       if (j.status !== 'succeeded') { resetPreview(`Preview failed: ${esc(j.error || 'see the Jobs page')}`); $('#previewState').textContent = '(failed)'; return; }
       state.preview = arr(j.result);
       box.innerHTML = state.preview.map((r) => `<h4>${esc(r.target)}</h4>${renderPlan(r.preview || {})}`).join('');
-      $('#previewState').textContent = `(${new Date().toLocaleTimeString()})`;
+      $('#previewState').textContent = `(${fmtTime(new Date())})`;
       updateRestoreGo();
     } catch (err) { resetPreview(); fail(err); }
   }));
 
-  $('#restoreGo').addEventListener('click', (e) => {
+  $('#restoreGo').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const f = $('#restoreForm');
     const targets = $$('#restoreTargets input:checked').map((i) => i.value);
     const names = targets.map((id) => (state.servers.find((s) => s.id === id) || {}).name).join(', ');
     const g = restoreGroup(restoreTarget.type);
     const what = g === 'full' ? 'The PRTG data on the target is REPLACED' : g === 'license' ? 'The license of the target is REPLACED' : 'PRTG is stopped for a moment and the configuration is changed as shown in the preview';
-    if (!confirm(`Restore ${restoreTarget.name} → ${names}?\n\n${what}. A rollback copy is taken first.`)) return;
+    // replacing a whole PRTG or a license: the target's name is typed (one target) or the word RESTORE (several)
+    const replaces = g === 'full' || g === 'license';
+    if (!(await ask(`Restore ${restoreTarget.name} → ${names}?\n\n${what}. A rollback copy is taken first.`, { ok: 'Restore', danger: replaces, type: replaces ? (targets.length === 1 ? names : 'RESTORE') : '' }))) return;
     const pw = f.Password.value; f.Password.value = '';
     $('#restoreDialog').close();
-    startJob({ type: 'restore', backupName: restoreTarget.name, targetIds: targets, options: restoreOptions(), secrets: pw ? { password: pw } : undefined }, e.currentTarget);
+    startJob({ type: 'restore', backupName: restoreTarget.name, targetIds: targets, options: restoreOptions(), secrets: pw ? { password: pw } : undefined }, btn);
   });
 
   function upload(url, file, onProgress) {
@@ -782,14 +862,14 @@
   }
   $('#licTrial').addEventListener('click', () => openLicenseDialog('trial'));
   $('#licActivate').addEventListener('click', () => openLicenseDialog('commercial'));
-  $('#licenseDialog').addEventListener('close', () => {
+  $('#licenseDialog').addEventListener('close', async () => {
     if ($('#licenseDialog').returnValue !== 'go') return;
     const f = $('#licenseForm');
     const name = f.licenseName.value.trim(); const key = f.licenseKey.value.replace(/\s+/g, '');
     f.licenseKey.value = '';
     if (!name || !key) return fail(new Error('Enter the license name and the license key.'));
     const id = $('#licServer').value; const s = state.servers.find((x) => x.id === id);
-    if (!confirm(`Enter this ${licKind === 'trial' ? 'trial ' : ''}license on ${s.name}?\n\nPRTG is restarted there (about a minute). A copy of the current license is kept on the server.`)) return;
+    if (!(await ask(`Enter this ${licKind === 'trial' ? 'trial ' : ''}license on ${s.name}?\n\nPRTG is restarted there (about a minute). A copy of the current license is kept on the server. PRTG activates the key itself with Paessler.`, { ok: 'Enter license' }))) return;
     startJob({ type: 'license', action: 'install', serverIds: [id], options: { Kind: licKind, Force: f.force.checked }, secrets: { licenseName: name, licenseKey: key } });
   });
   $('#licBackup').addEventListener('click', () => {
@@ -811,7 +891,10 @@
   });
   $('#licRemove').addEventListener('click', () => {
     const s = state.servers.find((x) => x.id === $('#licServer').value); if (!s) return;
-    $('#licRemoveForm').reset(); $('#licRemoveWhich').textContent = `${s.name} (${s.host})`; $('#licRemoveDialog').showModal();
+    $('#licRemoveForm').reset(); $('#licRemoveWhich').textContent = `${s.name} (${s.host})`;
+    const inp = $('#licRemoveForm').confirmName; $('#licRemoveGo').disabled = true;
+    inp.oninput = () => { $('#licRemoveGo').disabled = inp.value.trim() !== s.name; };
+    $('#licRemoveDialog').showModal(); inp.focus();
   });
   $('#licRemoveDialog').addEventListener('close', () => {
     if ($('#licRemoveDialog').returnValue !== 'go') return;
@@ -893,10 +976,10 @@
       + (j.resumable ? `<button class="btn small primary" id="resumeJob" title="${esc(resumeTitle)}">${cp.backup ? 'Resume' : 'Retry'}</button>` : '')
       + `<a class="btn small" href="/api/jobs/${encodeURIComponent(j.id)}/log">Download log</a>`;
     const cb = $('#cancelJob');
-    if (cb) cb.onclick = async () => { if (confirm('Cancel this job?')) { try { await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/cancel`); pollJob(); } catch (err) { fail(err); } } };
+    if (cb) cb.onclick = async () => { if (await ask('Cancel this job?\n\nThe running step is stopped. A backup, restore or migration that was cut off can be resumed later from this page.', { ok: 'Cancel job', danger: true })) { try { await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/cancel`); pollJob(); } catch (err) { fail(err); } } };
     const rb = $('#resumeJob');
     if (rb) rb.onclick = async () => {
-      if (!confirm(`${resumeTitle}\n\nStart now?`)) return;
+      if (!(await ask(`${cp.backup ? 'Resume' : 'Retry'} this job?\n\n${resumeTitle}`, { ok: cp.backup ? 'Resume' : 'Retry' }))) return;
       try { const r = await api('POST', `/api/jobs/${encodeURIComponent(j.id)}/resume`); toast('Resumed'); await loadJobs(); selectJob(r.id); } catch (err) { fail(err); }
     };
     renderResult(j);
@@ -926,7 +1009,7 @@
       const line = document.createElement('div');
       line.className = l.level;
       const t = new Date(l.time);
-      line.innerHTML = `<span class="ts">${esc(isNaN(t) ? '' : t.toLocaleTimeString())}</span> [${esc(l.computer)}] ${esc(l.message)}`;
+      line.innerHTML = `<span class="ts">${esc(fmtTime(t))}</span> [${esc(l.computer)}] ${esc(l.message)}`;
       frag.appendChild(line);
     });
     log.appendChild(frag);

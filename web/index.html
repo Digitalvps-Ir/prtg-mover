@@ -3,43 +3,74 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-
+  <meta name="color-scheme" content="light dark">
   <title>PRTG Manager</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="Vazirmatn.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="dv-theme.css">
   <link rel="stylesheet" href="style.css">
+  <script>try { const t = localStorage.getItem('dv-theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) { /* no storage */ }</script>
 </head>
 <body>
-<div class="app">
-  <aside class="sidebar">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-overview" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="1.6"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="1.6"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="1.6"/></symbol>
+    <symbol id="i-servers" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01M11 7.5h6M11 16.5h6"/></symbol>
+    <symbol id="i-migrate" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h13M14 4.5 17.5 8 14 11.5M20 16H7M10 12.5 6.5 16l3.5 3.5"/></symbol>
+    <symbol id="i-backups" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1.4"/><path d="M5 9v9.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V9M10 13h4"/></symbol>
+    <symbol id="i-license" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 8.7-8.7M16 7l3 3M13.5 9.5l2 2"/></symbol>
+    <symbol id="i-jobs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3 7 4-14 3 7h4"/></symbol>
+    <symbol id="i-logs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h9l4 4v14H6zM15 3v4h4M9 12h7M9 16h7M9 8h3"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+  </defs>
+</svg>
+<a class="skip-link" href="#main">Skip to content</a>
+<div class="app" id="app">
+  <aside class="sidebar" id="sidebar" aria-label="Main menu">
     <div class="brand">
-      <img src="favicon.svg" alt="" width="28" height="28">
-      <div><strong>PRTG Manager</strong><span id="version">…</span></div>
+      <span class="brand-mark" aria-hidden="true">DV</span>
+      <div><strong>PRTG Manager</strong><small>DigitalVPS · <span id="version">…</span></small></div>
+      <button class="sidebar-close" id="navClose" type="button" aria-label="Close the menu"><svg width="18" height="18"><use href="#i-close"/></svg></button>
     </div>
-    <nav>
-      <a href="#overview" data-view="overview" class="active">Overview</a>
-      <a href="#servers" data-view="servers">Servers</a>
-      <a href="#migrate" data-view="migrate">Backup &amp; Migrate</a>
-      <a href="#backups" data-view="backups">Backups</a>
-      <a href="#license" data-view="license">License</a>
-      <a href="#jobs" data-view="jobs">Jobs <span class="pill" id="runningPill" hidden>0</span></a>
-      <a href="#logs" data-view="logs">Logs &amp; Audit</a>
+    <p class="side-label">Manage</p>
+    <nav aria-label="Pages">
+      <a href="#overview" data-view="overview" class="active"><svg><use href="#i-overview"/></svg><span class="grow">Overview</span></a>
+      <a href="#servers" data-view="servers"><svg><use href="#i-servers"/></svg><span class="grow">Servers</span></a>
+      <a href="#migrate" data-view="migrate"><svg><use href="#i-migrate"/></svg><span class="grow">Backup &amp; Migrate</span></a>
+      <a href="#backups" data-view="backups"><svg><use href="#i-backups"/></svg><span class="grow">Backups</span></a>
+      <a href="#license" data-view="license"><svg><use href="#i-license"/></svg><span class="grow">License</span></a>
+      <a href="#jobs" data-view="jobs"><svg><use href="#i-jobs"/></svg><span class="grow">Jobs</span><span class="pill" id="runningPill" hidden>0</span></a>
+      <a href="#logs" data-view="logs"><svg><use href="#i-logs"/></svg><span class="grow">Logs &amp; Audit</span></a>
     </nav>
     <div class="side-agents" id="sideAgents"></div>
     <div class="sidebar-foot" id="managerInfo"></div>
   </aside>
+  <div class="scrim" id="navScrim"></div>
 
-  <main>
+  <div class="workspace">
+  <header class="topbar">
+    <button class="icon-btn menu-btn" id="navOpen" type="button" aria-label="Menu" title="Menu" aria-controls="sidebar" aria-expanded="false"><svg><use href="#i-menu"/></svg></button>
+    <div class="crumb"><span>DigitalVPS · PRTG Manager</span><strong id="crumbTitle">Overview</strong></div>
+    <button class="icon-btn" id="themeBtn" type="button" aria-label="Dark mode" title="Dark mode"><svg><use href="#i-moon"/></svg></button>
+    <div class="identity" id="identity"><span class="avatar" id="identityAvatar">PM</span><div><strong id="identityName">Manager</strong><span id="identityUser"></span></div></div>
+  </header>
+
+  <main id="main" tabindex="-1">
     <!-- ======================= OVERVIEW -->
     <section id="view-overview" class="view active">
       <header class="page-head">
         <div><h1>Overview</h1><p class="muted">Back up, restore and migrate PRTG servers: the whole PRTG, its history, devices, notifications, triggers and license.</p></div>
         <div class="actions"><button class="btn primary" data-goto="migrate">New backup or migration</button></div>
       </header>
-      <div class="stats">
-        <div class="stat"><span>Servers</span><strong id="statServers">–</strong></div>
-        <div class="stat"><span>Backups on manager</span><strong id="statBackups">–</strong></div>
-        <div class="stat"><span>Running jobs</span><strong id="statRunning">–</strong></div>
-        <div class="stat"><span>Last job</span><strong id="statLast">–</strong></div>
+      <div class="kpis">
+        <div class="kpi"><div class="kpi-top"><span class="tone green"><svg><use href="#i-servers"/></svg></span><span id="statServersTag"></span></div><span class="kpi-label">Servers</span><strong class="kpi-value" id="statServers">–</strong><span class="kpi-note" id="statServersNote">&nbsp;</span></div>
+        <div class="kpi"><div class="kpi-top"><span class="tone blue"><svg><use href="#i-backups"/></svg></span></div><span class="kpi-label">Backups on manager</span><strong class="kpi-value" id="statBackups">–</strong><span class="kpi-note" id="statBackupsNote">&nbsp;</span></div>
+        <div class="kpi"><div class="kpi-top"><span class="tone amber"><svg><use href="#i-jobs"/></svg></span></div><span class="kpi-label">Running jobs</span><strong class="kpi-value" id="statRunning">–</strong><span class="kpi-note" id="statRunningNote">&nbsp;</span></div>
+        <div class="kpi"><div class="kpi-top"><span class="tone" id="statLastTone"><svg><use href="#i-clock"/></svg></span><span id="statLast"></span></div><span class="kpi-label">Last job</span><strong class="kpi-value" id="statLastWhen" style="font-size:1.15rem">–</strong><span class="kpi-note" id="statLastNote">&nbsp;</span></div>
       </div>
       <div class="grid2">
         <div class="card">
@@ -188,7 +219,7 @@
       </header>
       <div class="upload-progress" id="uploadProgress" hidden><div class="bar"><i></i></div><span></span></div>
       <div class="card flush"><div class="table-wrap"><table class="table backups" id="backupsTable">
-        <thead><tr><th>Backup</th><th>Type</th><th>Source</th><th>Created</th><th>Size</th><th>Version</th><th>Encrypted</th><th>Valid</th><th></th></tr></thead>
+        <thead><tr><th>Backup</th><th>Source</th><th>Created · size</th><th>Version</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody></tbody>
       </table></div></div>
       <p class="hint">Delete moves a package to the Recycle Bin of this computer. Restore always shows a preview of what changes on the target first.</p>
@@ -262,6 +293,7 @@
       </div>
     </section>
   </main>
+  </div>
 </div>
 
 <!-- ======================= DIALOGS -->
@@ -403,10 +435,10 @@
     <h2>Remove the PRTG license</h2>
     <p class="muted" id="licRemoveWhich"></p>
     <p>License name and key (and PRTG's activation data of this key) are removed from the PRTG on this server. PRTG is restarted and runs without a license until a new one is entered. Configuration and history stay. A copy of the removed license data is kept on the server. Paessler has no remote deactivation: to use the key on another system, move the activation in the Paessler shop.</p>
-    <label class="field"><span>Type the server name to confirm</span><input name="confirmName" autocomplete="off"></label>
+    <label class="field type-to-confirm"><span>Type the server name to confirm</span><input name="confirmName" autocomplete="off" spellcheck="false"></label>
     <div class="form-actions">
       <button value="cancel" class="btn" formnovalidate>Cancel</button>
-      <button value="go" class="btn danger">Remove license</button>
+      <button value="go" class="btn destructive" id="licRemoveGo" disabled>Remove license</button>
     </div>
   </form>
 </dialog>
@@ -428,7 +460,17 @@
   </form>
 </dialog>
 
-<div id="toasts"></div>
+<!-- ======================= confirmation (replaces the browser's confirm box) -->
+<dialog id="confirmDialog" class="confirm-dialog" aria-labelledby="cfTitle">
+  <form method="dialog">
+    <h2 id="cfTitle">Please confirm</h2>
+    <div class="confirm-body" id="cfBody"></div>
+    <label class="field type-to-confirm" id="cfTypeBox" hidden><span>Type <b id="cfTypeWord"></b> to confirm</span><input id="cfTypeInput" autocomplete="off" spellcheck="false" autocapitalize="off"></label>
+    <div class="form-actions"><button value="cancel" class="btn" id="cfCancel">Cancel</button><button value="ok" class="btn primary" id="cfOk">Confirm</button></div>
+  </form>
+</dialog>
+
+<div id="toasts" role="status" aria-live="polite"></div>
 <script src="app.js"></script>
 </body>
 </html>

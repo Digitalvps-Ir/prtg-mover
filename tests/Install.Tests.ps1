@@ -367,6 +367,22 @@ Describe 'Upgrade path and command line (review findings)' {
         $cli | Should -Match 'finally \{ Remove-PmPlainPackage \$plain \}'
         [IO.File]::ReadAllText((Join-Path $Root 'src\PrtgManager.psm1')) | Should -Match 'finally \{ Remove-PmPlainPackage \$plain \}'
     }
+    It 'the dashboard follows the DigitalVPS UI: shared theme, local font, own confirmation dialog, fixed date digits' {
+        $web = Join-Path $Root 'web'
+        foreach ($f in 'dv-theme.css', 'style.css', 'Vazirmatn.woff2', 'Vazirmatn-OFL.txt') { Test-Path -LiteralPath (Join-Path $web $f) | Should -BeTrue -Because "$f is part of the UI" }
+        $html = [IO.File]::ReadAllText((Join-Path $web 'index.html'))
+        $html | Should -Match 'href="dv-theme\.css"'
+        $html | Should -Match 'id="confirmDialog"'
+        $js = [IO.File]::ReadAllText((Join-Path $web 'app.js'))
+        # every confirmation goes through the page's dialog (the browser box only as a fallback inside ask())
+        ([regex]::Matches($js, '(?<![\w.])confirm\(')).Count | Should -Be 0
+        $js | Should -Not -Match 'toLocale(Date|Time)?String\('
+        [IO.File]::ReadAllText((Join-Path $web 'Vazirmatn-OFL.txt')) | Should -Match 'SIL Open Font License'
+        # the font is sent as bytes with its own type (the text path would corrupt it)
+        $srv = [IO.File]::ReadAllText((Join-Path $Root 'Start-PrtgManager.ps1'))
+        $srv | Should -Match "'\.woff2' = 'font/woff2'"
+        $srv | Should -Match 'ReadAllBytes\(\$file\)'
+    }
     It 'a part restore that reports ok = false fails the command line and the dashboard job' {
         $cli = [IO.File]::ReadAllText((Join-Path $Root 'cli\Invoke-PrtgManager.ps1'))
         $restore = $cli.Substring($cli.IndexOf("'Restore' {")); $restore = $restore.Substring(0, $restore.IndexOf("'RemoveLicense' {"))

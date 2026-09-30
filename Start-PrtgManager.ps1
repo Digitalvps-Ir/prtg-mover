@@ -234,8 +234,17 @@ function Invoke-PmRoute {
         $name = if ($path -eq '/') { 'index.html' } else { $path.TrimStart('/') }
         $file = Join-Path (Get-PmPath Web) $name
         if ($name -match '^[\w\-\.]+$' -and (Test-Path -LiteralPath $file -PathType Leaf)) {
-            $types = @{ '.html' = 'text/html; charset=utf-8'; '.js' = 'application/javascript; charset=utf-8'; '.css' = 'text/css; charset=utf-8'; '.svg' = 'image/svg+xml' }
-            $ct = $types[[IO.Path]::GetExtension($file)]; if (-not $ct) { $ct = 'application/octet-stream' }
+            $types = @{ '.html' = 'text/html; charset=utf-8'; '.js' = 'application/javascript; charset=utf-8'; '.css' = 'text/css; charset=utf-8'; '.svg' = 'image/svg+xml'; '.txt' = 'text/plain; charset=utf-8'; '.woff2' = 'font/woff2' }
+            $ext = [IO.Path]::GetExtension($file)
+            $ct = $types[$ext]; if (-not $ct) { $ct = 'application/octet-stream' }
+            if ($ext -eq '.woff2') {
+                # binary: the font of the DigitalVPS theme, cached by the browser (it never changes within a version)
+                $bytes = [IO.File]::ReadAllBytes($file)
+                $res = $Ctx.Response; $res.StatusCode = 200; $res.ContentType = $ct; $res.ContentLength64 = $bytes.Length
+                $res.Headers['Cache-Control'] = 'public, max-age=604800'; $res.Headers['X-Content-Type-Options'] = 'nosniff'
+                try { $res.OutputStream.Write($bytes, 0, $bytes.Length) } finally { $res.OutputStream.Close() }
+                return
+            }
             Send-PmResponse -Ctx $Ctx -Body ([IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)) -ContentType $ct
         } else { Send-PmJson $Ctx @{ error = 'Not found' } 404 }
         return
