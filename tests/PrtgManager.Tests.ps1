@@ -794,12 +794,12 @@ Describe 'PRTG configuration parts (devices, notifications, triggers)' {
     BeforeAll {
         $script:CfgXml = @'
 <?xml version="1.0" encoding="UTF-8"?>
-<root version="30" oct="PRTG Network Monitor 25.4.114.1032 x64" max="700">
+<root version="30" oct="PRTG Network Monitor 25.4.114.1032 x64" max="700" guid="{11111111-2222-3333-4444-555555555555}">
   <basenode id="-99"><data><name>root</name></data><nodes>
     <group id="0"><data><name>Root</name></data><trigger><state id="1"><data><onnotificationid>300</onnotificationid><latency>60</latency></data></state></trigger><nodes>
       <probenode id="1"><data><name>Local Probe</name></data><nodes>
         <group id="10"><data><name>Servers</name></data><nodes>
-          <device id="40"><data><name>Web</name><schedule>-1</schedule><dependency></dependency><interval>60</interval></data><nodes>
+          <device id="40"><data><name>Web</name><schedule>-1</schedule><dependency></dependency><interval>60</interval><windowsloginpassword><flags/><cell crypt="PRTGv2">AAAAencrypted1111</cell></windowsloginpassword></data><nodes>
             <sensor id="41"><data><name>Ping</name></data><channels><channel id="0"/></channels><trigger><threshold id="1"><data><onnotificationid>301</onnotificationid></data></threshold></trigger></sensor>
             <sensor id="42"><data><name>HTTP</name><dependency>41</dependency></data></sensor>
           </nodes></device>
@@ -884,6 +884,19 @@ Describe 'PRTG configuration parts (devices, notifications, triggers)' {
         [void](Invoke-PmSectionMerge -Target $t -Section (& $Part 'devices') -Plan $p)
         $t.SelectSingleNode("//device[@id='40']/data/interval").InnerText | Should -Be '60'
         @($t.SelectNodes("//device[@id='40']/nodes/sensor")).Count | Should -Be 2
+    }
+
+    It 'does not count values PRTG re-encrypted on a save as a change' {
+        $t = & $NewTarget
+        $t.SelectSingleNode("//device[@id='40']/data/windowsloginpassword/cell").InnerText = 'BBBBreencrypted222'
+        (Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices') -Mode overwrite).Counts.update | Should -Be 0
+    }
+
+    It 'warns that encrypted values may not be readable when the backup comes from another PRTG installation' {
+        $t = & $NewTarget; $t.DocumentElement.SetAttribute('guid', '{99999999-0000-0000-0000-000000000000}')
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices')
+        (@($p.Warnings) -join ' ') | Should -Match 'another PRTG installation'
+        @((Get-PmSectionRestorePlan -Target (& $NewTarget) -Section (& $Part 'devices')).Warnings).Count | Should -Be 0
     }
 
     It 'blocks a backup made with a newer configuration format' {

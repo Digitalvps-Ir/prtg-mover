@@ -498,11 +498,11 @@ function Get-PmConfigHeader {
     param([Parameter(Mandatory)]$Doc)
     $r = $Doc.DocumentElement
     if ($r.LocalName -eq 'prtgmanagersection') {
-        return [pscustomobject]@{ ConfigVersion = [int]('0' + $r.GetAttribute('configversion')); PrtgVersion = $r.GetAttribute('prtgversion'); Max = [int]('0' + $r.GetAttribute('max')) }
+        return [pscustomobject]@{ ConfigVersion = [int]('0' + $r.GetAttribute('configversion')); PrtgVersion = $r.GetAttribute('prtgversion'); Max = [int]('0' + $r.GetAttribute('max')); Guid = $r.GetAttribute('configguid') }
     }
     $oct = $r.GetAttribute('oct'); $ver = ''
     if ($oct -match '(\d+\.\d+\.\d+\.\d+)') { $ver = $Matches[1] }
-    return [pscustomobject]@{ ConfigVersion = [int]('0' + $r.GetAttribute('version')); PrtgVersion = $ver; Max = [int]('0' + $r.GetAttribute('max')) }
+    return [pscustomobject]@{ ConfigVersion = [int]('0' + $r.GetAttribute('version')); PrtgVersion = $ver; Max = [int]('0' + $r.GetAttribute('max')); Guid = $r.GetAttribute('guid') }
 }
 
 function Get-PmChildElement { param($Element, [string]$Name) foreach ($c in $Element.ChildNodes) { if ($c.NodeType -eq [Xml.XmlNodeType]::Element -and $c.LocalName -eq $Name) { return $c } }; return $null }
@@ -597,6 +597,7 @@ function New-PmSectionDocument {
     $root.SetAttribute('type', $Type); $root.SetAttribute('format', '1')
     $root.SetAttribute('configversion', [string]$Header.ConfigVersion); $root.SetAttribute('prtgversion', [string]$Header.PrtgVersion)
     $root.SetAttribute('max', [string]$Header.Max); $root.SetAttribute('created', (Get-Date).ToUniversalTime().ToString('o'))
+    if ($Header.Guid) { $root.SetAttribute('configguid', [string]$Header.Guid) }
     return , $out
 }
 
@@ -682,11 +683,31 @@ function Get-PmTriggerRefs {
 }
 
 function Get-PmSettingsXml {
-    <# The settings of an object for comparison: data, trigger and channels (history and children excluded). #>
+    <#
+        The settings of an object for comparison: data, trigger and channels (history and children excluded).
+        Values PRTG stores encrypted (<cell crypt="...">: passwords, SNMP communities, comments) are masked:
+        PRTG encrypts them again with fresh randomness on every save, so the same value never looks the same.
+    #>
     param($Element)
     $sb = New-Object Text.StringBuilder
-    foreach ($n in 'data', 'trigger', 'channels', 'notifies') { $e = Get-PmChildElement $Element $n; if ($e) { [void]$sb.Append(($e.OuterXml -replace '\s+', ' ')) } }
+    foreach ($n in 'data', 'trigger', 'channels', 'notifies') {
+        $e = Get-PmChildElement $Element $n
+        if ($e) { [void]$sb.Append((ConvertTo-PmComparableXml $e.OuterXml)) }
+    }
     return $sb.ToString()
+}
+
+function ConvertTo-PmComparableXml {
+    <#
+        XML text in one canonical form for comparisons: encrypted cells masked, <x></x> written as <x />,
+        whitespace collapsed. Two texts that mean the same compare equal.
+    #>
+    param([string]$Xml)
+    $x = $Xml -replace '(<cell[^>]*\bcrypt="[^"]*"[^>]*>)[^<]*(</cell>)', '$1*$2'
+    $x = $x -replace '>\s+<', '><'
+    $x = $x -replace '<([\w\.:-]+)((?:\s[^<>]*?)?)\s*></\1>', '<$1$2 />'
+    $x = $x -replace '\s*/>', ' />'
+    return ($x -replace '\s+', ' ').Trim()
 }
 
 function New-PmPlanItem {
@@ -715,6 +736,9 @@ function Get-PmSectionRestorePlan {
         $plan.Blockers += "The backup was made with a newer PRTG (configuration format $($sh.ConfigVersion), PRTG $($sh.PrtgVersion)) than the target has (format $($th.ConfigVersion), PRTG $($th.PrtgVersion)). Update PRTG on the target to $($sh.PrtgVersion) or newer first."
     } elseif ($sh.PrtgVersion -and $th.PrtgVersion -and $sh.PrtgVersion -ne $th.PrtgVersion) {
         $plan.Warnings += "The backup comes from PRTG $($sh.PrtgVersion), the target runs PRTG $($th.PrtgVersion). PRTG converts older settings when it starts."
+    }
+    if ($sh.Guid -and $th.Guid -and $sh.Guid -ne $th.Guid) {
+        $plan.Warnings += 'The backup comes from another PRTG installation. PRTG stores passwords, SNMP communities and comments encrypted with a key of its own installation: in restored objects they may not be readable on the target - enter those credentials again there after the restore.'
     }
     $map = Get-PmConfigObjectMap $Target
     $created = @{}   # id -> $true for objects this plan creates (keeps their id)
@@ -839,7 +863,7 @@ function Get-PmSectionRestorePlan {
                     $have = $null
                     if ($tt) { foreach ($x in (Get-PmChildElements $tt)) { if ($x.LocalName -eq $i.LocalName -and $x.GetAttribute('id') -eq $iid) { $have = $x; break } } }
                     if (-not $have) { $act = 'create'; $why = 'not on the target' }
-                    elseif (($have.OuterXml -replace '\s+', ' ') -eq ($i.OuterXml -replace '\s+', ' ')) { $act = 'skip'; $why = 'identical on the target' }
+                    elseif ((ConvertTo-PmComparableXml $have.OuterXml) -eq (ConvertTo-PmComparableXml $i.OuterXml)) { $act = 'skip'; $why = 'identical on the target' }
                     elseif ($Mode -eq 'merge') { $act = 'conflict'; $why = 'the target has a different trigger with this id (merge keeps it)' }
                     else { $act = 'update'; $why = 'settings differ' }
                     [void]$plan.Items.Add((New-PmPlanItem -Id ([int]$iid) -Type "$($i.LocalName) trigger" -Name $what -ParentId $oid -Action $act -Reason $why -Kind 'trigger'))
@@ -1724,7 +1748,7 @@ function Get-PmGraphTargetFacts {
     $root = Join-Path $prtg.DataPath 'Monitoring Database'
     $files = @(Get-PmGraphFiles -Root $root | ForEach-Object { $_.Rel })
     $devices = @()
-    try { $doc = Read-PmPrtgConfig -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat'); $devices = @($doc.SelectNodes('//nodes/device[@id]') | ForEach-Object { [int]$_.GetAttribute('id') }) } catch { Write-PmLog "Device ids could not be read: $($_.Exception.Message)" 'WARN' }
+    try { $doc = Read-PmPrtgConfig -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat'); $devices = @($doc.SelectNodes('//nodes/*[@id][self::device or self::autodevice or self::probenode]') | ForEach-Object { [int]$_.GetAttribute('id') }) } catch { Write-PmLog "Device ids could not be read: $($_.Exception.Message)" 'WARN' }
     New-PmResult @{ Files = $files; Devices = $devices; Prtg = $prtg }
 }
 
@@ -2080,7 +2104,7 @@ function Invoke-PmRemoteBackup {
             $index = @()
             try {
                 $cdoc = Read-PmPrtgConfig -Path (Join-Path $dataSource 'PRTG Configuration.dat')
-                $index = @($cdoc.SelectNodes('//nodes/device[@id]') | ForEach-Object { [ordered]@{ id = [int]$_.GetAttribute('id'); name = (Get-PmObjectName $_) } })
+                $index = @($cdoc.SelectNodes('//nodes/*[@id][self::device or self::autodevice or self::probenode]') | ForEach-Object { [ordered]@{ id = [int]$_.GetAttribute('id'); name = (Get-PmObjectName $_) } })
                 $manifest.prtg = [ordered]@{ included = $false; version = $prtg.Version; configVersion = (Get-PmConfigHeader $cdoc).ConfigVersion; dataPath = $prtg.DataPath }
             } catch { Write-PmLog "Device names could not be read from the configuration: $($_.Exception.Message)" 'WARN'; $manifest.prtg = [ordered]@{ included = $false; version = $prtg.Version; dataPath = $prtg.DataPath } }
             New-Item -ItemType Directory -Force -Path (Join-Path $stage 'prtg') | Out-Null
