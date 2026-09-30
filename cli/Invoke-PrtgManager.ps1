@@ -123,9 +123,9 @@ try {
             if ($bk.StageDir) { Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
             $job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf) }
             if ($KeepLast -gt 0) {
-                # Retention only touches packages of the same source computer (PRTG_<COMPUTER>_<timestamp>.zip).
-                $prefix = (Split-Path $file -Leaf) -replace '_\d{8}-\d{6}\.zip$', '_'
-                Get-ChildItem (Get-PmPath Backups) -File | Where-Object { $_.Extension -in '.zip', '.pmenc' } | Where-Object { [IO.Path]::ChangeExtension($_.Name, '.zip').StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+                # Retention only touches packages of the same type and source computer (PRTG-FULL_<COMPUTER>_<timestamp>.zip / .pmenc).
+                $prefix = (Split-Path $file -Leaf) -replace '_\d{8}-\d{6}\.(zip|pmenc)$', '_'
+                Get-ChildItem (Get-PmPath Backups) -File | Where-Object { $_.Extension -in '.zip', '.pmenc' -and $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
                     Sort-Object LastWriteTime -Descending | Select-Object -Skip $KeepLast | ForEach-Object {
                         Remove-PmBackup -Name $_.Name; Add-PmJobLog -Job $job -Level INFO -Message "Retention: removed $($_.Name)"
                     }
@@ -139,10 +139,21 @@ try {
         'Restore' {
             if (-not $BackupName -or -not $Target) { throw '-BackupName and -Target are required.' }
             $file = Get-PmBackupFile -Name $BackupName
-            foreach ($ref in $Target) {
-                $srv = Resolve-CliServer $ref
-                $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -BackupPath $file -Options $options -Job $job
-                if (@($rep.Errors).Count) { $exit = 2 }
+            $meta = Read-PmBackupMeta -Path $file
+            $ptype = Get-PmBackupType -Manifest $(if ($meta) { $meta.manifest } else { Read-PmBackupManifest -ZipPath $file }) -Name $BackupName
+            $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
+            # the engine never restores into a server marked as source - checked before anything is decrypted or sent
+            foreach ($srv in $targets) { Assert-PmNotSource -Server $srv -What 'restore into' }
+            if ($ptype -in 'devices', 'notifications', 'triggers', 'license') {
+                foreach ($srv in $targets) { [void](Invoke-PmSectionRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -Path $file -Options $options -Password $pw -Job $job) }
+            } else {
+                $plain = Get-PmPlainPackage -Path $file -Password $pw -Job $job
+                try {
+                    foreach ($srv in $targets) {
+                        $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -BackupPath $plain.Path -Options $options -Job $job
+                        if (@($rep.Errors).Count) { $exit = 2 }
+                    }
+                } finally { if ($plain.Temp) { Remove-Item -LiteralPath $plain.Path -Force -ErrorAction SilentlyContinue } }
             }
         }
         'RemoveLicense' {
@@ -158,6 +169,7 @@ try {
             $srv = Resolve-CliServer $Source
             $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'KeepStopped' }
             $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
+            foreach ($x in $targets) { Assert-PmNotSource -Server $x -What 'migrate into' }
             $creds = @{}; if ($Credential) { foreach ($x in @($srv) + $targets) { $creds[$x.id] = $Credential } }
             if (-not $Transfer) { $Transfer = Resolve-PmTunnelFromServers -Servers (@($srv) + $targets); if ($Transfer) { $options.Transfer = $Transfer } }
             if ($Transfer -in 'rdp', 'winrm') {

@@ -423,8 +423,9 @@ if ($env:OS -ne 'Windows_NT') { throw 'PRTG Manager needs Windows.' }
 if ($PSVersionTable.PSVersion -lt [version]'5.1') { throw "Windows PowerShell 5.1 or newer is needed (found $($PSVersionTable.PSVersion)). Install Windows Management Framework 5.1." }
 Write-Ok "Windows PowerShell $($PSVersionTable.PSVersion), user $env:USERDOMAIN\$env:USERNAME$(if (Test-IsAdmin) { ' (administrator)' })"
 if (-not $InstallPath) {
-    # an installation under the earlier name is updated where it is, so its data stays with it
-    $InstallPath = if (Test-OldProgramFolder 'C:\PrtgMover') { 'C:\PrtgMover' } else { 'C:\PrtgManager' }
+    # an installation in C:\PrtgMover (made under the earlier name, or already updated there) is updated where
+    # it is, so its data stays with it; the forwarder Start-PrtgMover.ps1 is part of both
+    $InstallPath = if (-not (Test-ProgramFolder 'C:\PrtgManager') -and ((Test-OldProgramFolder 'C:\PrtgMover') -or (Test-ProgramFolder 'C:\PrtgMover'))) { 'C:\PrtgMover' } else { 'C:\PrtgManager' }
 }
 $InstallPath = [IO.Path]::GetFullPath($InstallPath).TrimEnd('\')
 if ($Local -and -not $Uninstall -and -not (Test-IsAdmin)) { throw 'Local mode (-Local) needs administrator rights: backup and restore of this computer work with snapshots, the registry and services. Start the installation with "Run as administrator".' }

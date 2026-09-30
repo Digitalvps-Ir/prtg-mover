@@ -60,8 +60,9 @@ try {
     Write-Host ''
     Write-Host "  PRTG Manager __PM_VERSION__ + VPN Manager __VM_VERSION__ - setup" -ForegroundColor Cyan
     if ($env:OS -ne 'Windows_NT' -or $PSVersionTable.PSVersion -lt [version]'5.1') { throw "Windows with Windows PowerShell 5.1 or newer is needed (found $($PSVersionTable.PSVersion))." }
-    if (-not $PrtgManagerPath) { $PrtgManagerPath = if (Test-Path -LiteralPath 'C:\PrtgMover\Start-PrtgMover.ps1') { 'C:\PrtgMover' } else { 'C:\PrtgManager' } }
-    if (-not $VpnManagerPath) { $VpnManagerPath = if (Test-Path -LiteralPath 'C:\VpnWatchDashboard\Start-VpnWatch.ps1') { 'C:\VpnWatchDashboard' } else { 'C:\VpnManager' } }
+    # an installation in the earlier folder (under the old or the new name) is updated where it is
+    if (-not $PrtgManagerPath) { $PrtgManagerPath = if (-not (Test-Path -LiteralPath 'C:\PrtgManager\Start-PrtgManager.ps1') -and ((Test-Path -LiteralPath 'C:\PrtgMover\Start-PrtgMover.ps1') -or (Test-Path -LiteralPath 'C:\PrtgMover\Start-PrtgManager.ps1'))) { 'C:\PrtgMover' } else { 'C:\PrtgManager' } }
+    if (-not $VpnManagerPath) { $VpnManagerPath = if (-not (Test-Path -LiteralPath 'C:\VpnManager\Start-VpnManager.ps1') -and ((Test-Path -LiteralPath 'C:\VpnWatchDashboard\Start-VpnWatch.ps1') -or (Test-Path -LiteralPath 'C:\VpnWatchDashboard\Start-VpnManager.ps1'))) { 'C:\VpnWatchDashboard' } else { 'C:\VpnManager' } }
     $PrtgManagerPath = [IO.Path]::GetFullPath($PrtgManagerPath).TrimEnd('\')
     $VpnManagerPath = [IO.Path]::GetFullPath($VpnManagerPath).TrimEnd('\')
     $admin = Test-Admin

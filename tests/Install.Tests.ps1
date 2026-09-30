@@ -327,3 +327,26 @@ Describe 'Installer option -Local (PRTG Manager on the PRTG server itself)' -Ski
         $text.Contains('$bytes[0x15] -bor 0x20') | Should -BeTrue
     }
 }
+
+Describe 'Upgrade path and command line (review findings)' {
+    It 'keeps C:\PrtgMover as the default folder also after it was updated to PRTG Manager' {
+        $txt = [IO.File]::ReadAllText((Join-Path $Root 'install.ps1'))
+        $txt | Should -Match "Test-OldProgramFolder 'C:\\PrtgMover'\) -or \(Test-ProgramFolder 'C:\\PrtgMover'\)"
+        $body = [IO.File]::ReadAllText((Join-Path $Root 'tools\setup-all\Setup-All.body.ps1'))
+        $body | Should -Match "C:\\PrtgMover\\Start-PrtgManager\.ps1"
+        $body | Should -Match "C:\\VpnWatchDashboard\\Start-VpnManager\.ps1"
+    }
+    It 'the command line decrypts encrypted packages, restores parts and never restores into a source' {
+        $cli = [IO.File]::ReadAllText((Join-Path $Root 'cli\Invoke-PrtgManager.ps1'))
+        $restore = $cli.Substring($cli.IndexOf("'Restore' {")); $restore = $restore.Substring(0, $restore.IndexOf("'RemoveLicense' {"))
+        $restore | Should -Match 'Assert-PmNotSource'
+        $restore | Should -Match 'Get-PmPlainPackage'
+        $restore | Should -Match 'Invoke-PmSectionRestoreFlow'
+        $cli.Substring($cli.IndexOf("'Migrate' {")) | Should -Match 'Assert-PmNotSource'
+    }
+    It 'retention finds packages of the same type and source, encrypted or not' {
+        $prefix = 'PRTG-FULL_SRV_20260101-000000.pmenc' -replace '_\d{8}-\d{6}\.(zip|pmenc)$', '_'
+        $prefix | Should -Be 'PRTG-FULL_SRV_'
+        [IO.File]::ReadAllText((Join-Path $Root 'cli\Invoke-PrtgManager.ps1')) | Should -Match ([regex]::Escape("-replace '_\d{8}-\d{6}\.(zip|pmenc)$', '_'"))
+    }
+}
