@@ -4,12 +4,12 @@
 
 | Component | File | Runs on | Responsibility |
 |---|---|---|---|
-| Dashboard / API | `Start-PrtgMover.ps1` | manager | `System.Net.HttpListener` on `localhost:8765`, static UI, REST API without access protection, streaming uploads and downloads on a separate runspace pool |
-| Engine | `src/PrtgMover.psm1` | manager | server inventory, DPAPI credentials, sessions for every connection method, file transfers, backup / restore / migrate flows, job runner (runspace pool), logs and audit trail |
-| Payload | `src/Remote/PrtgMover.Remote.ps1` | source / target | PRTG discovery, VSS snapshots, registry export and import, program clone, web server binding, VPN phonebook merge, health check |
-| RDP agent | `agent/PrtgMover-Agent.ps1` | source / target | runs the payload inside a Remote Desktop session and talks to the manager through the redirected drive |
+| Dashboard / API | `Start-PrtgManager.ps1` | manager | `System.Net.HttpListener` on `localhost:8765`, static UI, REST API without access protection, streaming uploads and downloads on a separate runspace pool |
+| Engine | `src/PrtgManager.psm1` | manager | server inventory, DPAPI credentials, sessions for every connection method, file transfers, backup / restore / migrate flows, job runner (runspace pool), logs and audit trail |
+| Payload | `src/Remote/PrtgManager.Remote.ps1` | source / target | PRTG discovery, VSS snapshots, registry export and import, program clone, web server binding, configuration parts (export, restore plan, merge), history restore, license (status, backup, install), backup encryption, health check |
+| RDP agent | `agent/PrtgManager-Agent.ps1` | source / target | runs the payload inside a Remote Desktop session and talks to the manager through the redirected drive |
 | UI | `web/` | browser | vanilla HTML/CSS/JS, polls the API |
-| CLI | `cli/Invoke-PrtgMover.ps1` | manager | same flows, console output, exit codes |
+| CLI | `cli/Invoke-PrtgManager.ps1` | manager | same flows, console output, exit codes |
 
 ## Connection methods
 
@@ -29,7 +29,7 @@ For every call the manager builds one script:
 
 ```
 param($PmFn, $PmParams)
-<contents of PrtgMover.Remote.ps1>
+<contents of PrtgManager.Remote.ps1>
 & $PmFn @PmParams
 ```
 
@@ -51,7 +51,7 @@ manager                          source                            target
   │ Invoke-PmRemoteBackup ───────►│ remove stale snapshots of earlier runs
   │                               │ VSS snapshot (PRTG keeps running)
   │                               │ stage small items: registry, services,
-  │                               │   VPN phonebooks, desktops, manifest
+  │                               │   desktops, manifest
   │ ◄── file lists ───────────────│
   │ pull data + program folder ◄──│ read from the snapshot
   │ Complete-PmRemotePull ───────►│ snapshot and temp files removed
@@ -65,7 +65,7 @@ manager                          source                            target
   │                                                                 │ adjust data path and web binding
   │                                                                 │ license, customisations, firewall
   │ ◄── log / progress / report ────────────────────────────────────│ start PRTG, health check
-  │                                                                 │ VPN merge, desktops, extra paths
+  │                                                                 │ desktops, extra paths
 ```
 
 With the RDP method the pull and push steps are replaced by direct reads and writes on the manager's staging folder through `\\tsclient`.
@@ -108,8 +108,16 @@ Every job record stores its parameters (without one-time credentials) and a chec
 
 | Path | Content | Removed |
 |---|---|---|
-| `C:\PrtgMover\staging\<job>` (source, WinRM) | registry export, VPN phonebooks, desktops, manifest | after the pull |
+| `C:\PrtgMover\staging\<job>` (source, WinRM) | registry export, desktops, manifest | after the pull |
 | `C:\PrtgMover\chunks` | transfer chunks | after every chunk |
 | `C:\PrtgMoverVss_*` (source) | link to the VSS snapshot | after the pull, or at the start of the next run |
 | `C:\PrtgMover\restore\<package>` (target, WinRM) | pushed files | after the restore |
 | `C:\PrtgMover\rollback\<timestamp>` (target) | registry before the restore | kept |
+
+## Configuration parts, restore plans and rollback (2.0)
+
+- `Export-PmConfigSection` cuts one part out of `PRTG Configuration.dat` (read with `FileShare.ReadWrite`, PRTG keeps running): the device tree (`root/basenode/nodes/group[@id=0]`), the notification templates (`basenode[@id=-3]`) with the schedules (`basenode[@id=-7]`), or the triggers of every tree object. The part is a `<prtgmanagersection>` document with the configuration format and the PRTG version; it crosses WinRM gzip + base64 packed (WinRM refuses single objects over 10 MB).
+- `Get-PmSectionRestorePlan` (pure) compares a part with a target configuration: every object gets `create`, `update`, `skip`, `conflict` or `create-new-id` with a reason; dependencies (notifications of triggers, schedules, `dependency` fields) are checked after the whole plan, so objects created in the same run count as present.
+- `Invoke-PmSectionMerge` applies a plan in memory (new ids above `root@max`, `dependency` fields inside a re-id'd subtree follow, `root@max` raised); `Invoke-PmSectionRestore` does it on a server: rollback copy, PRTG stopped, plan again on the flushed file, write via a temp file that must parse, PRTG started and checked, rollback copy back when PRTG does not come up.
+- A full restore keeps `<data>.pre-restore-<time>` and the registry export; `Undo-PmPrtgRestore` puts both back when the restore fails or PRTG does not come up (`AutoRollback`).
+- Encryption (`Protect-PmBytes`, `Protect-PmFile`): envelope `PMENC1 | kdf | iterations | salt | IV | AES-256-CBC | HMAC-SHA256`, keys from PBKDF2 (SHA-256 with 200 000 rounds where .NET has it, else SHA-1 with 300 000). Files are checked (HMAC) before they are decrypted.

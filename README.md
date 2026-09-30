@@ -1,8 +1,8 @@
 <div align="center">
 
-# PRTG Mover
+# PRTG Manager
 
-**Back up, migrate and restore a complete PRTG Network Monitor server, including Windows VPN connections and desktop files, from one manager machine with a web dashboard.**
+**Back up, restore and migrate PRTG Network Monitor servers from one web dashboard: the whole PRTG, or only its history, devices, notifications, triggers or license — always with a preview before anything changes.**
 
 ![PowerShell 5.1+](https://img.shields.io/badge/PowerShell-5.1%2B-2563eb)
 ![Windows Server 2012 R2 – 2025](https://img.shields.io/badge/Windows%20Server-2012%20R2%20%E2%80%93%202025-0078d4)
@@ -15,151 +15,108 @@
 
 ---
 
+PRTG Manager was called **PRTG Mover** up to version 1.9. Windows VPN connections and their routes are no longer part of it: they are backed up, restored and migrated by **VPN Manager** (the former VPN Watch). See [Coming from PRTG Mover](#coming-from-prtg-mover).
+
 ## Contents
 
 - [What it does](#what-it-does)
-- [Connection methods: RDP or WinRM](#connection-methods-rdp-or-winrm)
-- [Options at a glance](#options-at-a-glance)
-- [What gets migrated](#what-gets-migrated)
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
+- [Backup types](#backup-types)
+- [Restore: preview first, rollback built in](#restore-preview-first-rollback-built-in)
+- [License](#license-page)
+- [Connection methods](#connection-methods)
 - [Installation](#installation)
 - [Quick start: migrate a PRTG server](#quick-start-migrate-a-prtg-server)
 - [Dashboard](#dashboard)
 - [Command line](#command-line)
-- [Backup package format](#backup-package-format)
+- [Backup package format (version 2)](#backup-package-format-version-2)
 - [Security](#security)
 - [Limitations and after-migration checklist](#limitations-and-after-migration-checklist)
+- [Coming from PRTG Mover](#coming-from-prtg-mover)
 - [Project layout](#project-layout)
 - [Development](#development)
 
 ## What it does
 
-PRTG Mover moves a PRTG core server to one or more new Windows servers without manual copying:
+1. **Checks first.** Every server must answer with administrator rights, have enough disk space, and the PRTG versions must fit. If a check fails, nothing is changed anywhere.
+2. **Reads the source without touching it.** PRTG keeps running. Files come from a Windows snapshot (VSS); configuration parts are read from `PRTG Configuration.dat` without writing anything.
+3. **Keeps every package on the manager** with metadata, checksums and an optional backup password — ready to validate, inspect, download and restore.
+4. **Restores with a preview.** You see exactly what is created, updated, skipped, what conflicts and what is missing, before anything changes.
+5. **Proves PRTG works** afterwards (core and probe running, web interface answering, stable 45 s later) — and puts the previous state back automatically when it does not.
 
-1. **Checks first.** Every server must be reachable with administrator rights and have enough disk space, and the PRTG versions must fit. If a check fails, nothing is changed anywhere.
-2. **Copies from the source without touching it.** PRTG keeps running. The files are read from a Windows snapshot (VSS), so the copy is consistent, and the source needs no free disk space.
-3. **Keeps a package on the manager.** Every backup is stored as one `.zip` with a manifest and a SHA-256 checksum, and can be downloaded from the dashboard.
-4. **Restores on each target.** If PRTG is missing, the program itself is cloned from the source (no installer). A rollback copy of the target's own data is kept.
-5. **Starts PRTG and proves it works.** The job only succeeds when core and probe are running, the web interface answers and everything is still stable 45 seconds later.
+Everything runs in plain **Windows PowerShell 5.1**. Nothing is installed on the servers.
 
-Failed or interrupted jobs can be **resumed**: finished steps and files that were already transferred are not repeated.
+## Backup types
 
-Everything runs in **plain Windows PowerShell 5.1**. Nothing is installed on the servers.
-
-## Connection methods: RDP or WinRM
-
-Each server uses **one** connection method, chosen in *Servers → Edit → Connection method for the script*:
-
-| | **RDP (agent)**, the default | **WinRM** |
+| Type | Contents | On the source |
 |---|---|---|
-| What you need on the server | Nothing: only Remote Desktop access | PowerShell remoting enabled (`tools\Enable-PrtgMoverRemoting.ps1`) |
-| Changes on the server | None | WinRM service and firewall rule |
-| How it runs | **RDP** opens Remote Desktop with the manager's drive redirected. In an elevated PowerShell you paste one command (it's copied for you), and the **agent** takes its jobs from the dashboard. | Fully automatic from the manager |
-| While a job runs | The Remote Desktop window must stay open (minimized is fine) | Nothing to keep open |
-| File transfer | Through the redirected drive (`\\tsclient\…`) | Over WinRM in compressed chunks, several streams in parallel, resumable per file |
-| Disk space needed on the source | None (staged on the manager) | None (pulled from the snapshot) |
-| Best for | Servers you must not reconfigure | Unattended runs, scheduled backups, large data folders |
+| **Full** | PRTG configuration (all objects), data folder with history (optional), program clone and Windows services, registry, license, SSL certificate, customisations (custom sensors, notification scripts, lookups, MIBs, device templates, maps), desktop files and extra paths (optional). With targets ticked this is a migration. | VSS snapshot, PRTG keeps running |
+| **History** | `Monitoring Database` — the data PRTG draws graphs and tables from — all of it or the last *N* days, plus the list of devices it belongs to. | VSS snapshot |
+| **Devices** | The whole device tree: probes, groups, devices, sensors with all settings, channels and their triggers, hierarchy. | read-only |
+| **Notifications** | Notification templates (e-mail, push, SMS, HTTP, program, syslog, SNMP trap, Teams, Slack …) and the schedules they use. | read-only |
+| **Triggers** | Every trigger (state, threshold, speed, volume, change) of every probe, group, device and sensor, with the object it belongs to. | read-only |
+| **License** | License name, key, activation data and license files — **always encrypted on the server** with a backup password; the key never travels or rests in clear. | read-only |
 
-Both methods run exactly the same payload (`src\Remote\PrtgMover.Remote.ps1`) with the same checks and logs.
+Only what PRTG needs is packed: no log files, caches (`PRTG Graph Data Cache*`), temp files or old automatic configuration copies unless you ask for them.
 
-On **Backup & Migrate**, *How the files move* can override that for one job:
+Any package can be **encrypted with a backup password** (AES-256-CBC + HMAC-SHA256, key from PBKDF2-SHA256 with 200 000 rounds). A wrong password or a changed file is detected before anything is decrypted or restored.
 
-| Choice | Where the files go |
+## Restore: preview first, rollback built in
+
+Every package has **Restore…** on the Backups page. The dialog asks for the target(s) and the options, then **Preview** reads the target (nothing is changed) and shows:
+
+| | Full | History | Devices / Notifications / Triggers | License |
+|---|---|---|---|---|
+| Items to create / update / skip | configuration, data folder, license, registry, customisations | new files, files already there | every object with its action and reason | current license → the one in the backup |
+| Conflicts | — | — | **ID conflicts** (the id belongs to another object on the target), changed triggers | — |
+| Blockers / dependencies | older PRTG on the target, disk space, no PRTG and no clone, no admin rights | PRTG missing, devices the target does not have | newer configuration format, missing notifications / schedules / dependencies | password, PRTG missing |
+
+**Restore** is only enabled after a preview without blockers; a full restore additionally needs an explicit confirmation.
+
+Modes for configuration parts:
+
+- **Merge** — only add what is missing; existing objects are never changed (differences are listed as conflicts).
+- **Overwrite** — also update existing objects with the saved settings (data, triggers, channels); their children and history stay.
+- **New ids for conflicts** — an object whose id is taken by another object on the target is created with a new id (with everything below it; dependencies inside it follow).
+
+**Rollback**:
+
+- *Full restore*: the target's data folder is kept as `<data>.pre-restore-<time>` and its registry is exported. If the restore fails or PRTG does not come up, both are **put back automatically** and PRTG is started again (*Roll back automatically* is on by default).
+- *Configuration parts*: `PRTG Configuration.dat` is copied to `C:\PrtgMover\rollback\config-<time>` first; the change is written through a temp file that must parse; if PRTG does not come up, the copy is put back.
+- *License*: the current license data is saved in `C:\PrtgMover\rollback\license-<time>` first.
+- *History*: files that exist are kept (merge) or replaced (overwrite); nothing is deleted; the graph cache is set aside so PRTG recalculates the graphs.
+
+A server with the role **Source** is never restored into.
+
+## License page
+
+| Action | What happens |
 |---|---|
-| Each server's saved method | Through this computer, using RDP or WinRM as saved on the server |
-| RDP / WinRM | Through this computer, forcing that method for this job |
-| **WireGuard** | Directly between the two Windows servers on `10.66.66.0/24`. The files move over WinRM to the other server's tunnel address (TCP 5985), and a short probe reports MB/s. This computer sends commands only and does not keep the backup. Needs a target. UDP 51820 must be open between the two public addresses. |
-| **IPIP** | Same direct copy over WinRM to the tunnel address, on `10.66.67.0/24` (IP protocol 4). Needs a target. Protocol 4 must be open between the two public addresses. |
+| **Refresh status** | Edition, licensed name, sensors, activation state, the last activation message of PRTG, which license values exist (no values shown), system-id fingerprint. |
+| **Add free trial license** | Enter the trial name and key Paessler e-mails you after registering on [paessler.com/prtg/download](https://www.paessler.com/prtg/download). |
+| **Activate an authorized license** | Enter the name and key of a license you own (site, enterprise …) as shown in the [Paessler shop](https://shop.paessler.com). |
+| **Back up license** | Encrypted license backup (see above). |
+| **Restore license from backup** | Through the restore dialog, with preview. |
+| **Remove license** | Removes license name, key and the activation of that key (and license files); PRTG's own bookkeeping (install date, paused-sensor counter) stays. Needs the server name typed as confirmation. A copy is kept on the server. |
 
-**Testing**: each server has a **Test RDP** button (RDP port, plus a full system check if the agent is running) and a **Test WinRM** button (WinRM login and a full system check). **Test all** tries both. The results are kept per method, and a server shows **PASS** when at least one method works. The row shows the result of each method.
+Installing a key works like the *PRTG Administration Tool*: PRTG is stopped, name and key are written, PRTG is started and **PRTG itself activates the key online with Paessler**. PRTG Manager then reads only the log lines written after that start and explains the result (for example *HTTP 403: the key is active on another system — move the activation in the Paessler shop*).
 
-## Options at a glance
+What PRTG Manager deliberately does **not** do: generate, fetch or change license keys, reset trials, bypass or fake an activation. Paessler has no public interface that hands out keys, so "retrieve from the internet" means: you take the key from the Paessler shop or e-mail and PRTG Manager activates it. Offline activation stays in the PRTG web interface (*Setup › License Status*).
 
-| Option | Default | Effect |
-|---|---|---|
-| **Don't touch the source** | **on** | PRTG keeps running on the source, and nothing there is stopped, changed or deleted. Files are copied from a **VSS snapshot**. On a system without VSS it falls back to a live copy with a warning. |
-| Source after backup | Keep stopped (migrate) / Restart (backup) | Only used when *Don't touch the source* is off: *Keep stopped*, *Stop & disable*, or **Restart & verify fully up**. |
-| **Clone the PRTG program** | on | Copies the program folder and the Windows service definitions, so a target without PRTG needs no installer. |
-| **Copy source license** | on | Copies the license to the target. When it's off, the target keeps its own license. |
-| Historic monitoring data | on | Turn it off for a small, fast package that holds configuration only. |
-| PRTG log files | off | Not needed for a migration. |
-| Old automatic configuration copies | off | Not needed for a migration. |
-| Windows VPN connections | on | All-user and per-user connections. |
-| Desktop files | on | Desktops of every user and the Public desktop. |
-| Start PRTG and verify | on | Full health check on every target. Services that stop during start-up are started again. |
-| Open firewall | on | Adds an inbound rule on the target for the PRTG web ports and remote probes (TCP 23560). |
-| Parallel transfer streams | 4 | WinRM only, 1 to 8. When files are pulled from a source, the number is limited by the CPU count of that server. |
-| Dial VPN after restore | off | A full-tunnel VPN can cut the connection the manager is using. |
-| Allow downgrade | off | Allows restoring onto an older PRTG version (not recommended). |
+## Connection methods
 
-Cache and temp files (`*.tmp`, `PRTG Graph Data Cache*`, `*.old`, `*.bak`) and `desktop.ini` / `Thumbs.db` are never copied.
+Each server uses one connection method (*Servers → Edit*):
 
-**Pre-flight checks** run before anything is changed:
+| | **Local** | **RDP (agent)** | **WinRM** |
+|---|---|---|---|
+| Where PRTG Manager runs | on the PRTG server itself | on a manager computer | on a manager computer |
+| Needed on the server | nothing (run as administrator) | Remote Desktop access | PowerShell remoting (`tools\Enable-PrtgManagerRemoting.ps1`) |
+| While a job runs | — | the Remote Desktop window stays open | nothing |
 
-- every server answers over its connection method, with administrator rights
-- free disk space: the manager needs about 2.2 × the PRTG data (staging copy and package), each target about 1.2 ×, the source none
-- the PRTG version on a target is not older than on the source
-- a target without PRTG gets the clone, or an installer is selected
-
-**Integrity checks**:
-
-- The SHA-256 of `PRTG Configuration.dat` is compared between the source, the manager and every target.
-- Every transferred chunk is checked (size after transfer, number of files after unpacking).
-- The number of devices, sensors, notifications, triggers, users and other objects is counted on the source and again on the target, and both appear in the log.
-- A backup without `PRTG Configuration.dat` is rejected, and a staging copy only counts as complete when the transfer finished and the configuration checksum matches.
-
-## What gets migrated
-
-| Area | Details |
-|---|---|
-| **PRTG configuration: everything** | `PRTG Configuration.dat` holds the whole PRTG object tree: probes, groups, devices, **sensors with all their settings, channels and limits**, **notification templates**, **notification triggers** on every object including inherited ones, **dependencies**, **schedules**, **users and user groups** with their rights, **maps, reports and libraries**, credentials stored in PRTG, **system settings** (SMTP/SMS delivery, core settings) and tags. The file is copied byte for byte. |
-| PRTG data folder | Historic monitoring database (optional), tickets, toplists, report PDFs. The path comes from the registry (`Datapath`) and falls back to `%ProgramData%\Paessler\PRTG Network Monitor`. |
-| PRTG program | The complete program folder and the two Windows services (core and probe), so the target runs the same version as the source. |
-| PRTG registry | `HKLM\SOFTWARE\WOW6432Node\Paessler` and `HKLM\SOFTWARE\Paessler` (license, server and probe settings). |
-| PRTG customisations | `Custom Sensors`, `Notifications` (EXE/scripts), `lookups\custom`, `devicetemplates`, `MIB`, `snmplibs`, `cert` (web server SSL certificate), `webroot\map*` / `webroot\custom`. |
-| Web server binding | If the web server was bound to specific IP addresses, addresses of the source are replaced by the target's own address. Without this PRTG would only answer on `127.0.0.1`. |
-| Windows VPN | All-user phonebook (`%ProgramData%\Microsoft\Network\Connections\Pbk\*.pbk`) and every user's own phonebook. Entries are **merged**: connections that already exist on the target are never overwritten. |
-| Desktop files | `Desktop` of every local user profile plus the Public desktop, for example `.bat` files and VPN files. On the target, files go to the same user's desktop, or to `C:\PrtgMover-Restored\Desktop\<user>` if that profile doesn't exist. |
-| Extra paths | Any folders or files you list, such as `D:\Scripts`, restored to the same path. |
-
-## How it works
-
-All data travels through the manager. The servers never talk to each other.
-
-```
-                 ┌──────────────── Manager (this repo) ────────────────┐
-                 │ Start-PrtgMover.ps1 → http://localhost:8765          │
-                 │ dashboard, REST API, jobs, logs, backups\*.zip       │
-                 └───────────┬──────────────────────────────┬──────────┘
-                RDP agent or WinRM                  RDP agent or WinRM
-                             │                              │
-        ┌────────────────────▼─────────┐      ┌─────────────▼────────────────┐
-        │ SOURCE (old PRTG server)     │      │ TARGET(s) (new servers)      │
-        │ 1 VSS snapshot, PRTG runs on │      │ 4 clone PRTG if missing      │
-        │ 2 manager copies the files   │      │ 5 rollback copy, restore     │
-        │ 3 snapshot and temp removed  │      │ 6 start PRTG, verify health  │
-        └──────────────────────────────┘      └──────────────────────────────┘
-```
-
-The code that runs on the servers (`src\Remote\PrtgMover.Remote.ps1`) is sent with every call, so nothing is installed and nothing can get out of date. See [Architecture](docs/ARCHITECTURE.md) for the details.
-
-## Requirements
-
-| Machine | Requirement |
-|---|---|
-| **Manager** | Windows 10/11 or Windows Server 2012 R2+, Windows PowerShell 5.1, free disk space of about **2.2 × the PRTG data** during a migration. RDP method: the Remote Desktop client. WinRM method: access to the servers on TCP 5985 or 5986. |
-| **Source** | Windows Server 2012 R2 – 2025 with PowerShell 5.1 and an administrator account. No free disk space needed. |
-| **Target** | The same, with free disk space of about **1.2 × the PRTG data**. |
-| **PRTG** | Only needed on the source. If PRTG is already installed on a target, it must be the same version or newer. |
-
-Tested with PRTG 25.4 on Windows Server 2016 (source) and Windows Server 2022 (target).
+All methods run the same payload (`src\Remote\PrtgManager.Remote.ps1`). Changing a license or restoring a configuration part needs *Local* or *WinRM*. For migrations, *How the files move* can also be WireGuard or IPIP (a tunnel between the two servers).
 
 ## Installation
 
-### 1. Install PRTG Mover on the manager
-
-Get the files (clone the repository, or download the ZIP from GitHub and extract it), then double-click **`install.cmd`**. The same from a PowerShell window:
+Double-click **`install.cmd`**, or:
 
 ```powershell
 git clone https://github.com/Digitalvps-Ir/prtg-mover.git
@@ -167,187 +124,122 @@ cd prtg-mover
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-Administrator rights are not needed. The installer
-
-1. checks Windows and PowerShell (5.1 or newer),
-2. copies the program to `C:\PrtgMover`,
-3. unblocks the scripts and tests the installation: every script must be intact and the dashboard must answer,
-4. creates the shortcut **PRTG Mover** on the desktop and in the start menu,
-5. starts the dashboard. Your browser opens `http://localhost:8765/`, and the console window shows the live log of every job.
+The installer copies the program to `C:\PrtgManager` (an existing PRTG Mover installation in `C:\PrtgMover` is updated where it is), tests every script and the dashboard, creates the shortcut **PRTG Manager** and starts the dashboard on `http://localhost:8765/`.
 
 | Option | Meaning |
 |---|---|
-| `-InstallPath D:\Tools\PrtgMover` | Install into another folder. |
-| `-Source <folder or zip>` | Install from that folder or ZIP file instead of the installer's own folder. |
-| `-TrustedHosts 10.0.0.10,10.0.0.20` | Also prepare the manager for servers that are reached over plain WinRM (HTTP). Windows asks for administrator rights for this step. |
-| `-Port 8080` | Port of the dashboard. |
-| `-NoShortcut`, `-NoStart` | Create no shortcut, do not start the dashboard. |
-| `-Autostart` | Start the dashboard when you log on to Windows (minimized, without opening the browser). An update keeps it; `-NoAutostart` switches it off again. |
-| `-Uninstall` | Remove the shortcuts and the program files of this installation. |
+| `-InstallPath <folder>` | Install into another folder. |
+| `-Source <folder or zip>` | Install from there instead of the installer's own folder. |
+| `-Local` | PRTG Manager on the PRTG server itself (elevated): this computer is added with the connection method *Local* and the dashboard starts with the computer. |
+| `-Autostart` / `-NoAutostart` | Start with Windows on / off. |
+| `-TrustedHosts a,b` | Prepare plain WinRM (HTTP) to these servers. |
+| `-Port`, `-NoShortcut`, `-NoStart`, `-Uninstall` | Self-explanatory. |
 
-**Opening the dashboard:** use the shortcut. When the dashboard is already running, the shortcut opens it in the browser and does not start a second one.
+Your data (`config\`, `data\`, `backups\`, `installers\`) is never touched by an update or an uninstall.
 
-**Update or repair:** get the new files and run the installer again. Close the dashboard window first.
-
-**Your data is never touched**, neither by an update nor by `-Uninstall`: the server list (`config\`), saved credentials, jobs and logs (`data\`), backup packages (`backups\`) and PRTG installers (`installers\`) stay where they are.
-
-`install.ps1` on its own, without the other files, downloads the program from GitHub. The repository is private, so that only works on a computer where `git` or the GitHub CLI is signed in.
-
-**On the PRTG server itself (local mode):** install with `install.ps1 -Local` from an elevated PowerShell, or run `Setup-All.cmd` with *Run as administrator* on a computer where PRTG is installed. This computer is then in the server list with the connection method *Local*: backup and restore work without RDP, WinRM or a credential, and the dashboard comes up by itself when the computer starts, without anybody logging on. In an existing installation use **Servers → Add this computer**; PRTG Mover then has to be started with administrator rights.
-
-**Backups of VPN connections and routes:** on the **Backups** page the section *VPN* has the button **Back up VPN and routes**. The package holds the VPN connections and, per connection, the routes bound to it, the live routes on its interface and the persistent routes that point into it. Passwords and pre-shared keys are never part of a backup. Full backups are listed in the section *PRTG* and contain the same route files when *VPN* is ticked.
-
-**PRTG Mover and VPN Watch in one file:** `tools\Build-SetupAll.ps1 -VpnWatchSource <folder of VPN Watch>` builds `Setup-All.cmd`. Copy that single file to a Windows computer and double-click it: it installs or updates both programs (PRTG Mover in `C:\PrtgMover`, VPN Watch in `C:\VpnWatchDashboard`), creates the shortcuts, starts both with Windows and tests both dashboards. The file contains program files only; servers, users and passwords are entered in the dashboards. Options: `-SkipPrtgMover`, `-SkipVpnWatch`, `-PrtgMoverPath`, `-VpnWatchPath`, `-NoAutostart`. When the computer has VPN connections of its own, run the file with *Run as administrator* so that VPN Watch manages them directly.
-
-Without the installer: `powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1` (or a double-click on `Start-PrtgMover.cmd`) starts the dashboard right from the folder the files are in.
-
-### 2. Choose the connection method
-
-**RDP (default)** needs no preparation. Continue with the quick start.
-
-**WinRM** needs PowerShell remoting on every server. Copy `tools\Enable-PrtgMoverRemoting.ps1` to the server and run it once in an **elevated** PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Enable-PrtgMoverRemoting.ps1 -Https
-```
-
-The script
-
-- enables WinRM with an HTTPS listener (self-signed certificate, port 5986),
-- allows remote administration with local administrator accounts,
-- opens the firewall for port 5986 **only for the manager's address**. It takes the address from the Remote Desktop session you are working in; `-ManagerAddress <ip>` sets it by hand,
-- closes plain WinRM (port 5985) in the firewall, which Windows opens when remoting is enabled (`-KeepPlainWinRM` leaves it open),
-- checks the result and prints what to enter in the dashboard.
-
-In the dashboard, tick *HTTPS* and *Skip certificate checks* for such a server. The script can be run again at any time, for example when the manager's address has changed.
-
-Without `-Https` the script enables plain WinRM on port 5985. The manager then has to trust the server (`install.ps1 -TrustedHosts …` does the same):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\tools\Setup-Manager.ps1 -TrustedHosts 10.0.0.10,10.0.0.20
-```
+**PRTG Manager and VPN Manager in one file:** `tools\Build-SetupAll.ps1 -VpnManagerSource <VPN Manager folder>` builds `Setup-All.cmd`. Double-click it on a Windows computer: it installs or updates both (PRTG Manager in `C:\PrtgManager`, VPN Manager in `C:\VpnManager`; older installations are updated in place), creates the shortcuts, starts both with Windows and tests both dashboards. Options: `-SkipPrtgManager`, `-SkipVpnManager`, `-PrtgManagerPath`, `-VpnManagerPath`, `-NoAutostart` (the old names such as `-PrtgMoverPath` still work).
 
 ## Quick start: migrate a PRTG server
 
-1. **Servers → Add server**: add the old PRTG server (role *Source*) and the new one (role *Target*), each with its connection method and administrator credential (for example `HOSTNAME\Administrator`).
-2. **Test all**: every server should show `PASS`.
-3. RDP method only: press **RDP** for each server, log in, and paste the agent command into an elevated PowerShell. Keep the Remote Desktop windows open.
-4. **Backup & Migrate**: choose the source and tick the target(s). The box *What this job will do* lists exactly what is copied and what isn't. Press **Migrate**.
-5. Follow the live log under **Jobs**. When it finishes, each target shows `PRTG ok` and the address where the web interface answered.
-6. Work through the [after-migration checklist](#limitations-and-after-migration-checklist).
-
-A **backup only** run is the same, just without ticking any target.
-
-If a job fails, fix the cause shown in the log and press **Resume**.
+1. **Servers → Add server**: the old PRTG server (role *Source*) and the new one (role *Target*).
+2. **Test all** — every server should show `PASS`.
+3. **Backup & Migrate** → *Full* → tick the target(s) → **Migrate**. The box *What this job will do* lists exactly what is copied.
+4. Follow the live log under **Jobs**. Each target ends with `PRTG ok` and its web address — or `rolled back` with the reason.
+5. **License** page on the target: PRTG asks Paessler for a new activation there.
 
 ## Dashboard
 
 | Page | Purpose |
 |---|---|
-| **Overview** | Counters, recent jobs and a short summary of the process. |
-| **Servers** | Inventory with connection method, RDP and WinRM port, live reachability badges (**Check ports**), agent status, PRTG version and **license state**. Buttons per server: **RDP** (opens Remote Desktop and copies the agent command), **Test RDP**, **Test WinRM**, Edit, Delete. |
-| **Backup & Migrate** | One source → any number of targets, with all options and a plain-language summary of the job. |
-| **Backups** | The **package store on the manager**. **Download** a package, **restore** it to one or more servers at any time, **upload** a package made elsewhere, or delete it. |
-| **Jobs** | Phase stepper, progress, colour-coded live log, per-target result, **Resume / Retry**, Cancel, log download. *Show debug* adds the exact error position, stack and timings. |
-| **Logs & Audit** | Audit trail (who did what), the manager log of the day, and **Download diagnostics**: one zip with all logs and an environment report, without passwords. |
+| **Overview** | Counters and recent jobs. |
+| **Servers** | Inventory, connection method, ports, tests, PRTG version, license badge. |
+| **Backup & Migrate** | Backup type, options, backup password, migration targets, plain-language summary. |
+| **Backups** | Name, type, source, created, size, format and PRTG version, encrypted, valid — **Download, Validate, Inspect, Restore, Delete** (to the Recycle Bin). Upload of `.zip` / `.pmenc`. |
+| **License** | Status, trial / authorized key, backup, restore, removal. |
+| **Jobs** | Progress, live log, per-target results, Resume / Retry, Cancel, log download. |
+| **Logs & Audit** | Audit trail (backups, restores, validations, license changes, deletions) and the manager log. |
 
-**Make PRTG reachable** only appears when the test finds a PRTG that answers on `127.0.0.1` only, because its web server is still bound to another server's address. The button binds it to the server's own address and restarts PRTG there. Migrations do this automatically.
-
-The dashboard listens on `localhost` only. To reach it from another machine on a trusted management network, run `tools\Setup-Manager.ps1 -DashboardPort 8765` once, then `Start-PrtgMover.ps1 -ListenAll`.
+Errors say what failed, where, why and what to do, for example *Delete backup failed on PRTG-FULL_X.zip: the file could not be moved to the Recycle Bin (…) — Nothing was deleted.*
 
 ## Command line
 
-The same engine is available for scripts and scheduled tasks:
-
 ```powershell
-# Connectivity test (prompts for a credential)
-.\cli\Invoke-PrtgMover.ps1 -Action Test -Source 10.0.0.10 -Credential (Get-Credential)
-
-# Nightly backup of an inventory server, keep the last 7 packages (the source is not touched)
-.\cli\Invoke-PrtgMover.ps1 -Action Backup -Source PRTG-OLD -KeepLast 7
-
-# Migration to two servers with 6 parallel streams
-.\cli\Invoke-PrtgMover.ps1 -Action Migrate -Source PRTG-OLD -Target PRTG-NEW1,PRTG-NEW2 -Streams 6
-
-# Migration that stops and disables PRTG on the old server
-.\cli\Invoke-PrtgMover.ps1 -Action Migrate -Source PRTG-OLD -Target PRTG-NEW -AllowSourceStop -SourceAfter Disable
-
-# Restore an existing package
-.\cli\Invoke-PrtgMover.ps1 -Action Restore -BackupName PRTG_OLDSRV_20260928-221500.zip -Target PRTG-NEW1
-
-# Bind the web server of a migrated PRTG to the server's own address
-.\cli\Invoke-PrtgMover.ps1 -Action FixBinding -Target PRTG-NEW1
-
-# Remove the PRTG license data from a migrated server (a source server is refused)
-.\cli\Invoke-PrtgMover.ps1 -Action RemoveLicense -Target PRTG-NEW1
+.\cli\Invoke-PrtgManager.ps1 -Action Test -Source 10.0.0.10 -Credential (Get-Credential)
+.\cli\Invoke-PrtgManager.ps1 -Action Backup -Source PRTG-OLD -KeepLast 7
+.\cli\Invoke-PrtgManager.ps1 -Action Backup -Source PRTG-OLD -Scope Graphs -HistoryDays 30
+.\cli\Invoke-PrtgManager.ps1 -Action BackupPart -Part Devices -Source PRTG-OLD
+.\cli\Invoke-PrtgManager.ps1 -Action BackupPart -Part License -Source PRTG-OLD -BackupPassword (Read-Host -AsSecureString)
+.\cli\Invoke-PrtgManager.ps1 -Action Migrate -Source PRTG-OLD -Target PRTG-NEW1,PRTG-NEW2 -Streams 6
+.\cli\Invoke-PrtgManager.ps1 -Action Restore -BackupName PRTG-FULL_OLDSRV_20260928-221500.zip -Target PRTG-NEW1
+.\cli\Invoke-PrtgManager.ps1 -Action FixBinding -Target PRTG-NEW1
+.\cli\Invoke-PrtgManager.ps1 -Action RemoveLicense -Target PRTG-NEW1
 ```
 
-Other switches: `-NoPrtg -NoHistory -NoVpn -NoDesktop -ExtraPaths -NoProgramClone -NoLicense -NoFirewall -NoStart -HealthTimeoutMinutes -ConnectVpn -AllowDowngrade -InstallerFile -SkipPreflight`.
 Exit codes: `0` success, `1` failure, `2` finished with errors on a target.
 
-Servers that are not in the inventory are addressed by host name and use WinRM.
+## Backup package format (version 2)
 
-## Backup package format
+`backups\PRTG-<TYPE>_<SOURCE>_<yyyyMMdd-HHmmss>.zip` — or `.pmenc` when encrypted with a backup password — plus `<package>.meta.json` next to it (SHA-256 of the file, the manifest, the last validation).
 
-`backups\PRTG_<SOURCE>_<yyyyMMdd-HHmmss>.zip`:
+`manifest.json`:
 
-```
-manifest.json              source, PRTG version and paths, checksums, object counts, VPN names, desktop files
-prtg\data\...              PRTG data folder
-prtg\programfull\...       complete PRTG program folder (clone)
-prtg\services\*.reg        definitions of the PRTG Windows services
-prtg\program\<folder>\...  program customisations (Custom Sensors, cert, lookups\custom, ...)
-prtg\registry\*.reg        exported Paessler registry keys
-vpn\allusers\*.pbk         all-user VPN phonebooks
-vpn\users\<user>\*.pbk     per-user VPN phonebooks
-vpn\vpn-connections.json   readable list of the VPN connections
-desktop\<user>\...         desktop files
-extra\<n>\...              extra paths
-```
+| Field | Meaning |
+|---|---|
+| `tool`, `format`, `formatVersion` | `prtg-manager`, `prtg-manager-backup`, `2` (packages of PRTG Mover: `prtg-mover`, `1` — still restorable) |
+| `type` | `full`, `graphs`, `devices`, `notifications`, `triggers`, `license` |
+| `appVersion`, `createdUtc`, `jobId` | which PRTG Manager made it, when |
+| `source` | computer, OS, server name in the inventory |
+| `components` | PRTG version, manager version, PowerShell version |
+| `sections`, `counts` | what is inside (for example `device=27, sensor=386`) |
+| `files` | path, size and SHA-256 of every file of a part package |
+| `prtg` | version, configuration format, configuration SHA-256 and statistics, paths, program folders, services |
+| `graphs` | days, first and last day, files, bytes, devices (history packages) |
+| `license` | value names, edition, activated (never the key) |
+| `encryption` | `package` (whole file) / `secrets` (license key), algorithm, key derivation |
 
-The manager keeps `<package>.zip.meta.json` next to each package (SHA-256 and manifest) for the dashboard. You can open packages with any ZIP tool.
+Part packages contain `devices.xml`, `notifications.xml`, `triggers.xml` (a `<prtgmanagersection>` with the configuration format and PRTG version) or `license.enc`. Full and history packages contain `prtg\data`, `prtg\graphs`, `prtg\programfull`, `prtg\program`, `prtg\registry`, `prtg\services`, `desktop`, `extra`.
+
+**Validate** checks: the file against its original SHA-256, zip integrity, supported format, every listed file checksum, `PRTG Configuration.dat` against the checksum read on the source, the history file count, and for encrypted packages the password and integrity (HMAC).
 
 ## Security
 
-- **Passwords are never written in plain text.** Credentials saved in the dashboard are encrypted with Windows DPAPI (`Export-Clixml`). Only the same Windows user on the same manager machine can decrypt them. `config\servers.json` holds no secrets.
-- **The dashboard listens on `localhost` by default and has no access protection**: no token, and no check of where a request comes from. Every program on the manager, and every web page that is open in a browser on the manager, can call the dashboard and start jobs with the saved server credentials. With `-ListenAll`, everyone who can reach the port can do the same. Run the dashboard only while you need it.
-- **Restrict WinRM** to the manager's IP (`-ManagerAddress`), and use **HTTPS (5986)** whenever servers are reached over the internet. When the migration is done, you can remove the firewall rule or disable WinRM again.
-- **The RDP agent** only runs while you keep its window open, and it only accepts the functions PRTG Mover needs.
-- **Backups contain sensitive data**: the PRTG configuration (including encrypted device credentials), the license and the SSL private key. Store and share them like a password vault export.
-- **Logs and the diagnostics bundle** contain no passwords and no token.
-- `backups/`, `data/` and `config/servers.json` are in `.gitignore`. **Never commit them.**
+- Server passwords are stored with Windows DPAPI for the current Windows user only; `config\servers.json` holds no secrets.
+- Backup passwords and license keys are only used by the running job: they are never written to job records, logs, the audit trail or URLs.
+- License backups are encrypted on the PRTG server itself; restore decrypts on the target server. The manager never holds the key in clear.
+- The dashboard listens on `localhost` without access protection (no token). Every program on the manager can use it; with `-ListenAll` everyone who reaches the port can. Run it only while you need it.
+- Full backups contain the PRTG configuration with PRTG's encrypted device credentials, the license and the SSL private key: use a backup password or store them like a password vault export.
+- `backups/`, `data/` and `config/servers.json` are in `.gitignore` — never commit them.
 
 ## Limitations and after-migration checklist
 
-- **Two cores at once**: with *Don't touch the source* the old PRTG keeps running, so both servers monitor and send notifications until you stop the old one.
-- **License activation**: PRTG binds a license to the system it was activated on. The license key is copied, but on the new server PRTG reports *No License (System Changed)* and pauses the sensors until the license is activated there (*Setup → License Information*, or through Paessler if the server can't reach the activation service). PRTG Mover shows this state and the last activation error. It doesn't activate licenses, and it never changes the license on the source.
-- **License use**: check with your license terms how many cores may run at the same time, and stop the old core when the new one is verified.
-- **Devices that only allow the old IP**: if monitored devices restrict SNMP, WMI or API access to the old server's address, allow the new address there.
-- **Remote probes** connect to the core's IP or DNS name. If the new core has a different address, update the DNS record or change the core address on each remote probe (*PRTG Administration Tool → Probe settings*).
-- **Saved VPN passwords and machine certificates** are protected by Windows DPAPI and can't be moved. Enter the VPN credentials once on the new server, and import any IKEv2/SSTP certificates.
-- **Service account**: cloned services run as LocalSystem. If the source ran PRTG under another account, set it again in `services.msc`.
-- **Target version**: it must be equal to or newer than the source. Older is blocked unless you enable *Allow downgrade*.
-- **Data drive**: if the source data folder lives on a drive the target doesn't have (for example `D:`), the target's default data path is used and the registry is updated.
-- **Rollback**: if a target already had PRTG data, it is kept as `<datapath>.pre-restore-<timestamp>`, and its registry is saved in `C:\PrtgMover\rollback\<timestamp>`.
-- **Manager clock**: if the manager's clock is behind, a fresh WinRM HTTPS certificate looks invalid. The tool waits until it becomes valid. Syncing the clock ends the wait.
+- **Two cores at once**: with *Don't touch the source* the old PRTG keeps running until you stop it.
+- **License activation** is per system: on a new server PRTG reports *No License (System Changed)* until Paessler activates it there. The source license is never changed.
+- **ID conflicts**: restoring devices into a PRTG that was set up independently can collide on object ids; use *New ids for conflicts* (history then does not follow those objects).
+- **History restore** only shows up for devices with the same ids as on the source (the source itself or a server restored from a full backup of it).
+- **Devices that only allow the old IP**, **remote probes** (core address), **service account** (clones run as LocalSystem), **target version** (equal or newer) — as before.
+- **Manager clock**: a WinRM HTTPS certificate looks invalid while the manager's clock is behind; the tool waits until it is valid.
+
+## Coming from PRTG Mover
+
+- The installer and `Setup-All.cmd` update an installation in `C:\PrtgMover` in place; servers, credentials and backups stay. Shortcuts and the start-with-Windows task are renamed to **PRTG Manager**; `Start-PrtgMover.ps1`, `Start-PrtgMover.cmd`, `Open-PrtgMover.ps1`, `tools\Enable-PrtgMoverRemoting.ps1` and `cli\Invoke-PrtgMover.ps1` remain as small forwarders so older shortcuts and tasks keep working.
+- Packages of PRTG Mover (format 1) are listed as *Full* and restore as before. Their VPN part is ignored here — import the package in **VPN Manager**. VPN-only packages (`VPN_*.zip`) are not listed in PRTG Manager any more.
+- Kept as technical identifiers: the work folder on the servers `C:\PrtgMover` (rollback copies live there), the VSS link prefix `PrtgMoverVss_`, environment variables `PRTGMOVER_*`, the GitHub repository name `prtg-mover`.
 
 ## Project layout
 
 ```
-install.ps1 / .cmd               installs, updates or removes PRTG Mover on the manager
-Start-PrtgMover.ps1 / .cmd       dashboard (HttpListener) + REST API
-cli\Invoke-PrtgMover.ps1         command-line front end
-src\PrtgMover.psm1               manager engine: inventory, credentials, sessions, transfers, jobs
-src\Remote\PrtgMover.Remote.ps1  code executed on source / target servers
-agent\PrtgMover-Agent.ps1        agent for the RDP connection method
-web\                             dashboard UI (vanilla HTML/CSS/JS, no build step)
-tools\Enable-PrtgMoverRemoting.ps1   WinRM method: run once on every server
-tools\Setup-Manager.ps1          optional manager preparation (TrustedHosts, dashboard on the LAN)
-tests\                           Pester 5 tests
-docs\                            architecture, troubleshooting
+install.ps1 / .cmd                  installs, updates or removes PRTG Manager
+Start-PrtgManager.ps1 / .cmd        dashboard (HttpListener) + REST API
+Open-PrtgManager.ps1                opens the running dashboard (or starts it)
+cli\Invoke-PrtgManager.ps1          command-line front end
+src\PrtgManager.psm1                manager engine: inventory, sessions, transfers, packages, jobs
+src\Remote\PrtgManager.Remote.ps1   code executed on the servers (backup, restore, parts, license, encryption)
+agent\PrtgManager-Agent.ps1         agent for the RDP connection method
+web\                                dashboard UI (vanilla HTML/CSS/JS)
+tools\Enable-PrtgManagerRemoting.ps1  WinRM method: run once on every server
+tools\Build-SetupAll.ps1            builds Setup-All.cmd (PRTG Manager + VPN Manager in one file)
+tests\                              Pester tests
 ```
-
-Runtime folders created automatically: `backups\`, `installers\`, `data\` (credentials, jobs, logs, agent files, staging) and `config\servers.json`.
 
 ## Development
 
@@ -358,9 +250,7 @@ Invoke-Pester -Path .\tests -Output Detailed
 Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error
 ```
 
-The suite covers the whole backup, transfer and restore path without any server: the `local` connection method runs the payload in the test process, and the RDP agent is started as a local process.
-
-CI (GitHub Actions, `windows-latest`, Windows PowerShell 5.1) parses every script, runs PSScriptAnalyzer and the Pester suite on each pull request and on each push to `main`.
+The suite runs the backup, transfer and restore path without any server (connection method *Local* and a local RDP agent), the configuration-part planner and merger on a sample PRTG configuration, encryption, package validation, license handling against a temporary registry key, and the dashboard API. CI (GitHub Actions, `windows-latest`, Windows PowerShell 5.1) parses every script, runs PSScriptAnalyzer and the Pester suite.
 
 ## License
 

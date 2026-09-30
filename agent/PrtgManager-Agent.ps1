@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    PRTG Mover agent - the "RDP" connection method (no WinRM needed).
+    PRTG Manager agent - the "RDP" connection method (no WinRM needed).
 
 .DESCRIPTION
     Run this INSIDE a Remote Desktop session that was opened from the dashboard (the
@@ -8,13 +8,13 @@
     \\tsclient\<drive>\...). The agent:
       - talks to the manager only through files in the redirected folder
         (data\agent\<serverId>\requests / responses / heartbeat.json)
-      - executes the same payload as WinRM mode (src\Remote\PrtgMover.Remote.ps1)
+      - executes the same payload as WinRM mode (src\Remote\PrtgManager.Remote.ps1)
       - moves backup packages / installers through the redirected drive
     Nothing is installed or configured on the server (no WinRM, no firewall change).
     Close the window (or Ctrl+C) when the job is finished.
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File "\\tsclient\F\PrtgMover\agent\PrtgMover-Agent.ps1" -ServerId 83585c7686
+    powershell -NoProfile -ExecutionPolicy Bypass -File "\\tsclient\F\PrtgMover\agent\PrtgManager-Agent.ps1" -ServerId 83585c7686
 #>
 [CmdletBinding()]
 param(
@@ -42,7 +42,7 @@ if (-not $isAdmin -and -not $AllowNonAdmin) {
 }
 
 # Load the payload (same code the WinRM mode ships to the server).
-$PayloadFile = Join-Path $Root 'src\Remote\PrtgMover.Remote.ps1'
+$PayloadFile = Join-Path $Root 'src\Remote\PrtgManager.Remote.ps1'
 . ([scriptblock]::Create((Get-Content -LiteralPath $PayloadFile -Raw -Encoding UTF8)))
 $script:PayloadLoaded = (Get-Item -LiteralPath $PayloadFile).LastWriteTimeUtc
 $version = 'dev'
@@ -77,7 +77,7 @@ Write-Heartbeat
 
 Clear-Host
 Write-Host ''
-Write-Host "  PRTG Mover agent $version" -ForegroundColor Cyan
+Write-Host "  PRTG Manager agent $version" -ForegroundColor Cyan
 Write-Host "  Server : $computerName  (inventory id $ServerId)"
 Write-Host "  Manager: $Root"
 Write-Host '  Status : connected - waiting for jobs from the dashboard. Keep this window open.' -ForegroundColor Green
@@ -107,7 +107,7 @@ try {
         if (-not $reachable) {
             if ($linkUp) {
                 $linkUp = $false
-                try { $Host.UI.RawUI.WindowTitle = 'PRTG Mover agent - WAITING for the RDP connection' } catch { }
+                try { $Host.UI.RawUI.WindowTitle = 'PRTG Manager agent - WAITING for the RDP connection' } catch { }
                 Write-Host ("[{0}] Link to the manager lost (RDP window closed or network drop). Still running - reconnect RDP and the job continues automatically." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Yellow
             }
             $lastWork = Get-Date
@@ -119,7 +119,7 @@ try {
             Write-AgentLog 'Link to the manager restored.'
             Write-Host ("[{0}] Link to the manager restored." -f (Get-Date -Format 'HH:mm:ss')) -ForegroundColor Green
         }
-        try { $Host.UI.RawUI.WindowTitle = "PRTG Mover agent - connected ($ServerId)" } catch { }
+        try { $Host.UI.RawUI.WindowTitle = "PRTG Manager agent - connected ($ServerId)" } catch { }
         $next = Get-ChildItem -LiteralPath $Req -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -First 1
         if (-not $next) { Start-Sleep -Milliseconds 700; continue }
 

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Installs or updates PRTG Mover on this computer (the manager) in one step.
+    Installs or updates PRTG Manager on this computer (the manager) in one step.
 
 .DESCRIPTION
     1. Checks the requirements (Windows, Windows PowerShell 5.1 or newer).
@@ -10,7 +10,7 @@
        and installers\ of an existing installation stay as they are.
     4. Unblocks the scripts and tests the installation: every script must parse and the
        dashboard must answer on a free port.
-    5. Creates the shortcuts "PRTG Mover" on the desktop and in the start menu.
+    5. Creates the shortcuts "PRTG Manager" on the desktop and in the start menu.
     6. Optional: prepares this computer for plain WinRM (-TrustedHosts, needs administrator
        rights; Windows asks for them).
     7. Starts the dashboard.
@@ -18,11 +18,12 @@
     Run it again at any time to update or repair the installation.
 
 .PARAMETER InstallPath
-    Where PRTG Mover is installed. Default: C:\PrtgMover.
+    Where PRTG Manager is installed. Default: C:\PrtgManager - or C:\PrtgMover when PRTG Mover (the
+    earlier name) is installed there: that installation is updated in place and keeps its data.
 
 .PARAMETER Source
     Folder or zip file with the program files. Default: the folder of this script if it
-    contains PRTG Mover, otherwise GitHub.
+    contains PRTG Manager, otherwise GitHub.
 
 .PARAMETER Repository
     GitHub repository (owner/name) used for the download.
@@ -54,7 +55,7 @@
     Folder for the autostart shortcut. Default: the Startup folder of the current user.
 
 .PARAMETER Local
-    PRTG Mover is installed on the PRTG server itself. Adds this computer to the server list
+    PRTG Manager is installed on the PRTG server itself. Adds this computer to the server list
     (connection method "Local"), starts the dashboard with administrator rights at logon
     (scheduled task) and makes the shortcut start it with administrator rights. Needs an
     elevated PowerShell.
@@ -70,14 +71,14 @@
     powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\install.ps1 -InstallPath D:\Tools\PrtgMover -TrustedHosts 10.0.0.10,10.0.0.20
+    powershell -ExecutionPolicy Bypass -File .\install.ps1 -InstallPath D:\Tools\PrtgManager -TrustedHosts 10.0.0.10,10.0.0.20
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
-    [string]$InstallPath = 'C:\PrtgMover',
+    [string]$InstallPath,
     [string]$Source,
     [string]$Repository = 'Digitalvps-Ir/prtg-mover',
     [string]$Branch = 'main',
@@ -96,9 +97,19 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:StepNo = 0
 $ProgramItems = 'agent', 'cli', 'docs', 'src', 'tools', 'web', 'tests', '.github', 'config\servers.example.json',
-    'Start-PrtgMover.ps1', 'Start-PrtgMover.cmd', 'Open-PrtgMover.ps1', 'install.ps1', 'install.cmd', 'VERSION', 'README.md', 'README.fa.md', 'CHANGELOG.md', 'LICENSE', '.gitignore', '.gitattributes'
-$RequiredFiles = 'Start-PrtgMover.ps1', 'src\PrtgMover.psm1', 'src\Remote\PrtgMover.Remote.ps1', 'web\index.html', 'web\app.js', 'VERSION'
+    'Start-PrtgManager.ps1', 'Start-PrtgManager.cmd', 'Open-PrtgManager.ps1', 'install.ps1', 'install.cmd', 'VERSION', 'README.md', 'README.fa.md', 'CHANGELOG.md', 'LICENSE', '.gitignore', '.gitattributes',
+    # the earlier names (PRTG Mover) forward to the new scripts: tasks and shortcuts made by older versions keep working
+    'Start-PrtgMover.ps1', 'Start-PrtgMover.cmd', 'Open-PrtgMover.ps1'
+$RequiredFiles = 'Start-PrtgManager.ps1', 'src\PrtgManager.psm1', 'src\Remote\PrtgManager.Remote.ps1', 'web\index.html', 'web\app.js', 'VERSION'
 $DataFolders = 'config', 'data', 'backups', 'installers'
+$OldLogonTask = 'PRTG Mover Dashboard'
+$OldLinkName = 'PRTG Mover.lnk'
+
+function Test-OldProgramFolder {
+    <# An installation made under the earlier name PRTG Mover. #>
+    param([string]$Path)
+    return ($Path -and (Test-Path -LiteralPath (Join-Path $Path 'Start-PrtgMover.ps1')) -and (Test-Path -LiteralPath (Join-Path $Path 'src\PrtgMover.psm1')))
+}
 
 function Write-Step { param([string]$Text) $script:StepNo++; Write-Host ("[{0}] {1}" -f $script:StepNo, $Text) -ForegroundColor Cyan }
 function Write-Ok { param([string]$Text) Write-Host "    $Text" -ForegroundColor Green }
@@ -122,7 +133,7 @@ function Find-Tool {
 
 function Get-ShortcutFolders {
     if ($ShortcutFolder) { return $ShortcutFolder }
-    return @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('Programs')) 'PRTG Mover'))
+    return @([Environment]::GetFolderPath('Desktop'), (Join-Path ([Environment]::GetFolderPath('Programs')) 'PRTG Manager'))
 }
 
 function Test-IsAdmin {
@@ -139,7 +150,7 @@ function Get-FreePort {
 function Get-ProgramFromGitHub {
     <# Downloads the program into a temporary folder and returns that folder. #>
     param([string]$Repo, [string]$Ref)
-    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('prtg-mover-' + [guid]::NewGuid().ToString('N'))
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('prtg-manager-' + [guid]::NewGuid().ToString('N'))
     $tried = @()
     $git = Find-Tool 'git.exe' @("$env:ProgramFiles\Git\cmd\git.exe")
     if ($git) {
@@ -169,7 +180,7 @@ function Get-ProgramFromGitHub {
         $inner = Get-ChildItem -LiteralPath $tmp -Directory | Select-Object -First 1
         if ($inner -and (Test-ProgramFolder $inner.FullName)) { return $inner.FullName }
     } catch { Write-Info "Plain download failed: $($_.Exception.Message)" }
-    throw ("Could not download PRTG Mover from GitHub (tried: {0}). The repository '{1}' is private: sign in first (git or 'gh auth login'), or download the ZIP from GitHub in your browser, extract it and run install.ps1 from that folder." -f ($tried -join ', '), $Repo)
+    throw ("Could not download PRTG Manager from GitHub (tried: {0}). The repository '{1}' is private: sign in first (git or 'gh auth login'), or download the ZIP from GitHub in your browser, extract it and run install.ps1 from that folder." -f ($tried -join ', '), $Repo)
 }
 
 function Copy-Program {
@@ -202,10 +213,10 @@ function Test-Installation {
         if ($errors) { throw "Script '$($f.FullName)' is damaged: $($errors[0].Message)" }
     }
     $testPort = Get-FreePort
-    $testData = Join-Path ([IO.Path]::GetTempPath()) ('prtg-mover-selftest-' + [guid]::NewGuid().ToString('N'))
+    $testData = Join-Path ([IO.Path]::GetTempPath()) ('prtg-manager-selftest-' + [guid]::NewGuid().ToString('N'))
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $p = Start-Process -FilePath $ps -PassThru -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Path 'Start-PrtgMover.ps1')`"",
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $Path 'Start-PrtgManager.ps1')`"",
         '-Port', $testPort, '-NoBrowser', '-Quiet', '-DataRoot', "`"$testData`"")
     try {
         $info = $null
@@ -216,7 +227,7 @@ function Test-Installation {
         }
         if (-not $info) { throw 'The dashboard did not answer within 45 seconds.' }
         $page = Invoke-WebRequest -Uri "http://localhost:$testPort/" -UseBasicParsing -TimeoutSec 10
-        if ($page.Content -notmatch 'PRTG Mover') { throw 'The dashboard page is not served correctly.' }
+        if ($page.Content -notmatch 'PRTG Manager') { throw 'The dashboard page is not served correctly.' }
         return [string]$info.version
     } finally {
         if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
@@ -231,17 +242,17 @@ function New-Shortcuts {
     $made = @()
     foreach ($folder in (Get-ShortcutFolders)) {
         New-Item -ItemType Directory -Force -Path $folder | Out-Null
-        $lnk = Join-Path $folder 'PRTG Mover.lnk'
+        $lnk = Join-Path $folder 'PRTG Manager.lnk'
         $s = $shell.CreateShortcut($lnk)
         $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Path 'Start-PrtgMover.ps1')`" -Port $Port"
+        $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Path 'Start-PrtgManager.ps1')`" -Port $Port"
         if ($Local) {
             # local mode: the dashboard runs from the start of the computer; the shortcut opens it (and starts the task when needed)
-            $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Open-PrtgMover.ps1')`" -Port $Port"
+            $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Open-PrtgManager.ps1')`" -Port $Port"
             $s.WindowStyle = 7
         }
         $s.WorkingDirectory = $Path
-        $s.Description = 'PRTG Mover dashboard'
+        $s.Description = 'PRTG Manager dashboard'
         $s.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll') + ',109'
         $s.Save()
         if ($Local) {
@@ -253,13 +264,13 @@ function New-Shortcuts {
     return $made
 }
 
-$LogonTask = 'PRTG Mover Dashboard'
+$LogonTask = 'PRTG Manager Dashboard'
 
 function Test-OwnLogonTask {
     param([string]$Path)
     $t = Get-ScheduledTask -TaskName $LogonTask -ErrorAction SilentlyContinue
     if (-not $t) { return $false }
-    return [bool](@($t.Actions | Where-Object { "$($_.Arguments)".IndexOf("$($Path.TrimEnd('\'))\Start-PrtgMover.", [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count)
+    return [bool](@($t.Actions | Where-Object { "$($_.Arguments)".IndexOf("$($Path.TrimEnd('\'))\Start-PrtgManager.", [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count)
 }
 
 function Set-LogonTask {
@@ -270,7 +281,7 @@ function Set-LogonTask {
     #>
     param([string]$Path)
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $Path -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Start-PrtgMover.ps1')`" -Port $Port -NoBrowser -Quiet"
+    $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $Path -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Start-PrtgManager.ps1')`" -Port $Port -NoBrowser -Quiet"
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     # Credentials that a user saved in this installation can only be read by that user (Windows DPAPI).
     # Then the dashboard has to keep running as that user, which is only possible from the logon on.
@@ -285,14 +296,14 @@ function Set-LogonTask {
         $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $me
         $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest
-        Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Mover dashboard with administrator rights at logon (local mode).' -Force | Out-Null
+        Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Manager dashboard with administrator rights at logon (local mode).' -Force | Out-Null
         Write-Note "$($saved.Count) saved server credential(s) can only be read by $me. So the dashboard starts when $me logs on, not with the computer."
         Write-Note 'For a start with the computer: delete the servers that have a saved credential, run the installation with -Local again and enter the credentials again in the dashboard.'
         return "task '$LogonTask': starts at logon of $me, with administrator rights"
     }
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Mover dashboard when the computer starts (local mode).' -Force | Out-Null
+    Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Manager dashboard when the computer starts (local mode).' -Force | Out-Null
     return "task '$LogonTask': starts with the computer, without logon"
 }
 
@@ -301,7 +312,7 @@ function Start-LocalDashboard {
     Start-ScheduledTask -TaskName $LogonTask
     $until = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $until) {
-        try { if ((Invoke-RestMethod -Uri "http://localhost:$Port/api/info" -TimeoutSec 3).product -eq 'PRTG Mover') { return $true } } catch { Start-Sleep -Milliseconds 700 }
+        try { if ((Invoke-RestMethod -Uri "http://localhost:$Port/api/info" -TimeoutSec 3).product -in 'PRTG Manager', 'PRTG Mover') { return $true } } catch { Start-Sleep -Milliseconds 700 }
     }
     return $false
 }
@@ -309,7 +320,7 @@ function Start-LocalDashboard {
 function Add-LocalServer {
     <# Adds this computer to the server list of the installation (connection method "local"), once. #>
     param([string]$Path)
-    Import-Module (Join-Path $Path 'src\PrtgMover.psm1') -Force -DisableNameChecking
+    Import-Module (Join-Path $Path 'src\PrtgManager.psm1') -Force -DisableNameChecking
     Set-PmRoot -Path $Path
     $have = @(Get-PmServers | ForEach-Object { $_ } | Where-Object { $_.transport -eq 'local' })
     if ($have.Count) { return "this computer is already in the server list ('$($have[0].name)')" }
@@ -319,7 +330,7 @@ function Add-LocalServer {
 
 function Get-AutostartShortcut {
     $folder = if ($StartupFolder) { $StartupFolder } else { [Environment]::GetFolderPath('Startup') }
-    return (Join-Path $folder 'PRTG Mover.lnk')
+    return (Join-Path $folder 'PRTG Manager.lnk')
 }
 
 function Set-AutostartShortcut {
@@ -329,49 +340,92 @@ function Set-AutostartShortcut {
     New-Item -ItemType Directory -Force -Path (Split-Path $lnk -Parent) | Out-Null
     $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
     $s.TargetPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Path 'Start-PrtgMover.ps1')`" -Port $Port -NoBrowser"
+    $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $Path 'Start-PrtgManager.ps1')`" -Port $Port -NoBrowser"
     $s.WorkingDirectory = $Path
     $s.WindowStyle = 7
-    $s.Description = 'PRTG Mover dashboard (start with Windows)'
+    $s.Description = 'PRTG Manager dashboard (start with Windows)'
     $s.IconLocation = (Join-Path $env:SystemRoot 'System32\imageres.dll') + ',109'
     $s.Save()
     return $lnk
 }
 
 function Test-OwnShortcut {
-    <# True when the shortcut starts PRTG Mover from this installation folder. #>
+    <# True when the shortcut starts PRTG Manager from this installation folder. #>
     param([string]$Link, [string]$Path)
     if (-not (Test-Path -LiteralPath $Link)) { return $false }
     $s = (New-Object -ComObject WScript.Shell).CreateShortcut($Link)
     $folder = $Path.TrimEnd('\')
     $ic = [StringComparison]::OrdinalIgnoreCase
-    return ("$($s.WorkingDirectory)".TrimEnd('\').Equals($folder, $ic)) -or ("$($s.Arguments)".IndexOf("$folder\Start-PrtgMover.", $ic) -ge 0) -or ("$($s.TargetPath)".StartsWith("$folder\", $ic))
+    return ("$($s.WorkingDirectory)".TrimEnd('\').Equals($folder, $ic)) -or ("$($s.Arguments)".IndexOf("$folder\Start-PrtgManager.", $ic) -ge 0) -or ("$($s.TargetPath)".StartsWith("$folder\", $ic))
 }
 
 function Remove-Shortcuts {
     <# Removes the shortcuts of THIS installation. A shortcut that starts another folder is left alone. #>
     param([string]$Path)
     $removed = @()
-    $links = @(Get-AutostartShortcut) + @(Get-ShortcutFolders | ForEach-Object { Join-Path $_ 'PRTG Mover.lnk' })
+    $links = @(Get-AutostartShortcut) + @(Get-OldAutostartShortcut) + @(Get-ShortcutFolders | ForEach-Object { Join-Path $_ 'PRTG Manager.lnk'; Join-Path $_ $OldLinkName }) + @(Get-OldShortcutFolders | ForEach-Object { Join-Path $_ $OldLinkName })
     foreach ($lnk in $links) {
         if (Test-OwnShortcut -Link $lnk -Path $Path) { Remove-Item -LiteralPath $lnk -Force; $removed += $lnk }
     }
-    foreach ($folder in (Get-ShortcutFolders)) {
-        if ((Split-Path $folder -Leaf) -eq 'PRTG Mover' -and (Test-Path -LiteralPath $folder) -and -not (Get-ChildItem -LiteralPath $folder -Force)) { Remove-Item -LiteralPath $folder -Force }
+    foreach ($folder in @(Get-ShortcutFolders) + @(Get-OldShortcutFolders)) {
+        if ((Split-Path $folder -Leaf) -in 'PRTG Manager', 'PRTG Mover' -and (Test-Path -LiteralPath $folder) -and -not (Get-ChildItem -LiteralPath $folder -Force)) { Remove-Item -LiteralPath $folder -Force }
     }
     return $removed
 }
 
+function Get-OldAutostartShortcut {
+    $folder = if ($StartupFolder) { $StartupFolder } else { [Environment]::GetFolderPath('Startup') }
+    return (Join-Path $folder $OldLinkName)
+}
+
+function Get-OldShortcutFolders {
+    if ($ShortcutFolder) { return @() }
+    return @((Join-Path ([Environment]::GetFolderPath('Programs')) 'PRTG Mover'))
+}
+
+function Update-OldNames {
+    <#
+        An installation made under the earlier name PRTG Mover: its own shortcuts "PRTG Mover" (desktop, start
+        menu, Startup) and its task "PRTG Mover Dashboard" are replaced by the ones named PRTG Manager.
+        Shortcuts and tasks of other folders are left alone. Returns what it did.
+    #>
+    param([string]$Path)
+    $done = @()
+    $hadAutostart = $false
+    foreach ($lnk in @(Get-OldAutostartShortcut) + @(Get-ShortcutFolders | ForEach-Object { Join-Path $_ $OldLinkName }) + @(Get-OldShortcutFolders | ForEach-Object { Join-Path $_ $OldLinkName })) {
+        if (Test-OwnShortcut -Link $lnk -Path $Path) {
+            if ($lnk -eq (Get-OldAutostartShortcut)) { $hadAutostart = $true }
+            Remove-Item -LiteralPath $lnk -Force; $done += "old shortcut removed: $lnk"
+        }
+    }
+    foreach ($folder in (Get-OldShortcutFolders)) { if ((Test-Path -LiteralPath $folder) -and -not (Get-ChildItem -LiteralPath $folder -Force)) { Remove-Item -LiteralPath $folder -Force } }
+    $hadTask = $false
+    $old = Get-ScheduledTask -TaskName $OldLogonTask -ErrorAction SilentlyContinue
+    if ($old -and @($old.Actions | Where-Object { "$($_.Arguments)".IndexOf("$($Path.TrimEnd('\'))\Start-Prtg", [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count) {
+        if (-not (Test-IsAdmin)) { $done += "the old task '$OldLogonTask' stays (removing it needs administrator rights) - it still starts the dashboard through Start-PrtgMover.ps1" }
+        else {
+            try { Stop-ScheduledTask -TaskName $OldLogonTask -ErrorAction SilentlyContinue } catch { }
+            Unregister-ScheduledTask -TaskName $OldLogonTask -Confirm:$false
+            $hadTask = $true; $done += "old task '$OldLogonTask' replaced by '$LogonTask'"
+        }
+    }
+    return [pscustomobject]@{ Done = $done; HadAutostart = $hadAutostart; HadTask = $hadTask }
+}
+
 # ------------------------------------------------------------------ start
 Write-Host ''
-Write-Host "  PRTG Mover - $(if ($Uninstall) { 'uninstall' } else { 'installation' })" -ForegroundColor Cyan
+Write-Host "  PRTG Manager - $(if ($Uninstall) { 'uninstall' } else { 'installation' })" -ForegroundColor Cyan
 Write-Host "  Folder: $InstallPath"
 Write-Host ''
 
 Write-Step 'Checking this computer'
-if ($env:OS -ne 'Windows_NT') { throw 'PRTG Mover needs Windows.' }
+if ($env:OS -ne 'Windows_NT') { throw 'PRTG Manager needs Windows.' }
 if ($PSVersionTable.PSVersion -lt [version]'5.1') { throw "Windows PowerShell 5.1 or newer is needed (found $($PSVersionTable.PSVersion)). Install Windows Management Framework 5.1." }
 Write-Ok "Windows PowerShell $($PSVersionTable.PSVersion), user $env:USERDOMAIN\$env:USERNAME$(if (Test-IsAdmin) { ' (administrator)' })"
+if (-not $InstallPath) {
+    # an installation under the earlier name is updated where it is, so its data stays with it
+    $InstallPath = if (Test-OldProgramFolder 'C:\PrtgMover') { 'C:\PrtgMover' } else { 'C:\PrtgManager' }
+}
 $InstallPath = [IO.Path]::GetFullPath($InstallPath).TrimEnd('\')
 if ($Local -and -not $Uninstall -and -not (Test-IsAdmin)) { throw 'Local mode (-Local) needs administrator rights: backup and restore of this computer work with snapshots, the registry and services. Start the installation with "Run as administrator".' }
 
@@ -381,8 +435,8 @@ if ($Uninstall) {
     $r = @(Remove-Shortcuts -Path $InstallPath)
     if ($r.Count) { $r | ForEach-Object { Write-Ok "removed $_" } } else { Write-Info 'no shortcuts found' }
     Write-Step 'Removing program files'
-    if (-not (Test-ProgramFolder $InstallPath)) { Write-Note "No PRTG Mover installation in $InstallPath - nothing removed."; return }
-    $running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like "*$InstallPath\Start-PrtgMover.ps1*" })
+    if (-not (Test-ProgramFolder $InstallPath)) { Write-Note "No PRTG Manager installation in $InstallPath - nothing removed."; return }
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like "*$InstallPath\Start-PrtgManager.ps1*" -or $_.CommandLine -like "*$InstallPath\Start-PrtgMover.ps1*" })
     if ($running.Count) { throw 'The dashboard is running from this folder. Close its window first.' }
     foreach ($item in $ProgramItems) {
         $t = Join-Path $InstallPath $item
@@ -401,13 +455,13 @@ if ($Source) {
     if (-not (Test-Path -LiteralPath $Source)) { throw "Source '$Source' does not exist." }
     if ((Get-Item -LiteralPath $Source).PSIsContainer) { $from = (Resolve-Path -LiteralPath $Source).Path }
     else {
-        $temporary = Join-Path ([IO.Path]::GetTempPath()) ('prtg-mover-' + [guid]::NewGuid().ToString('N'))
+        $temporary = Join-Path ([IO.Path]::GetTempPath()) ('prtg-manager-' + [guid]::NewGuid().ToString('N'))
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [IO.Compression.ZipFile]::ExtractToDirectory((Resolve-Path -LiteralPath $Source).Path, $temporary)
         $from = $temporary
         if (-not (Test-ProgramFolder $from)) { $inner = Get-ChildItem -LiteralPath $temporary -Directory | Select-Object -First 1; if ($inner) { $from = $inner.FullName } }
     }
-    if (-not (Test-ProgramFolder $from)) { throw "'$Source' does not contain PRTG Mover." }
+    if (-not (Test-ProgramFolder $from)) { throw "'$Source' does not contain PRTG Manager." }
     Write-Ok "from $Source"
 } elseif ($PSScriptRoot -and (Test-ProgramFolder $PSScriptRoot)) {
     $from = $PSScriptRoot.TrimEnd('\')
@@ -423,7 +477,8 @@ try {
     $before = $null
     $vf = Join-Path $InstallPath 'VERSION'
     if (Test-Path -LiteralPath $vf) { $before = ([IO.File]::ReadAllText($vf)).Trim() }
-    $running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*$InstallPath\Start-PrtgMover.ps1*" -and $_.CommandLine -notlike '*-DataRoot*' })
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { ($_.CommandLine -like "*$InstallPath\Start-PrtgManager.ps1*" -or $_.CommandLine -like "*$InstallPath\Start-PrtgMover.ps1*") -and $_.CommandLine -notlike '*-DataRoot*' })
+    $upgradeFromOld = Test-OldProgramFolder $InstallPath
     if ($from -ne $InstallPath) {
         if ($running.Count) { throw "The dashboard is running from $InstallPath. Close its window (in local mode: stop the task '$LogonTask' in an elevated PowerShell with Stop-ScheduledTask), then run the installation again." }
         Copy-Program -From $from -To $InstallPath
@@ -432,7 +487,13 @@ try {
     foreach ($d in $DataFolders) { New-Item -ItemType Directory -Force -Path (Join-Path $InstallPath $d) | Out-Null }
     $kept = @()
     if (Test-Path -LiteralPath (Join-Path $InstallPath 'config\servers.json')) { $kept += 'server list' }
-    if (Get-ChildItem -LiteralPath (Join-Path $InstallPath 'backups') -Filter '*.zip' -ErrorAction SilentlyContinue) { $kept += 'backups' }
+    if (Get-ChildItem -LiteralPath (Join-Path $InstallPath 'backups') -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.zip', '.pmenc' }) { $kept += 'backups' }
+    # program files of the earlier name that the new version does not have any more
+    foreach ($gone in 'src\PrtgMover.psm1', 'src\Remote\PrtgMover.Remote.ps1', 'agent\PrtgMover-Agent.ps1', 'cli\Invoke-PrtgMover.ps1', 'tools\Enable-PrtgMoverRemoting.ps1', 'tests\PrtgMover.Tests.ps1') {
+        $g = Join-Path $InstallPath $gone
+        if ((Test-Path -LiteralPath $g) -and -not (Test-Path -LiteralPath (Join-Path $from $gone))) { Remove-Item -LiteralPath $g -Force }
+    }
+    if ($upgradeFromOld) { Write-Ok 'updated from PRTG Mover (the earlier name) - your data stays in this folder' }
     if ($kept.Count) { Write-Ok "your data was kept: $($kept -join ', ')" }
     Get-ChildItem -LiteralPath $InstallPath -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.ps1', '.psm1', '.cmd' } | Unblock-File -ErrorAction SilentlyContinue
     Write-Ok 'scripts unblocked'
@@ -446,13 +507,17 @@ try {
     else { New-Shortcuts -Path $InstallPath | ForEach-Object { Write-Ok $_ } }
 
     Write-Step 'Start with Windows'
+    $old = Update-OldNames -Path $InstallPath
+    foreach ($d in $old.Done) { Write-Ok $d }
+    if ($old.HadAutostart -and -not $NoAutostart -and -not $Local) { $Autostart = $true }
+    if ($old.HadTask -and -not $NoAutostart) { $Local = $true }
     $auto = Get-AutostartShortcut
     $exists = Test-Path -LiteralPath $auto
     $own = Test-OwnShortcut -Link $auto -Path $InstallPath
     if ($NoAutostart) {
         if (Test-OwnLogonTask -Path $InstallPath) { Unregister-ScheduledTask -TaskName $LogonTask -Confirm:$false; Write-Ok 'logon task removed' }
         if ($own) { Remove-Item -LiteralPath $auto -Force; Write-Ok 'switched off' }
-        elseif ($exists) { Write-Note 'another installation of PRTG Mover starts with Windows - left as it is' }
+        elseif ($exists) { Write-Note 'another installation of PRTG Manager starts with Windows - left as it is' }
         else { Write-Info 'was not switched on' }
     } elseif ($Local) {
         # with administrator rights: a scheduled task instead of the Startup shortcut
@@ -463,12 +528,12 @@ try {
         Write-Ok "the dashboard starts when you log on ($(Set-AutostartShortcut -Path $InstallPath))"
     } elseif ($own) {
         Write-Ok "the dashboard starts when you log on ($(Set-AutostartShortcut -Path $InstallPath))"
-    } elseif ($exists) { Write-Info 'another installation of PRTG Mover starts with Windows - left as it is' }
+    } elseif ($exists) { Write-Info 'another installation of PRTG Manager starts with Windows - left as it is' }
     else { Write-Info 'not switched on (use -Autostart)' }
 
     Write-Step 'This computer as a server (local mode)'
     if ($Local) { Write-Ok (Add-LocalServer -Path $InstallPath) }
-    else { Write-Info 'skipped - use -Local when PRTG Mover is installed on the PRTG server itself' }
+    else { Write-Info 'skipped - use -Local when PRTG Manager is installed on the PRTG server itself' }
 
     Write-Step 'WinRM on this computer'
     if (-not $TrustedHosts.Count) { Write-Info 'skipped - only needed for servers reached over plain WinRM (HTTP). RDP and WinRM over HTTPS need nothing here.' }
@@ -492,16 +557,16 @@ try {
     elseif ($running.Count) { Write-Ok "the dashboard is already running: http://localhost:$Port/" }
     elseif ($Local -and -not $NoAutostart) {
         if (Start-LocalDashboard) { Write-Ok "http://localhost:$Port/ is up (started by the task '$LogonTask')"; Start-Process "http://localhost:$Port/" }
-        else { Write-Note "The dashboard did not answer within 60 seconds. Open it with the 'PRTG Mover' shortcut." }
+        else { Write-Note "The dashboard did not answer within 60 seconds. Open it with the 'PRTG Manager' shortcut." }
     } else {
         Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -WorkingDirectory $InstallPath -ArgumentList @(
-            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$(Join-Path $InstallPath 'Start-PrtgMover.ps1')`"", '-Port', $Port)
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-NoExit', '-File', "`"$(Join-Path $InstallPath 'Start-PrtgManager.ps1')`"", '-Port', $Port)
         Write-Ok "http://localhost:$Port/ opens in your browser"
     }
 
     Write-Host ''
-    Write-Host "  PRTG Mover $version is installed in $InstallPath" -ForegroundColor Green
-    Write-Host '  Open it with the "PRTG Mover" shortcut (it opens the running dashboard or starts it). Run install.ps1 again to update.'
+    Write-Host "  PRTG Manager $version is installed in $InstallPath" -ForegroundColor Green
+    Write-Host '  Open it with the "PRTG Manager" shortcut (it opens the running dashboard or starts it). Run install.ps1 again to update.'
     Write-Host ''
 } finally {
     if ($temporary -and (Test-Path -LiteralPath $temporary)) { Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue }

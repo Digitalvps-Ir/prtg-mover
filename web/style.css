@@ -194,3 +194,22 @@ dialog::backdrop { background: rgba(10, 12, 16, .45); }
   .grid2, .jobs-layout { grid-template-columns: 1fr; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
+
+/* ---- backup types, restore wizard, license page */
+.segmented.wide { display: flex; flex-wrap: wrap; }
+.segmented.wide label { flex: 1 1 auto; text-align: center; }
+dialog.wide { width: min(980px, calc(100vw - 32px)); }
+.sub-head { font-size: 13.5px; margin: 16px 0 6px; font-weight: 600; }
+.preview { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; max-height: 360px; overflow: auto; background: var(--surface-2); font-size: 13px; }
+.preview .table td, .preview .table th { padding: 6px 10px; }
+.preview ul { margin: 4px 0 8px 18px; padding: 0; }
+.preview .blocker { color: var(--err); font-weight: 600; }
+.lic-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+ul.plain { margin: 6px 0 0 18px; padding: 0; font-size: 13px; }
+ul.plain li { margin: 4px 0; }
+.danger-confirm { background: var(--err-soft); border-radius: 8px; padding: 8px 10px; }
+.counts { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.btn.busy { position: relative; pointer-events: none; opacity: .7; }
+.btn.busy::after { content: ' …'; }
+.filter-row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.toast .hint-line { display: block; opacity: .9; font-size: 12.5px; margin-top: 4px; }

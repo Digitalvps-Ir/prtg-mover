@@ -12,7 +12,7 @@
     Hosts or IPs of the source/target servers, e.g. 10.0.0.10,10.0.0.20 . Use '*' to trust all (not recommended).
 
 .PARAMETER DashboardPort
-    When set, reserves http://+:<port>/ for the current user so Start-PrtgMover.ps1 -ListenAll works without admin rights.
+    When set, reserves http://+:<port>/ for the current user so Start-PrtgManager.ps1 -ListenAll works without admin rights.
 
 .EXAMPLE
     .\tools\Setup-Manager.ps1 -TrustedHosts 10.0.0.10,10.0.0.20
@@ -46,14 +46,14 @@ Write-Host '[4/4] Dashboard URL ACL...' -ForegroundColor Cyan
 if ($DashboardPort -gt 0) {
     $user = "$env:USERDOMAIN\$env:USERNAME"
     & netsh http add urlacl url="http://+:$DashboardPort/" user="$user" | Out-Null
-    New-NetFirewallRule -DisplayName "PRTG Mover dashboard $DashboardPort" -Direction Inbound -Protocol TCP -LocalPort $DashboardPort -Action Allow -Profile Domain, Private | Out-Null
+    New-NetFirewallRule -DisplayName "PRTG Manager dashboard $DashboardPort" -Direction Inbound -Protocol TCP -LocalPort $DashboardPort -Action Allow -Profile Domain, Private | Out-Null
     Write-Host "      http://+:$DashboardPort/ reserved for $user and firewall opened (Domain/Private)."
 } else { Write-Host '      skipped (dashboard listens on localhost only)' -ForegroundColor DarkGray }
 
 $ps = (Get-ExecutionPolicy -Scope CurrentUser)
 if ($ps -in 'Restricted', 'AllSigned', 'Undefined' -and (Get-ExecutionPolicy) -in 'Restricted', 'AllSigned') {
     Write-Host "Execution policy is '$((Get-ExecutionPolicy))'. Start the dashboard with:" -ForegroundColor Yellow
-    Write-Host '   powershell -ExecutionPolicy Bypass -File .\Start-PrtgMover.ps1' -ForegroundColor Yellow
+    Write-Host '   powershell -ExecutionPolicy Bypass -File .\Start-PrtgManager.ps1' -ForegroundColor Yellow
 }
 Write-Host ''
-Write-Host 'Manager ready. Start the dashboard with .\Start-PrtgMover.ps1' -ForegroundColor Green
+Write-Host 'Manager ready. Start the dashboard with .\Start-PrtgManager.ps1' -ForegroundColor Green

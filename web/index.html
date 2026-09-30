@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
 
-  <title>PRTG Mover</title>
+  <title>PRTG Manager</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
 </head>
@@ -13,13 +13,14 @@
   <aside class="sidebar">
     <div class="brand">
       <img src="favicon.svg" alt="" width="28" height="28">
-      <div><strong>PRTG Mover</strong><span id="version">…</span></div>
+      <div><strong>PRTG Manager</strong><span id="version">…</span></div>
     </div>
     <nav>
       <a href="#overview" data-view="overview" class="active">Overview</a>
       <a href="#servers" data-view="servers">Servers</a>
       <a href="#migrate" data-view="migrate">Backup &amp; Migrate</a>
       <a href="#backups" data-view="backups">Backups</a>
+      <a href="#license" data-view="license">License</a>
       <a href="#jobs" data-view="jobs">Jobs <span class="pill" id="runningPill" hidden>0</span></a>
       <a href="#logs" data-view="logs">Logs &amp; Audit</a>
     </nav>
@@ -31,8 +32,8 @@
     <!-- ======================= OVERVIEW -->
     <section id="view-overview" class="view active">
       <header class="page-head">
-        <div><h1>Overview</h1><p class="muted">Move PRTG, Windows VPN connections and desktop files between Windows servers.</p></div>
-        <div class="actions"><button class="btn primary" data-goto="migrate">New migration</button></div>
+        <div><h1>Overview</h1><p class="muted">Back up, restore and migrate PRTG servers: the whole PRTG, its history, devices, notifications, triggers and license.</p></div>
+        <div class="actions"><button class="btn primary" data-goto="migrate">New backup or migration</button></div>
       </header>
       <div class="stats">
         <div class="stat"><span>Servers</span><strong id="statServers">–</strong></div>
@@ -44,11 +45,11 @@
         <div class="card">
           <h2>How it works</h2>
           <ol class="steps">
-            <li><b>Servers</b> — add the source PRTG server and the target(s). Choose the connection method: <span class="badge info">RDP</span> (nothing to configure on the server) or <span class="badge info">WinRM</span>.</li>
-            <li><b>Test</b> — <i>Test RDP</i> / <i>Test WinRM</i>. A server is <span class="badge ok">PASS</span> when at least one method works.</li>
-            <li><b>Agent</b> (RDP method) — press <i>RDP</i>, log in, run the copied command in an elevated PowerShell. Keep the RDP window open or minimized — <b>do not close it</b> while a job runs.</li>
-            <li><b>Migrate</b> — pre-flight checks → copy PRTG from a snapshot straight to this manager (source untouched) → package → restore on each target → start PRTG and verify it is fully up.</li>
-            <li><b>Backups / Jobs / Logs</b> — download the package, follow every step live, resume failed jobs, download diagnostics.</li>
+            <li><b>Servers</b> — add the source PRTG server and the target(s). Choose the connection method: <span class="badge info">Local</span> (PRTG Manager on the PRTG server), <span class="badge info">RDP</span> or <span class="badge info">WinRM</span>.</li>
+            <li><b>Test</b> — a server is <span class="badge ok">PASS</span> when at least one method works.</li>
+            <li><b>Backup &amp; Migrate</b> — a full backup / migration, or only history, devices, notifications, triggers or the license.</li>
+            <li><b>Backups</b> — validate, inspect, download and restore every package, always with a preview first.</li>
+            <li><b>License</b> — see the license state, enter a trial or bought key, back it up, restore or remove it.</li>
           </ol>
         </div>
         <div class="card">
@@ -65,7 +66,7 @@
         <div class="actions">
           <button class="btn" id="checkPortsBtn">Check ports</button>
           <button class="btn" id="testAllBtn">Test all</button>
-          <button class="btn" id="addLocalBtn" title="PRTG Mover is installed on the PRTG server itself: back up and restore this computer without any connection">Add this computer</button>
+          <button class="btn" id="addLocalBtn" title="PRTG Manager is installed on the PRTG server itself: back up and restore this computer without any connection">Add this computer</button>
           <button class="btn primary" id="addServerBtn">Add server</button>
         </div>
       </header>
@@ -75,66 +76,94 @@
       </table></div></div>
     </section>
 
-    <!-- ======================= MIGRATE -->
+    <!-- ======================= BACKUP & MIGRATE -->
     <section id="view-migrate" class="view">
       <header class="page-head">
-        <div><h1>Backup &amp; Migrate</h1><p class="muted">One source, any number of targets. The package is always kept on the manager and can be downloaded.</p></div>
+        <div><h1>Backup &amp; Migrate</h1><p class="muted">One source, any number of targets. Every package is kept on the manager and can be validated, inspected, downloaded and restored.</p></div>
       </header>
       <form id="migrateForm" class="grid2">
         <div class="card">
           <h2>1 · Source</h2>
           <label class="field"><span>Source server</span><select name="sourceId" required></select></label>
-          <h2 class="mt">2 · Targets</h2>
-          <div id="targetList" class="checklist"></div>
-          <p class="hint">Leave all targets unchecked to create a backup only.</p>
-          <h2 class="mt">3 · What to include</h2>
-          <div class="group">
-            <label class="check"><input type="checkbox" name="IncludePrtg" checked> <span><b>PRTG</b> — configuration (all sensors, notifications, triggers, users, maps, reports…), registry, SSL certificate, custom sensors, lookups, MIBs</span></label>
-            <label class="check sub"><input type="checkbox" name="IncludeProgram" checked> Clone the <b>PRTG program</b> (program files + services) — no installer needed on the target</label>
-            <label class="check sub"><input type="checkbox" name="CopyLicense" checked> <span>Copy the source <b>license</b> <span class="muted">(PRTG binds a license to the server it was activated on: on the new server it has to be activated again in PRTG → Setup → License Information)</span></span></label>
-            <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> <b>Historic monitoring data</b> (graphs &amp; tables of the past)</label>
-            <label class="check sub"><input type="checkbox" name="IncludeLogs"> PRTG log files <span class="muted">(not needed — usually large)</span></label>
-            <label class="check sub"><input type="checkbox" name="IncludeAutoBackups"> Old automatic configuration copies <span class="muted">(not needed)</span></label>
+          <h2 class="mt">2 · What to back up</h2>
+          <div class="segmented wide" id="backupTypes">
+            <label><input type="radio" name="backupType" value="full" checked><span>Full</span></label>
+            <label><input type="radio" name="backupType" value="graphs"><span>History</span></label>
+            <label><input type="radio" name="backupType" value="devices"><span>Devices</span></label>
+            <label><input type="radio" name="backupType" value="notifications"><span>Notifications</span></label>
+            <label><input type="radio" name="backupType" value="triggers"><span>Triggers</span></label>
+            <label><input type="radio" name="backupType" value="license"><span>License</span></label>
           </div>
-          <div class="group">
-            <label class="check"><input type="checkbox" name="IncludeVpn" checked> <span><b>Windows VPN connections</b> (all-user + per-user)</span></label>
-            <label class="check"><input type="checkbox" name="IncludeDesktop" checked> <span><b>Desktop files</b> of every user + Public desktop (.bat, VPN files, notes…)</span></label>
+          <p class="hint" id="typeHint"></p>
+          <div data-for="full">
+            <div class="group">
+              <label class="check"><input type="checkbox" name="IncludePrtg" checked> <span><b>PRTG</b> — configuration (probes, groups, devices, sensors, notifications, triggers, users, maps, reports, libraries), registry, SSL certificate, custom sensors, lookups, MIBs</span></label>
+              <label class="check sub"><input type="checkbox" name="IncludeProgram" checked> Clone the <b>PRTG program</b> (program files + services) — no installer needed on the target</label>
+              <label class="check sub"><input type="checkbox" name="CopyLicense" checked> <span>Copy the source <b>license</b> <span class="muted">(PRTG binds a license to the server it was activated on: on the new server PRTG asks Paessler for a new activation)</span></span></label>
+              <label class="check sub"><input type="checkbox" name="IncludeHistory" checked> <b>Historic monitoring data</b> (graphs &amp; tables of the past)</label>
+              <label class="check sub"><input type="checkbox" name="IncludeLogs"> PRTG log files <span class="muted">(not needed — usually large)</span></label>
+              <label class="check sub"><input type="checkbox" name="IncludeAutoBackups"> Old automatic configuration copies <span class="muted">(not needed)</span></label>
+            </div>
+            <div class="group">
+              <label class="check"><input type="checkbox" name="IncludeDesktop" checked> <span><b>Desktop files</b> of every user + Public desktop</span></label>
+            </div>
+            <label class="field"><span>Extra paths on the source (one per line, optional)</span><textarea name="ExtraPaths" rows="3" placeholder="D:\Scripts&#10;C:\Tools\prtg-helper.ps1"></textarea></label>
+            <h2 class="mt">3 · Targets</h2>
+            <div id="targetList" class="checklist"></div>
+            <p class="hint">Leave all targets unchecked to create a backup only.</p>
           </div>
-          <label class="field"><span>Extra paths on the source (one per line, optional)</span><textarea name="ExtraPaths" rows="3" placeholder="D:\Scripts&#10;C:\Tools\prtg-helper.ps1"></textarea></label>
+          <div data-for="graphs" hidden>
+            <label class="field inline"><span>Only the last … days (0 = all history)</span><input type="number" name="HistoryDays" value="0" min="0" max="3650"></label>
+            <p class="hint">Copies <code>Monitoring Database</code> — the data PRTG draws its graphs and tables from — from a VSS snapshot. PRTG keeps running. Restore it into a PRTG that has the same devices (same ids): the source itself, or a migrated server.</p>
+          </div>
+          <div data-for="devices" hidden><p class="hint">The whole device tree: probes, groups, devices, sensors with all their settings, channels and triggers. Read from the configuration while PRTG keeps running — nothing is written on the server.</p></div>
+          <div data-for="notifications" hidden><p class="hint">Notification templates (e-mail, push, HTTP, program …) and the schedules they use. Read-only on the server.</p></div>
+          <div data-for="triggers" hidden><p class="hint">Every trigger (state, threshold, speed, volume, change) of every probe, group, device and sensor, with the object it belongs to. Read-only on the server.</p></div>
+          <div data-for="license" hidden><p class="hint">License name, key and activation data, encrypted <b>on the server</b> with the backup password below — the key never travels or rests in clear. PRTG activates a license per system: restored on another server it needs a new activation from Paessler.</p></div>
+          <fieldset>
+            <legend>Backup password</legend>
+            <label class="check" id="encryptRow"><input type="checkbox" name="Encrypt"> <span>Encrypt the package (AES-256 + HMAC-SHA256, key from PBKDF2). The password is needed to restore it.</span></label>
+            <div class="grid2 tight" id="pwFields" hidden>
+              <label class="field"><span>Password (at least 8 characters)</span><input type="password" name="BackupPassword" autocomplete="new-password"></label>
+              <label class="field"><span>Repeat</span><input type="password" name="BackupPassword2" autocomplete="new-password"></label>
+            </div>
+          </fieldset>
         </div>
         <div class="card">
-          <h2>Transfer</h2>
-          <label class="field"><span>How the files move</span><select name="transfer">
-            <option value="">Each server's saved method (RDP or WinRM)</option>
-            <option value="rdp">RDP — through this computer</option>
-            <option value="winrm">WinRM — through this computer</option>
-            <option value="wireguard">WireGuard — tunnel between the two Windows servers</option>
-            <option value="ipip">IPIP — tunnel between the two Windows servers</option>
-          </select></label>
-          <p class="hint" id="transferHint">RDP and WinRM copy the files through this computer. WireGuard and IPIP build a tunnel between the two servers, then WinRM (TCP 5985) carries the files from one tunnel address to the other. This computer sends commands and does not keep the backup.</p>
-          <h2 class="mt">4 · Source server</h2>
-          <label class="check notouch"><input type="checkbox" name="NoTouch" checked> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
-          <div id="sourceAfterBox" class="disabled">
-            <div class="segmented" id="sourceAfter">
-              <label><input type="radio" name="SourceAfter" value="KeepStopped" checked><span>Keep stopped</span></label>
-              <label><input type="radio" name="SourceAfter" value="Disable"><span>Stop &amp; disable</span></label>
-              <label><input type="radio" name="SourceAfter" value="Restart"><span>Restart &amp; verify fully up</span></label>
+          <div data-for="full">
+            <h2>Transfer</h2>
+            <label class="field"><span>How the files move</span><select name="transfer">
+              <option value="">Each server's saved method (RDP or WinRM)</option>
+              <option value="rdp">RDP — through this computer</option>
+              <option value="winrm">WinRM — through this computer</option>
+              <option value="wireguard">WireGuard — tunnel between the two Windows servers</option>
+              <option value="ipip">IPIP — tunnel between the two Windows servers</option>
+            </select></label>
+            <p class="hint" id="transferHint">RDP and WinRM copy the files through this computer. WireGuard and IPIP build a tunnel between the two servers, then WinRM (TCP 5985) carries the files from one tunnel address to the other. This computer sends commands and does not keep the backup.</p>
+            <h2 class="mt">4 · Source server</h2>
+            <label class="check notouch"><input type="checkbox" name="NoTouch" checked> <span><b>Don't touch the source</b> — PRTG keeps running, nothing is stopped, changed or deleted (consistent VSS snapshot is used)</span></label>
+            <div id="sourceAfterBox" class="disabled">
+              <div class="segmented" id="sourceAfter">
+                <label><input type="radio" name="SourceAfter" value="KeepStopped" checked><span>Keep stopped</span></label>
+                <label><input type="radio" name="SourceAfter" value="Disable"><span>Stop &amp; disable</span></label>
+                <label><input type="radio" name="SourceAfter" value="Restart"><span>Restart &amp; verify fully up</span></label>
+              </div>
+              <p class="hint"><b>Restart &amp; verify</b> starts core + probe and waits until both services run, the web interface answers and everything is still stable after 45 s — otherwise the job fails. For a real migration keep the old server stopped (two cores with the same license would alert twice).</p>
             </div>
-            <p class="hint"><b>Restart &amp; verify</b> starts core + probe and waits until both services run, the web interface answers and everything is still stable after 45 s — otherwise the job fails. For a real migration keep the old server stopped (two cores with the same license would alert twice).</p>
-          </div>
 
-          <h2 class="mt">5 · Target options</h2>
-          <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify it is fully up (services + web + stability)</label>
-          <label class="check"><input type="checkbox" name="OpenFirewall" checked> Open the Windows firewall for the PRTG web ports and remote probes (23560)</label>
-          <label class="field inline"><span>Health-check timeout (minutes)</span><input type="number" name="HealthTimeoutMinutes" value="15" min="1" max="120"></label>
-          <label class="field inline"><span>Parallel transfer streams (WinRM)</span><input type="number" name="TransferStreams" value="4" min="1" max="8"></label>
-          <label class="check"><input type="checkbox" name="ConnectVpn"> Dial the VPN connections after restore</label>
-          <label class="check"><input type="checkbox" name="AllowDowngrade"> Allow restoring onto an older PRTG version (not recommended)</label>
-          <label class="field"><span>PRTG installer (optional — only if you prefer a fresh install over the clone)</span><select name="InstallerFile"><option value="">— none (use the clone) —</option></select></label>
-          <label class="field"><span>Installer arguments</span><input name="InstallerArgs" value="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"></label>
-          <div class="upload-row">
-            <label class="btn small">Upload installer<input type="file" id="installerUpload" accept=".exe,.zip" hidden></label>
-            <span class="hint" id="installerUploadStatus"></span>
+            <h2 class="mt">5 · Target options</h2>
+            <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify it is fully up (services + web + stability)</label>
+            <label class="check"><input type="checkbox" name="AutoRollback" checked> Put the previous PRTG back automatically when the restored one does not come up</label>
+            <label class="check"><input type="checkbox" name="OpenFirewall" checked> Open the Windows firewall for the PRTG web ports and remote probes (23560)</label>
+            <label class="field inline"><span>Health-check timeout (minutes)</span><input type="number" name="HealthTimeoutMinutes" value="15" min="1" max="120"></label>
+            <label class="field inline"><span>Parallel transfer streams (WinRM)</span><input type="number" name="TransferStreams" value="4" min="1" max="8"></label>
+            <label class="check"><input type="checkbox" name="AllowDowngrade"> Allow restoring onto an older PRTG version (not recommended)</label>
+            <label class="field"><span>PRTG installer (optional — only if you prefer a fresh install over the clone)</span><select name="InstallerFile"><option value="">— none (use the clone) —</option></select></label>
+            <label class="field"><span>Installer arguments</span><input name="InstallerArgs" value="/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"></label>
+            <div class="upload-row">
+              <label class="btn small">Upload installer<input type="file" id="installerUpload" accept=".exe,.zip" hidden></label>
+              <span class="hint" id="installerUploadStatus"></span>
+            </div>
           </div>
           <div class="summary" id="migrateSummary"></div>
           <div class="form-actions">
@@ -149,34 +178,55 @@
       <header class="page-head">
         <div><h1>Backups</h1><p class="muted" id="backupsPath">Packages stored on the manager.</p></div>
         <div class="actions">
-          <label class="btn">Upload backup<input type="file" id="backupUpload" accept=".zip" hidden></label>
+          <select id="backupFilter" title="Show only one type">
+            <option value="">All types</option><option value="full">Full</option><option value="graphs">History</option><option value="devices">Devices</option>
+            <option value="notifications">Notifications</option><option value="triggers">Triggers</option><option value="license">License</option>
+          </select>
+          <button class="btn" id="refreshBackups">Refresh</button>
+          <label class="btn">Upload backup<input type="file" id="backupUpload" accept=".zip,.pmenc" hidden></label>
         </div>
       </header>
       <div class="upload-progress" id="uploadProgress" hidden><div class="bar"><i></i></div><span></span></div>
-      <header class="page-head" style="margin-top:6px">
-        <div><h2>PRTG</h2><p class="muted">Full backups: PRTG with configuration, history, license and program, plus the VPN connections and desktop files that were selected.</p></div>
-      </header>
       <div class="card flush"><div class="table-wrap"><table class="table backups" id="backupsTable">
-        <thead><tr><th>Package</th><th>Source</th><th>Contents</th><th>Size</th><th>Created</th><th></th></tr></thead>
+        <thead><tr><th>Backup</th><th>Type</th><th>Source</th><th>Created</th><th>Size</th><th>Version</th><th>Encrypted</th><th>Valid</th><th></th></tr></thead>
         <tbody></tbody>
       </table></div></div>
+      <p class="hint">Delete moves a package to the Recycle Bin of this computer. Restore always shows a preview of what changes on the target first.</p>
+    </section>
 
-      <header class="page-head" style="margin-top:22px">
-        <div><h2>VPN</h2><p class="muted">VPN connections with their routes and routings: routes bound to each connection, live routes on its interface, persistent routes into it. Passwords are never part of a backup.</p></div>
+    <!-- ======================= LICENSE -->
+    <section id="view-license" class="view">
+      <header class="page-head">
+        <div><h1>PRTG license</h1><p class="muted">License state of a PRTG server, entering a trial or bought key, license backup, restore and removal. PRTG activates every key itself with Paessler — PRTG Manager never bypasses or fakes the activation.</p></div>
         <div class="actions">
-          <select id="vpnBackupSource" title="Server whose VPN connections and routes are backed up"></select>
-          <button class="btn primary" id="vpnBackupBtn">Back up VPN and routes</button>
+          <select id="licServer" title="Server"></select>
+          <button class="btn" id="licRefresh">Refresh status</button>
         </div>
       </header>
-      <div class="card flush"><div class="table-wrap"><table class="table backups" id="vpnBackupsTable">
-        <thead><tr><th>Package</th><th>Source</th><th>Connections and routes</th><th>Size</th><th>Created</th><th></th></tr></thead>
-        <tbody></tbody>
-      </table></div></div>
+      <div class="grid2">
+        <div class="card" id="licStatus"><p class="muted">Choose a server and press Refresh status.</p></div>
+        <div class="card">
+          <h2>Actions</h2>
+          <div class="lic-actions">
+            <button class="btn primary" id="licTrial">Add free trial license</button>
+            <button class="btn" id="licActivate">Activate an authorized license</button>
+            <button class="btn" id="licBackup">Back up license</button>
+            <button class="btn" id="licRestore">Restore license from backup</button>
+            <button class="btn danger" id="licRemove">Remove license</button>
+          </div>
+          <h3 class="sub-head">Where license keys come from</h3>
+          <ul class="plain">
+            <li><b>Trial</b>: register on <a href="https://www.paessler.com/prtg/download" target="_blank" rel="noopener noreferrer">paessler.com/prtg/download</a> — Paessler sends the trial license name and key by e-mail.</li>
+            <li><b>Bought / site license</b>: the Paessler shop (<a href="https://shop.paessler.com" target="_blank" rel="noopener noreferrer">shop.paessler.com</a>) shows your license name and key. Paessler has no public interface that hands out keys, so PRTG Manager cannot fetch one by itself — it activates the key you enter.</li>
+            <li><b>Activation</b> happens in PRTG itself, online with Paessler. Without internet access use <i>Setup › License Status › offline activation</i> in the PRTG web interface. A key active on another system must first be moved in the Paessler shop (Activation Center) or by Paessler / your reseller.</li>
+          </ul>
+        </div>
+      </div>
     </section>
 
     <!-- ======================= JOBS -->
     <section id="view-jobs" class="view">
-      <header class="page-head"><div><h1>Jobs</h1><p class="muted">Live progress and full logs of every operation. Failed jobs can be resumed.</p></div>
+      <header class="page-head"><div><h1>Jobs</h1><p class="muted">Live progress and full logs of every operation. Failed backups, restores and migrations can be resumed.</p></div>
         <div class="actions"><button class="btn" id="diagBtn" title="Zip with manager/audit/robocopy/agent logs, job records, test results and an environment report (no passwords)">Download diagnostics</button></div>
       </header>
       <div class="jobs-layout">
@@ -198,7 +248,7 @@
         <div class="kv">
           <dt>Job logs</dt><dd>Jobs page (tick <i>Show debug</i> for exact error line, stack, timings) · <code>data\jobs\&lt;id&gt;.log</code></dd>
           <dt>Manager / API</dt><dd><code>data\logs\manager-yyyyMMdd.log</code> (below)</dd>
-          <dt>Audit trail</dt><dd><code>data\logs\audit.log</code> (below)</dd>
+          <dt>Audit trail</dt><dd><code>data\logs\audit.log</code> (below) — backups, restores, validations, license changes, deletions</dd>
           <dt>File copies</dt><dd><code>data\logs\robocopy\robocopy-&lt;job&gt;-&lt;server&gt;.log</code></dd>
           <dt>Agents (RDP)</dt><dd><code>data\agent\&lt;server-id&gt;\agent.log</code></dd>
         </div>
@@ -224,7 +274,7 @@
       <label class="field"><span>Host / IP</span><input name="host" required placeholder="10.0.0.10"></label>
       <label class="field"><span>Role</span><select name="role"><option value="both">Source &amp; target</option><option value="source">Source</option><option value="target">Target</option></select></label>
       <label class="field"><span>Connection method for the script</span><select name="transport">
-        <option value="local">Local (this computer: PRTG Mover runs on the server itself, no connection needed)</option>
+        <option value="local">Local (this computer: PRTG Manager runs on the server itself, no connection needed)</option>
         <option value="rdp">RDP (agent in a Remote Desktop session — nothing to configure on the server)</option>
         <option value="winrm">WinRM (PowerShell remoting — fully automatic, needs WinRM enabled)</option>
         <option value="wireguard">WireGuard tunnel (files between the two Windows servers on 10.66.66.0/24; commands still use RDP)</option>
@@ -253,23 +303,110 @@
   </form>
 </dialog>
 
-<dialog id="restoreDialog">
+<dialog id="restoreDialog" class="wide">
   <form method="dialog" id="restoreForm">
-    <h2>Restore package</h2>
+    <h2 id="restoreTitle">Restore</h2>
     <p class="muted" id="restoreName"></p>
+    <div class="kv" id="restoreInfo"></div>
+    <h3 class="sub-head">1 · Target</h3>
     <div id="restoreTargets" class="checklist"></div>
-    <label class="check"><input type="checkbox" name="RestorePrtg" checked> PRTG</label>
-    <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source license</label>
-    <label class="check sub"><input type="checkbox" name="OpenFirewall" checked> Open firewall for PRTG ports</label>
-    <label class="check"><input type="checkbox" name="RestoreVpn" checked> VPN connections</label>
-    <label class="check sub"><input type="checkbox" name="RestoreRoutes" checked> Routes of the VPN connections (missing routes are put back, nothing is removed)</label>
-    <label class="check"><input type="checkbox" name="RestoreDesktop" checked> Desktop files</label>
-    <label class="check"><input type="checkbox" name="RestoreExtra" checked> Extra paths</label>
-    <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify web interface</label>
-    <label class="field"><span>PRTG installer (if missing on target)</span><select name="InstallerFile"><option value="">— none —</option></select></label>
+    <h3 class="sub-head">2 · Options</h3>
+    <div data-rfor="full">
+      <label class="check"><input type="checkbox" name="RestorePrtg" checked> PRTG</label>
+      <label class="check sub"><input type="checkbox" name="CopyLicense" checked> Copy the source license (PRTG asks Paessler for a new activation there)</label>
+      <label class="check sub"><input type="checkbox" name="OpenFirewall" checked> Open the firewall for the PRTG ports</label>
+      <label class="check sub"><input type="checkbox" name="AutoRollback" checked> Roll back automatically when PRTG does not come up</label>
+      <label class="check sub"><input type="checkbox" name="AllowDowngrade"> Allow restoring onto an older PRTG version</label>
+      <label class="check"><input type="checkbox" name="RestoreDesktop" checked> Desktop files</label>
+      <label class="check"><input type="checkbox" name="RestoreExtra" checked> Extra paths</label>
+      <label class="field"><span>PRTG installer (if missing on the target and the package has no clone)</span><select name="InstallerFile"><option value="">— none —</option></select></label>
+    </div>
+    <div data-rfor="graphs">
+      <div class="segmented"><label><input type="radio" name="GraphMode" value="merge" checked><span>Merge — keep files that exist</span></label><label><input type="radio" name="GraphMode" value="overwrite"><span>Overwrite — replace them</span></label></div>
+    </div>
+    <div data-rfor="section">
+      <div class="segmented"><label><input type="radio" name="Mode" value="merge" checked><span>Merge — only add what is missing</span></label><label><input type="radio" name="Mode" value="overwrite"><span>Overwrite — also update existing objects</span></label></div>
+      <label class="check"><input type="checkbox" name="ReIdConflicts"> Objects whose id is taken by another object on the target: create them with new ids (their history does not follow)</label>
+    </div>
+    <div data-rfor="service">
+      <label class="check"><input type="checkbox" name="StartServices" checked> Start PRTG and verify it is fully up</label>
+    </div>
+    <div id="restorePwRow" hidden>
+      <label class="field"><span id="restorePwLabel">Backup password</span><input type="password" name="Password" autocomplete="off"></label>
+    </div>
+    <h3 class="sub-head">3 · Preview <span class="muted" id="previewState"></span></h3>
+    <div id="previewBox" class="preview"><p class="muted">Press <b>Preview</b> to see exactly what changes on the target. Nothing is changed by the preview.</p></div>
+    <label class="check danger-confirm" id="fullConfirmRow" hidden><input type="checkbox" id="fullConfirm"> <span>I understand that the PRTG data on the target is replaced. A rollback copy is taken first and put back automatically if PRTG does not come up.</span></label>
+    <div class="form-actions">
+      <button value="cancel" class="btn" formnovalidate>Close</button>
+      <button type="button" class="btn" id="previewBtn">Preview</button>
+      <button type="button" class="btn primary" id="restoreGo" disabled>Restore</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="validateDialog">
+  <form method="dialog" id="validateForm">
+    <h2>Validate backup</h2>
+    <p class="muted" id="validateName"></p>
+    <label class="field" id="validatePwRow"><span>Backup password (optional — checks the password and the integrity of an encrypted package)</span><input type="password" name="Password" autocomplete="off"></label>
+    <div id="validateBox"></div>
+    <div class="form-actions">
+      <button value="close" class="btn" formnovalidate>Close</button>
+      <button type="button" class="btn primary" id="validateGo">Validate</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="inspectDialog" class="wide">
+  <form method="dialog">
+    <h2>Inspect backup</h2>
+    <div id="inspectBox"></div>
+    <div class="form-actions"><button value="close" class="btn primary">Close</button></div>
+  </form>
+</dialog>
+
+<dialog id="licenseDialog">
+  <form method="dialog" id="licenseForm">
+    <h2 id="licenseTitle">Activate license</h2>
+    <p class="muted" id="licenseWhich"></p>
+    <p class="hint" id="licenseHelp"></p>
+    <label class="field"><span>License name (exactly as Paessler sent it — case sensitive)</span><input name="licenseName" required autocomplete="off"></label>
+    <label class="field"><span>License key</span><textarea name="licenseKey" rows="3" required autocomplete="off" spellcheck="false"></textarea></label>
+    <label class="check"><input type="checkbox" name="force"> Replace an active license on this server</label>
+    <p class="hint">PRTG is stopped for a moment, the key is written the way the PRTG Administration Tool does it, PRTG is started and the activation result is read from the PRTG log. A copy of the current license is kept on the server.</p>
     <div class="form-actions">
       <button value="cancel" class="btn" formnovalidate>Cancel</button>
-      <button value="go" class="btn primary">Restore</button>
+      <button value="go" class="btn primary">Activate</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="licBackupDialog">
+  <form method="dialog" id="licBackupForm">
+    <h2>Back up license</h2>
+    <p class="muted" id="licBackupWhich"></p>
+    <p class="hint">The license name, key and activation data are encrypted on the server with this password. Keep the password — it is needed to restore the license.</p>
+    <div class="grid2 tight">
+      <label class="field"><span>Backup password (at least 8 characters)</span><input type="password" name="pw" autocomplete="new-password"></label>
+      <label class="field"><span>Repeat</span><input type="password" name="pw2" autocomplete="new-password"></label>
+    </div>
+    <div class="form-actions">
+      <button value="cancel" class="btn" formnovalidate>Cancel</button>
+      <button value="go" class="btn primary">Back up</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="licRemoveDialog">
+  <form method="dialog" id="licRemoveForm">
+    <h2>Remove the PRTG license</h2>
+    <p class="muted" id="licRemoveWhich"></p>
+    <p>License name and key (and PRTG's activation data of this key) are removed from the PRTG on this server. PRTG is restarted and runs without a license until a new one is entered. Configuration and history stay. A copy of the removed license data is kept on the server. Paessler has no remote deactivation: to use the key on another system, move the activation in the Paessler shop.</p>
+    <label class="field"><span>Type the server name to confirm</span><input name="confirmName" autocomplete="off"></label>
+    <div class="form-actions">
+      <button value="cancel" class="btn" formnovalidate>Cancel</button>
+      <button value="go" class="btn danger">Remove license</button>
     </div>
   </form>
 </dialog>

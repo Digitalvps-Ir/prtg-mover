@@ -1,5 +1,5 @@
 <#
-    PrtgMover.Remote.ps1
+    PrtgManager.Remote.ps1
     ---------------------
     Functions executed *on the source / target server* inside a PowerShell remoting
     session opened by the manager. The whole file is shipped with every call, so it
@@ -23,7 +23,7 @@ $PmProgramFolders = @(
 )
 
 function Get-PmWorkRoot {
-    <# Folder for PRTG Mover's own temporary files on this server. #>
+    <# Folder for PRTG Manager's own temporary files on this server. #>
     if ($env:PRTGMOVER_WORKROOT) { return $env:PRTGMOVER_WORKROOT.TrimEnd('\').TrimEnd('/') }
     if ($env:SystemDrive) { return (Join-Path $env:SystemDrive 'PrtgMover') }
     # PowerShell 7 on Linux has no SystemDrive. Keep the same folder name under temp.
@@ -240,182 +240,748 @@ public class PmTrustAllPolicy : ICertificatePolicy {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 }
 
-# ---------------------------------------------------------------- RAS phonebook (Windows VPN)
+# ---------------------------------------------------------------- backup encryption (password)
+# Envelope (same layout everywhere PRTG Manager encrypts):
+#   'PMENC1' | kdf (1 byte: 1 = PBKDF2-SHA256, 2 = PBKDF2-SHA1) | iterations (int32 LE) | salt (16) | IV (16) |
+#   AES-256-CBC ciphertext (PKCS7) | HMAC-SHA256 (32 bytes) over everything before it.
+# 64 bytes are derived from the password: the first 32 encrypt, the last 32 authenticate.
 
-function Get-PmPbkEntries {
-    <# Parses a rasphone.pbk file into ordered entries: @{ Name; Lines } #>
-    param([Parameter(Mandatory)][string]$Path)
-    $entries = New-Object System.Collections.ArrayList
-    if (-not (Test-Path -LiteralPath $Path)) { return , $entries }
-    $enc = Get-PmFileEncoding -Path $Path
-    $current = $null
-    foreach ($line in [IO.File]::ReadAllLines($Path, $enc)) {
-        if ($line -match '^\s*\[(.+)\]\s*$') {
-            $current = @{ Name = $Matches[1]; Lines = New-Object System.Collections.ArrayList }
-            [void]$entries.Add($current)
+$PmEncMagic = [byte[]](0x50, 0x4D, 0x45, 0x4E, 0x43, 0x31)
+$PmEncHeaderLength = 43   # 6 + 1 + 4 + 16 + 16
+
+function Assert-PmBackupPassword {
+    param([string]$Password)
+    if (-not $Password -or $Password.Length -lt 8) { throw 'The backup password must have at least 8 characters.' }
+}
+
+function Get-PmDefaultKdf {
+    <# PBKDF2 with SHA-256 where .NET offers it (4.7.2 and newer), otherwise PBKDF2 with SHA-1 and more rounds. #>
+    try {
+        $t = New-Object Security.Cryptography.Rfc2898DeriveBytes([byte[]](1, 2, 3, 4, 5, 6, 7, 8), [byte[]](1..16), 1, [Security.Cryptography.HashAlgorithmName]::SHA256)
+        $t.Dispose()
+        return @{ Kdf = 1; Iterations = 200000 }
+    } catch { return @{ Kdf = 2; Iterations = 300000 } }
+}
+
+function Get-PmKeyMaterial {
+    param([Parameter(Mandatory)][string]$Password, [Parameter(Mandatory)][byte[]]$Salt, [Parameter(Mandatory)][int]$Iterations, [Parameter(Mandatory)][int]$Kdf)
+    $pw = [Text.Encoding]::UTF8.GetBytes($Password)
+    if ($Kdf -eq 1) { $d = New-Object Security.Cryptography.Rfc2898DeriveBytes($pw, $Salt, $Iterations, [Security.Cryptography.HashAlgorithmName]::SHA256) }
+    elseif ($Kdf -eq 2) { $d = New-Object Security.Cryptography.Rfc2898DeriveBytes($pw, $Salt, $Iterations) }
+    else { throw "Unknown key derivation $Kdf in the encrypted file." }
+    try {
+        $k = $d.GetBytes(64)
+        return @{ Enc = [byte[]]$k[0..31]; Mac = [byte[]]$k[32..63] }
+    } finally { $d.Dispose() }
+}
+
+function New-PmAes {
+    param([byte[]]$Key, [byte[]]$IV)
+    $aes = [Security.Cryptography.Aes]::Create()
+    $aes.KeySize = 256; $aes.Mode = [Security.Cryptography.CipherMode]::CBC; $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = $Key; $aes.IV = $IV
+    return $aes
+}
+
+function Test-PmBytesEqual {
+    <# Constant-time comparison of two byte arrays. #>
+    param([byte[]]$A, [byte[]]$B)
+    if ($null -eq $A -or $null -eq $B -or $A.Length -ne $B.Length) { return $false }
+    $diff = 0
+    for ($i = 0; $i -lt $A.Length; $i++) { $diff = $diff -bor ($A[$i] -bxor $B[$i]) }
+    return ($diff -eq 0)
+}
+
+function New-PmEncHeader {
+    param([int]$Kdf, [int]$Iterations, [byte[]]$Salt, [byte[]]$IV)
+    $ms = New-Object IO.MemoryStream
+    $ms.Write($PmEncMagic, 0, 6); $ms.WriteByte([byte]$Kdf)
+    $it = [BitConverter]::GetBytes([int]$Iterations); $ms.Write($it, 0, 4)
+    $ms.Write($Salt, 0, 16); $ms.Write($IV, 0, 16)
+    return , $ms.ToArray()
+}
+
+function Read-PmEncHeader {
+    <# Parses the header of an encrypted blob / file; throws a clear error when it is not one. #>
+    param([Parameter(Mandatory)][byte[]]$Header)
+    if ($Header.Length -lt $PmEncHeaderLength) { throw 'This is not a PRTG Manager encrypted file (too short).' }
+    for ($i = 0; $i -lt 6; $i++) { if ($Header[$i] -ne $PmEncMagic[$i]) { throw 'This is not a PRTG Manager encrypted file (unknown header).' } }
+    $kdf = [int]$Header[6]
+    $iter = [BitConverter]::ToInt32($Header, 7)
+    if ($kdf -notin 1, 2 -or $iter -lt 1000 -or $iter -gt 10000000) { throw 'The header of the encrypted file is damaged.' }
+    return @{ Kdf = $kdf; Iterations = $iter; Salt = [byte[]]$Header[11..26]; IV = [byte[]]$Header[27..42] }
+}
+
+function Protect-PmBytes {
+    <# Encrypts bytes with a password (see the envelope above). #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Data, [Parameter(Mandatory)][string]$Password)
+    Assert-PmBackupPassword $Password
+    $k = Get-PmDefaultKdf
+    $salt = New-Object byte[] 16; $iv = New-Object byte[] 16
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($salt); $rng.GetBytes($iv) } finally { $rng.Dispose() }
+    $km = Get-PmKeyMaterial -Password $Password -Salt $salt -Iterations $k.Iterations -Kdf $k.Kdf
+    $aes = New-PmAes -Key $km.Enc -IV $iv
+    try { $t = $aes.CreateEncryptor(); $ct = $t.TransformFinalBlock($Data, 0, $Data.Length); $t.Dispose() } finally { $aes.Dispose() }
+    $head = New-PmEncHeader -Kdf $k.Kdf -Iterations $k.Iterations -Salt $salt -IV $iv
+    $body = New-Object byte[] ($head.Length + $ct.Length)
+    [Array]::Copy($head, 0, $body, 0, $head.Length); [Array]::Copy($ct, 0, $body, $head.Length, $ct.Length)
+    $h = New-Object Security.Cryptography.HMACSHA256(, $km.Mac)
+    try { $mac = $h.ComputeHash($body) } finally { $h.Dispose() }
+    $out = New-Object byte[] ($body.Length + 32)
+    [Array]::Copy($body, 0, $out, 0, $body.Length); [Array]::Copy($mac, 0, $out, $body.Length, 32)
+    return , $out
+}
+
+function Unprotect-PmBytes {
+    <# Decrypts an envelope. A wrong password and a changed file give the same, clear error. #>
+    param([Parameter(Mandatory)][byte[]]$Envelope, [Parameter(Mandatory)][string]$Password)
+    if ($Envelope.Length -lt ($PmEncHeaderLength + 16 + 32)) { throw 'The encrypted data is too short - the file is damaged.' }
+    $hd = Read-PmEncHeader -Header ([byte[]]$Envelope[0..($PmEncHeaderLength - 1)])
+    $km = Get-PmKeyMaterial -Password $Password -Salt $hd.Salt -Iterations $hd.Iterations -Kdf $hd.Kdf
+    $bodyLen = $Envelope.Length - 32
+    $h = New-Object Security.Cryptography.HMACSHA256(, $km.Mac)
+    try { $mac = $h.ComputeHash($Envelope, 0, $bodyLen) } finally { $h.Dispose() }
+    $stored = New-Object byte[] 32; [Array]::Copy($Envelope, $bodyLen, $stored, 0, 32)
+    if (-not (Test-PmBytesEqual $mac $stored)) { throw 'The backup password is wrong or the file was changed (HMAC mismatch).' }
+    $aes = New-PmAes -Key $km.Enc -IV $hd.IV
+    try { $t = $aes.CreateDecryptor(); $pt = $t.TransformFinalBlock($Envelope, $PmEncHeaderLength, $bodyLen - $PmEncHeaderLength); $t.Dispose() } finally { $aes.Dispose() }
+    return , $pt
+}
+
+function Protect-PmFile {
+    <# Encrypts a file of any size in 1 MB steps into the same envelope format. #>
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [Parameter(Mandatory)][string]$Password)
+    Assert-PmBackupPassword $Password
+    $k = Get-PmDefaultKdf
+    $salt = New-Object byte[] 16; $iv = New-Object byte[] 16
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $rng.GetBytes($salt); $rng.GetBytes($iv) } finally { $rng.Dispose() }
+    $km = Get-PmKeyMaterial -Password $Password -Salt $salt -Iterations $k.Iterations -Kdf $k.Kdf
+    $head = New-PmEncHeader -Kdf $k.Kdf -Iterations $k.Iterations -Salt $salt -IV $iv
+    $aes = New-PmAes -Key $km.Enc -IV $iv; $enc = $aes.CreateEncryptor()
+    $hmac = New-Object Security.Cryptography.HMACSHA256(, $km.Mac)
+    $in = [IO.File]::OpenRead($Source); $out = [IO.File]::Create($Destination)
+    try {
+        $out.Write($head, 0, $head.Length); [void]$hmac.TransformBlock($head, 0, $head.Length, $null, 0)
+        $buf = New-Object byte[] (1MB); $cbuf = New-Object byte[] (1MB + 32)
+        while ($true) {
+            $n = 0
+            while ($n -lt $buf.Length) { $r = $in.Read($buf, $n, $buf.Length - $n); if ($r -le 0) { break }; $n += $r }
+            if ($in.Position -ge $in.Length) {
+                $last = $enc.TransformFinalBlock($buf, 0, $n)
+                $out.Write($last, 0, $last.Length); [void]$hmac.TransformBlock($last, 0, $last.Length, $null, 0)
+                break
+            }
+            $c = $enc.TransformBlock($buf, 0, $n, $cbuf, 0)
+            $out.Write($cbuf, 0, $c); [void]$hmac.TransformBlock($cbuf, 0, $c, $null, 0)
         }
-        if ($current) { [void]$current.Lines.Add($line) }
-    }
-    return , $entries
+        [void]$hmac.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+        $out.Write($hmac.Hash, 0, 32)
+    } finally { $in.Dispose(); $out.Dispose(); $enc.Dispose(); $aes.Dispose(); $hmac.Dispose() }
 }
 
-function Merge-PmPbk {
-    <#
-        Appends entries from $SourcePath to $TargetPath that do not exist yet
-        (matched by entry name, case-insensitive). Existing entries are never touched.
-        Returns the names of the added entries.
-    #>
-    param([Parameter(Mandatory)][string]$SourcePath, [Parameter(Mandatory)][string]$TargetPath)
-    $added = New-Object System.Collections.ArrayList
-    $src = Get-PmPbkEntries -Path $SourcePath
-    if ($src.Count -eq 0) { return [string[]]@() }
-
-    $dir = Split-Path $TargetPath -Parent
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-
-    $existing = @{}
-    $enc = [Text.Encoding]::Default
-    if (Test-Path -LiteralPath $TargetPath) {
-        $enc = Get-PmFileEncoding -Path $TargetPath
-        foreach ($e in (Get-PmPbkEntries -Path $TargetPath)) { $existing[$e.Name.ToLowerInvariant()] = $true }
-        Copy-Item -LiteralPath $TargetPath -Destination ("{0}.pre-restore-{1}" -f $TargetPath, (Get-Date -Format 'yyyyMMdd-HHmmss')) -Force
-    }
-
-    $sb = New-Object System.Text.StringBuilder
-    foreach ($e in $src) {
-        if ($existing.ContainsKey($e.Name.ToLowerInvariant())) { continue }
-        [void]$sb.AppendLine('')
-        foreach ($l in $e.Lines) { [void]$sb.AppendLine($l) }
-        [void]$added.Add($e.Name)
-    }
-    if ($added.Count -gt 0) {
-        if (Test-Path -LiteralPath $TargetPath) { [IO.File]::AppendAllText($TargetPath, $sb.ToString(), $enc) }
-        else { [IO.File]::WriteAllText($TargetPath, $sb.ToString().TrimStart(), $enc) }
-    }
-    return [string[]]$added.ToArray()
+function Test-PmEncryptedFile {
+    <# Checks the password and the integrity of an encrypted file (HMAC) without writing anything. Returns the header facts. #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Password)
+    $in = [IO.File]::OpenRead($Path)
+    try {
+        if ($in.Length -lt ($PmEncHeaderLength + 16 + 32)) { throw 'The encrypted file is too short - it is damaged.' }
+        $head = New-Object byte[] $PmEncHeaderLength; [void]$in.Read($head, 0, $PmEncHeaderLength)
+        $hd = Read-PmEncHeader -Header $head
+        $km = Get-PmKeyMaterial -Password $Password -Salt $hd.Salt -Iterations $hd.Iterations -Kdf $hd.Kdf
+        $hmac = New-Object Security.Cryptography.HMACSHA256(, $km.Mac)
+        try {
+            [void]$hmac.TransformBlock($head, 0, $head.Length, $null, 0)
+            $left = $in.Length - $PmEncHeaderLength - 32
+            $buf = New-Object byte[] (1MB)
+            while ($left -gt 0) { $r = $in.Read($buf, 0, [int][math]::Min($buf.Length, $left)); if ($r -le 0) { throw 'Unexpected end of the encrypted file.' }; [void]$hmac.TransformBlock($buf, 0, $r, $null, 0); $left -= $r }
+            [void]$hmac.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+            $stored = New-Object byte[] 32; [void]$in.Read($stored, 0, 32)
+            if (-not (Test-PmBytesEqual $hmac.Hash $stored)) { throw 'The backup password is wrong or the file was changed (HMAC mismatch).' }
+        } finally { $hmac.Dispose() }
+        return @{ Kdf = $hd.Kdf; Iterations = $hd.Iterations; Key = $km; IV = $hd.IV }
+    } finally { $in.Dispose() }
 }
 
-# ---- routes of a VPN connection (format "vpn-routes/1", shared with VPN Watch; contains no secrets)
-
-function ConvertTo-PmIPv4Number {
-    param([string]$Address)
-    $b = ([Net.IPAddress]::Parse($Address)).GetAddressBytes()
-    return ([uint32]$b[0] * 16777216) + ([uint32]$b[1] * 65536) + ([uint32]$b[2] * 256) + [uint32]$b[3]
+function Unprotect-PmFile {
+    <# Verifies (HMAC) first, then decrypts a file of any size. Nothing is written when the check fails. #>
+    param([Parameter(Mandatory)][string]$Source, [Parameter(Mandatory)][string]$Destination, [Parameter(Mandatory)][string]$Password)
+    $t = Test-PmEncryptedFile -Path $Source -Password $Password
+    $aes = New-PmAes -Key $t.Key.Enc -IV $t.IV; $dec = $aes.CreateDecryptor()
+    $in = [IO.File]::OpenRead($Source); $out = [IO.File]::Create($Destination)
+    try {
+        [void]$in.Seek($PmEncHeaderLength, [IO.SeekOrigin]::Begin)
+        $left = $in.Length - $PmEncHeaderLength - 32
+        $buf = New-Object byte[] (1MB); $pbuf = New-Object byte[] (1MB + 32)
+        while ($left -gt 0) {
+            $want = [int][math]::Min($buf.Length, $left); $n = 0
+            while ($n -lt $want) { $r = $in.Read($buf, $n, $want - $n); if ($r -le 0) { throw 'Unexpected end of the encrypted file.' }; $n += $r }
+            $left -= $n
+            if ($left -le 0) { $last = $dec.TransformFinalBlock($buf, 0, $n); $out.Write($last, 0, $last.Length) }
+            else { $c = $dec.TransformBlock($buf, 0, $n, $pbuf, 0); $out.Write($pbuf, 0, $c) }
+        }
+    } catch { $out.Dispose(); Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue; throw }
+    finally { $in.Dispose(); $out.Dispose(); $dec.Dispose(); $aes.Dispose() }
 }
 
-function ConvertTo-PmIPv4Mask {
-    param([int]$PrefixLength)
-    $bits = ('1' * $PrefixLength).PadRight(32, '0')
-    return ((0..3 | ForEach-Object { [Convert]::ToInt32($bits.Substring($_ * 8, 8), 2) }) -join '.')
+# ---------------------------------------------------------------- PRTG configuration: parts (devices, notifications, triggers)
+# PRTG Configuration.dat is one XML file. Objects live in <nodes> elements and have a unique numeric id:
+#   root/basenode/nodes/group[@id=0]          the device tree: probenode / group / device / sensor (each with data,
+#                                             trigger, channels, history and its own <nodes>)
+#   root/basenode/nodes/basenode[@id=-3]      notification templates      [@id=-7] schedules
+#   root@max                                  the highest id handed out so far
+# Triggers are <trigger> children of tree objects (state / threshold / speed / volume / change, each with an id).
+# XmlElement properties can be shadowed by child elements (PowerShell adapter), so LocalName / methods are used.
+
+$PmSectionTypes = 'devices', 'notifications', 'triggers'
+$PmTreeObjectTypes = 'probenode', 'group', 'device', 'sensor', 'autodevice'
+$PmTriggerRefFields = 'onnotificationid', 'escnotificationid', 'offnotificationid'
+
+function ConvertTo-PmPackedText {
+    <# Text -> gzip -> base64 (large XML crosses WinRM in one small object). #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
+    $ms = New-Object IO.MemoryStream
+    $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Compress)
+    $b = [Text.Encoding]::UTF8.GetBytes($Text); $gz.Write($b, 0, $b.Length); $gz.Dispose()
+    return [Convert]::ToBase64String($ms.ToArray())
 }
 
-function ConvertTo-PmPrefixLength {
-    param([string]$Mask)
-    $n = 0
-    foreach ($b in ([Net.IPAddress]::Parse($Mask)).GetAddressBytes()) { $n += ([Convert]::ToString($b, 2) -replace '0', '').Length }
+function ConvertFrom-PmPackedText {
+    param([Parameter(Mandatory)][string]$Packed)
+    $in = New-Object IO.MemoryStream(, [Convert]::FromBase64String($Packed))
+    $gz = New-Object IO.Compression.GZipStream($in, [IO.Compression.CompressionMode]::Decompress)
+    $sr = New-Object IO.StreamReader($gz, [Text.Encoding]::UTF8)
+    try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+}
+function Read-PmXmlText {
+    <# XmlDocument from XML text (no DTDs, no external resources). #>
+    param([Parameter(Mandatory)][string]$Text)
+    $doc = New-Object Xml.XmlDocument
+    $doc.PreserveWhitespace = $true; $doc.XmlResolver = $null
+    $doc.LoadXml($Text)
+    return , $doc
+}
+
+function Read-PmPrtgConfig {
+    <# PRTG Configuration.dat as XmlDocument. Opened with FileShare.ReadWrite (PRTG may keep running); retried while PRTG writes it. #>
+    param([Parameter(Mandatory)][string]$Path, [int]$Tries = 4)
+    if (-not (Test-Path -LiteralPath $Path)) { throw "PRTG Configuration.dat not found: $Path" }
+    for ($i = 1; $i -le $Tries; $i++) {
+        $fs = $null
+        try {
+            $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            $doc = New-Object Xml.XmlDocument
+            $doc.PreserveWhitespace = $true; $doc.XmlResolver = $null
+            $doc.Load($fs)
+            return , $doc
+        } catch [Xml.XmlException] {
+            if ($i -ge $Tries) { throw "PRTG Configuration.dat could not be read as XML after $Tries tries (PRTG may be writing it right now): $($_.Exception.Message)" }
+            Start-Sleep -Seconds 5
+        } finally { if ($fs) { $fs.Dispose() } }
+    }
+}
+
+function ConvertTo-PmXmlBytes {
+    <# XmlDocument -> UTF-8 bytes (optionally with BOM), whitespace kept as it is. #>
+    param([Parameter(Mandatory)]$Doc, [bool]$Bom = $false)
+    $ms = New-Object IO.MemoryStream
+    $set = New-Object Xml.XmlWriterSettings
+    $set.Encoding = New-Object Text.UTF8Encoding($Bom); $set.Indent = $false; $set.NewLineHandling = [Xml.NewLineHandling]::None
+    $w = [Xml.XmlWriter]::Create($ms, $set)
+    try { $Doc.Save($w) } finally { $w.Dispose() }
+    return , $ms.ToArray()
+}
+
+function ConvertTo-PmXmlText { param([Parameter(Mandatory)]$Doc) return [Text.Encoding]::UTF8.GetString((ConvertTo-PmXmlBytes -Doc $Doc)) }
+
+function Get-PmConfigHeader {
+    <# Format version, PRTG version and highest id of a configuration (or of a saved part of one). #>
+    param([Parameter(Mandatory)]$Doc)
+    $r = $Doc.DocumentElement
+    if ($r.LocalName -eq 'prtgmanagersection') {
+        return [pscustomobject]@{ ConfigVersion = [int]('0' + $r.GetAttribute('configversion')); PrtgVersion = $r.GetAttribute('prtgversion'); Max = [int]('0' + $r.GetAttribute('max')) }
+    }
+    $oct = $r.GetAttribute('oct'); $ver = ''
+    if ($oct -match '(\d+\.\d+\.\d+\.\d+)') { $ver = $Matches[1] }
+    return [pscustomobject]@{ ConfigVersion = [int]('0' + $r.GetAttribute('version')); PrtgVersion = $ver; Max = [int]('0' + $r.GetAttribute('max')) }
+}
+
+function Get-PmChildElement { param($Element, [string]$Name) foreach ($c in $Element.ChildNodes) { if ($c.NodeType -eq [Xml.XmlNodeType]::Element -and $c.LocalName -eq $Name) { return $c } }; return $null }
+
+function Get-PmChildElements {
+    param($Element)
+    if (-not $Element) { return }
+    foreach ($c in $Element.ChildNodes) { if ($c.NodeType -eq [Xml.XmlNodeType]::Element) { $c } }
+}
+
+function Get-PmObjectName {
+    param($Element)
+    $d = Get-PmChildElement $Element 'data'
+    $n = $null
+    if ($d) { $n = Get-PmChildElement $d 'name' }
+    if (-not $n) { $n = Get-PmChildElement $Element 'name' }
+    if ($n) { return $n.InnerText.Trim() }
+    return ''
+}
+
+function Get-PmDataValue {
+    <# Text of data/<field> of an object, trimmed; '' when missing. #>
+    param($Element, [string]$Field)
+    $d = Get-PmChildElement $Element 'data'
+    if (-not $d) { return '' }
+    $f = Get-PmChildElement $d $Field
+    if ($f) { return $f.InnerText.Trim() }
+    return ''
+}
+
+function Get-PmRefId {
+    <# The id a reference field points to (its text starts with the id), or 0. #>
+    param([string]$Text)
+    if ($Text -match '^\s*(-?\d+)') { return [int]$Matches[1] }
+    return 0
+}
+
+function Get-PmObjectId {
+    <# Id of an object element, or $null for anything that is not an object (objects sit directly in <nodes>). #>
+    param($Element)
+    if (-not $Element -or $Element.NodeType -ne [Xml.XmlNodeType]::Element) { return $null }
+    $id = $Element.GetAttribute('id')
+    if ($id -eq '' -or -not $Element.ParentNode -or $Element.ParentNode.LocalName -ne 'nodes') { return $null }
+    return [int]$id
+}
+
+function Get-PmConfigObjectMap {
+    <# id -> element for every object of a configuration. #>
+    param([Parameter(Mandatory)]$Doc)
+    $map = @{}
+    foreach ($e in $Doc.SelectNodes('//nodes/*[@id]')) { $map[[int]$e.GetAttribute('id')] = $e }
+    return $map
+}
+
+function Get-PmConfigTreeRoot { param([Parameter(Mandatory)]$Doc) return $Doc.DocumentElement.SelectSingleNode("basenode/nodes/group[@id='0']") }
+
+function Get-PmConfigContainer {
+    <# The <nodes> element of a system folder: -3 notifications, -7 schedules, ... #>
+    param([Parameter(Mandatory)]$Doc, [Parameter(Mandatory)][int]$Id)
+    $bn = $Doc.DocumentElement.SelectSingleNode("basenode/nodes/basenode[@id='$Id']")
+    if (-not $bn) { return $null }
+    $n = Get-PmChildElement $bn 'nodes'
+    if (-not $n) { $n = $Doc.CreateElement('nodes'); [void]$bn.AppendChild($n) }
     return $n
 }
 
-function Test-PmAddressInPrefix {
-    param([string]$Address, [string]$Prefix)
-    try {
-        $net, $len = $Prefix -split '/'
-        if ([int]$len -eq 0) { return $true }
-        $shift = [uint32][math]::Pow(2, 32 - [int]$len)
-        return ([math]::Floor((ConvertTo-PmIPv4Number $Address) / $shift) -eq [math]::Floor((ConvertTo-PmIPv4Number $net) / $shift))
-    } catch { return $false }
-}
-
-function Get-PmPersistentRoutes {
-    <# The persistent IPv4 routes of this computer: prefix, mask, gateway, metric. #>
-    $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes'
-    $p = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
-    if (-not $p) { return @() }
-    @($p.PSObject.Properties | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+,\d+\.\d+\.\d+\.\d+,\d+\.\d+\.\d+\.\d+,\d+$' } | ForEach-Object {
-            $dest, $mask, $gw, $metric = $_.Name -split ','
-            [ordered]@{ prefix = "$dest/$(ConvertTo-PmPrefixLength $mask)"; mask = $mask; gateway = $gw; metric = [int]$metric }
-        })
-}
-
-function Get-PmVpnRouteBackup {
-    <# The routes that belong to one Windows VPN connection. #>
-    param([Parameter(Mandatory)][string]$Name, [bool]$AllUsers = $true)
-    $conn = $null
-    if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) {
-        try { $conn = if ($AllUsers) { Get-VpnConnection -Name $Name -AllUserConnection -ErrorAction Stop } else { Get-VpnConnection -Name $Name -ErrorAction Stop } } catch { }
-    }
-    $connectionRoutes = @()
-    if ($conn) { $connectionRoutes = @($conn.Routes | Where-Object { $_ } | ForEach-Object { [ordered]@{ prefix = [string]$_.DestinationPrefix; metric = [int]$_.RouteMetric } }) }
-    $tunnelIp = $null; $live = @(); $onLink = @(); $hops = @()
-    if (Get-Command Get-NetIPAddress -ErrorAction SilentlyContinue) {
-        $addr = @(Get-NetIPAddress -InterfaceAlias $Name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notmatch '^(0\.|169\.254\.)' })
-        if ($addr.Count) {
-            $tunnelIp = [string]$addr[0].IPAddress
-            $routes = @(Get-NetRoute -InterfaceAlias $Name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.DestinationPrefix -notmatch '^(224\.|255\.255\.255\.255/)' -and $_.DestinationPrefix -ne "$tunnelIp/32" })
-            $live = @($routes | ForEach-Object { [ordered]@{ prefix = [string]$_.DestinationPrefix; nextHop = [string]$_.NextHop; metric = [int]$_.RouteMetric } })
-            $onLink = @($routes | Where-Object { $_.NextHop -eq '0.0.0.0' } | ForEach-Object { [string]$_.DestinationPrefix })
-            $hops = @($routes | Where-Object { $_.NextHop -ne '0.0.0.0' } | ForEach-Object { [string]$_.NextHop } | Select-Object -Unique)
+function Get-PmTreeObjects {
+    <# Flat list of the device tree below (and including) $Root: Id, Type, Name, ParentId, Element (parents before children). #>
+    param([Parameter(Mandatory)]$Root, [int]$ParentId = -1)
+    $out = New-Object System.Collections.ArrayList
+    $stack = New-Object System.Collections.Stack
+    $stack.Push(@($Root, $ParentId))
+    while ($stack.Count) {
+        $pair = $stack.Pop(); $el = $pair[0]
+        $id = [int]$el.GetAttribute('id')
+        [void]$out.Add([pscustomobject]@{ Id = $id; Type = $el.LocalName; Name = (Get-PmObjectName $el); ParentId = [int]$pair[1]; Element = $el })
+        $kids = Get-PmChildElement $el 'nodes'
+        if ($kids) {
+            $list = @(Get-PmChildElements $kids | Where-Object { $_.LocalName -in $PmTreeObjectTypes -and $_.GetAttribute('id') -ne '' })
+            for ($i = $list.Count - 1; $i -ge 0; $i--) { $stack.Push(@($list[$i], $id)) }
         }
     }
-    if ($tunnelIp) {
-        # persistent routes that point into this VPN
-        $persistent = @(Get-PmPersistentRoutes | Where-Object { $gw = $_.gateway; ($hops -contains $gw) -or [bool]@($onLink | Where-Object { Test-PmAddressInPrefix -Address $gw -Prefix $_ }).Count })
-    } else {
-        # The VPN is down, so its interface cannot tell which persistent routes are its own. Kept are the
-        # persistent routes whose gateway no connected network reaches: they wait for a VPN. Marked as assumed.
-        $reachable = @()
-        if (Get-Command Get-NetRoute -ErrorAction SilentlyContinue) { $reachable = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -eq '0.0.0.0' -and $_.DestinationPrefix -notmatch '^(0\.0\.0\.0/0|224\.|255\.255\.255\.255/|127\.)' } | ForEach-Object { [string]$_.DestinationPrefix }) }
-        $persistent = @(Get-PmPersistentRoutes | Where-Object { $gw = $_.gateway; -not [bool]@($reachable | Where-Object { Test-PmAddressInPrefix -Address $gw -Prefix $_ }).Count } | ForEach-Object { $_['assumed'] = $true; $_ })
-    }
-    return [ordered]@{
-        format = 'vpn-routes/1'; computer = $env:COMPUTERNAME; vpn = $Name; created = (Get-Date).ToString('o'); tunnelIp = $tunnelIp
-        scope = $(if ($AllUsers) { 'AllUsers' } else { 'User' })
-        connectionRoutes = $connectionRoutes; liveRoutes = $live; persistentRoutes = $persistent
-    }
+    return $out
 }
 
-function Restore-PmVpnRoutes {
+function New-PmSectionDocument {
+    param([string]$Type, $Header)
+    $out = New-Object Xml.XmlDocument
+    $out.PreserveWhitespace = $true
+    [void]$out.AppendChild($out.CreateXmlDeclaration('1.0', 'UTF-8', $null))
+    $root = $out.CreateElement('prtgmanagersection'); [void]$out.AppendChild($root)
+    $root.SetAttribute('type', $Type); $root.SetAttribute('format', '1')
+    $root.SetAttribute('configversion', [string]$Header.ConfigVersion); $root.SetAttribute('prtgversion', [string]$Header.PrtgVersion)
+    $root.SetAttribute('max', [string]$Header.Max); $root.SetAttribute('created', (Get-Date).ToUniversalTime().ToString('o'))
+    return , $out
+}
+
+function Export-PmConfigSection {
     <#
-        Puts the routes of a route backup back: routes bound to the connection and persistent
-        routes. Routes that are already there are left alone; nothing is removed.
+        One part of a PRTG configuration as its own XML document:
+          devices       - the whole device tree (probes, groups, devices, sensors with their settings, triggers, channels)
+          notifications - notification templates + all schedules (templates refer to schedules)
+          triggers      - the triggers of every tree object, with the object's id, type and name
     #>
-    param([Parameter(Mandatory)]$Backup, [bool]$AllUsers = $true)
-    $name = [string]$Backup.vpn
-    $added = 0; $kept = 0; $failed = 0
-    $conn = $null
-    if (Get-Command Get-VpnConnection -ErrorAction SilentlyContinue) {
-        # Where the connection is NOW decides, not where it was: a restore puts the connections of a user
-        # without a profile into the phonebook for all users, and it runs as another account than that user.
-        foreach ($scope in @($AllUsers, (-not $AllUsers))) {
-            try { $conn = if ($scope) { Get-VpnConnection -Name $name -AllUserConnection -ErrorAction Stop } else { Get-VpnConnection -Name $name -ErrorAction Stop } } catch { $conn = $null }
-            if ($conn) { $AllUsers = $scope; break }
+    param([Parameter(Mandatory)]$Doc, [Parameter(Mandatory)][ValidateSet('devices', 'notifications', 'triggers')][string]$Type)
+    $out = New-PmSectionDocument -Type $Type -Header (Get-PmConfigHeader $Doc)
+    $root = $out.DocumentElement
+    switch ($Type) {
+        'devices' {
+            $tree = Get-PmConfigTreeRoot $Doc
+            if (-not $tree) { throw 'The device tree (root group 0) was not found in PRTG Configuration.dat.' }
+            $t = $out.CreateElement('tree'); [void]$root.AppendChild($t)
+            [void]$t.AppendChild($out.ImportNode($tree, $true))
+        }
+        'notifications' {
+            $n = $out.CreateElement('notifications'); [void]$root.AppendChild($n)
+            $c = Get-PmConfigContainer -Doc $Doc -Id -3
+            if ($c) { foreach ($x in (Get-PmChildElements $c)) { [void]$n.AppendChild($out.ImportNode($x, $true)) } }
+            $s = $out.CreateElement('schedules'); [void]$root.AppendChild($s)
+            $c = Get-PmConfigContainer -Doc $Doc -Id -7
+            if ($c) { foreach ($x in (Get-PmChildElements $c)) { [void]$s.AppendChild($out.ImportNode($x, $true)) } }
+        }
+        'triggers' {
+            $t = $out.CreateElement('triggers'); [void]$root.AppendChild($t)
+            $tree = Get-PmConfigTreeRoot $Doc
+            if ($tree) {
+                foreach ($o in (Get-PmTreeObjects -Root $tree)) {
+                    $tr = Get-PmChildElement $o.Element 'trigger'
+                    if (-not $tr -or -not @(Get-PmChildElements $tr).Count) { continue }
+                    $w = $out.CreateElement('object')
+                    $w.SetAttribute('id', [string]$o.Id); $w.SetAttribute('type', $o.Type); $w.SetAttribute('name', $o.Name)
+                    [void]$w.AppendChild($out.ImportNode($tr, $true))
+                    [void]$t.AppendChild($w)
+                }
+            }
         }
     }
-    foreach ($r in @($Backup.connectionRoutes | Where-Object { $_ })) {
-        if (-not $conn) { Write-PmLog "Routes of '$name': the connection does not exist on this computer - route $($r.prefix) skipped." 'WARN'; $failed++; continue }
-        if (@($conn.Routes | Where-Object { $_.DestinationPrefix -eq $r.prefix }).Count) { $kept++; continue }
-        try {
-            $p = @{ ConnectionName = $name; DestinationPrefix = [string]$r.prefix; RouteMetric = [int]$r.metric; PassThru = $true; ErrorAction = 'Stop' }
-            if ($AllUsers) { $p.AllUserConnection = $true }
-            [void](Add-VpnConnectionRoute @p); $added++
-        } catch { $failed++; Write-PmLog "Routes of '$name': $($r.prefix) could not be bound to the connection: $($_.Exception.Message)" 'WARN' }
+    return , $out
+}
+
+function Get-PmSectionSummary {
+    <# Counts of a saved part: probes / groups / devices / sensors / triggers / notifications / schedules. #>
+    param([Parameter(Mandatory)]$Section)
+    $r = $Section.DocumentElement
+    $c = [ordered]@{ type = $r.GetAttribute('type'); prtgVersion = $r.GetAttribute('prtgversion'); configVersion = $r.GetAttribute('configversion') }
+    switch ($c.type) {
+        'devices' {
+            $treeRoot = @(Get-PmChildElements (Get-PmChildElement $r 'tree'))[0]
+            $objs = @(); if ($treeRoot) { $objs = @(Get-PmTreeObjects -Root $treeRoot) }
+            foreach ($t in 'probenode', 'group', 'device', 'sensor') { $c[$t] = @($objs | Where-Object { $_.Type -eq $t }).Count }
+            $c.triggers = @($objs | ForEach-Object { Get-PmChildElements (Get-PmChildElement $_.Element 'trigger') } | Where-Object { $_ }).Count
+        }
+        'notifications' {
+            $c.notifications = @(Get-PmChildElements (Get-PmChildElement $r 'notifications')).Count
+            $c.schedules = @(Get-PmChildElements (Get-PmChildElement $r 'schedules')).Count
+        }
+        'triggers' {
+            $objs = @(Get-PmChildElements (Get-PmChildElement $r 'triggers'))
+            $c.objects = $objs.Count
+            $c.triggers = @($objs | ForEach-Object { Get-PmChildElements (Get-PmChildElement $_ 'trigger') } | Where-Object { $_ }).Count
+            $kinds = @{}
+            foreach ($o in $objs) { foreach ($i in (Get-PmChildElements (Get-PmChildElement $o 'trigger'))) { $kinds[$i.LocalName] = 1 + [int]$kinds[$i.LocalName] } }
+            $c.kinds = ($kinds.Keys | Sort-Object | ForEach-Object { "$_=$($kinds[$_])" }) -join ', '
+        }
     }
-    $have = @(Get-PmPersistentRoutes | ForEach-Object { "$($_.prefix)|$($_.gateway)" })
-    foreach ($r in @($Backup.persistentRoutes | Where-Object { $_ })) {
-        if ($have -contains "$($r.prefix)|$($r.gateway)") { $kept++; continue }
-        $net = ([string]$r.prefix -split '/')[0]
-        & route.exe -p add $net mask ([string]$r.mask) ([string]$r.gateway) metric ([int]$r.metric) 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0 -and (@(Get-PmPersistentRoutes | Where-Object { $_.prefix -eq $r.prefix -and $_.gateway -eq $r.gateway }).Count)) { $added++; continue }
-        # the gateway is only reachable while the VPN is up: keep the route for the next connect / restart
-        try {
-            $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\PersistentRoutes'
-            New-ItemProperty -Path $key -Name ("{0},{1},{2},{3}" -f $net, $r.mask, $r.gateway, [int]$r.metric) -Value '' -PropertyType String -Force -ErrorAction Stop | Out-Null
-            $added++
-            Write-PmLog "Routes of '$name': persistent route $($r.prefix) via $($r.gateway) is saved; it becomes active when the VPN is connected." 'INFO'
-        } catch { $failed++; Write-PmLog "Routes of '$name': persistent route $($r.prefix) via $($r.gateway) could not be saved: $($_.Exception.Message)" 'WARN' }
+    return [pscustomobject]$c
+}
+
+function Get-PmTriggerRefs {
+    <# Notification ids used by the trigger items below an element (0 / negative = none). #>
+    param($TriggerElement)
+    $ids = @()
+    foreach ($it in (Get-PmChildElements $TriggerElement)) {
+        foreach ($f in $PmTriggerRefFields) { $v = Get-PmRefId (Get-PmDataValue $it $f); if ($v -gt 0) { $ids += $v } }
     }
-    Write-PmLog "Routes of '$name': $added put back, $kept were already there, $failed failed." $(if ($failed) { 'WARN' } else { 'OK' })
-    return [ordered]@{ vpn = $name; added = $added; kept = $kept; failed = $failed }
+    return @($ids | Select-Object -Unique)
+}
+
+function Get-PmSettingsXml {
+    <# The settings of an object for comparison: data, trigger and channels (history and children excluded). #>
+    param($Element)
+    $sb = New-Object Text.StringBuilder
+    foreach ($n in 'data', 'trigger', 'channels', 'notifies') { $e = Get-PmChildElement $Element $n; if ($e) { [void]$sb.Append(($e.OuterXml -replace '\s+', ' ')) } }
+    return $sb.ToString()
+}
+
+function New-PmPlanItem {
+    param([int]$Id, [string]$Type, [string]$Name, [int]$ParentId, [string]$Action, [string]$Reason, [string]$Kind = 'object')
+    return [pscustomobject][ordered]@{ Id = $Id; Type = $Type; Name = $Name; ParentId = $ParentId; Action = $Action; Reason = $Reason; Kind = $Kind; NewId = $null }
+}
+
+function Get-PmSectionRestorePlan {
+    <#
+        PURE. What restoring a saved part into a configuration would do - nothing is changed.
+          Mode merge     : create what is missing, never change what exists (differences are conflicts)
+          Mode overwrite : create what is missing, update existing objects with the saved settings
+          ReIdConflicts  : objects whose id is taken by another object on the target are created with new ids
+        Returns Type, Mode, Blockers, Warnings, Items (Action create | update | skip | conflict | create-new-id)
+        and MissingDependencies.
+    #>
+    param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)]$Section, [ValidateSet('merge', 'overwrite')][string]$Mode = 'merge', [bool]$ReIdConflicts = $false)
+    $sr = $Section.DocumentElement
+    if ($sr.LocalName -ne 'prtgmanagersection') { throw 'This is not a saved part of a PRTG configuration.' }
+    $type = $sr.GetAttribute('type')
+    if ($type -notin $PmSectionTypes) { throw "Unknown part type '$type'." }
+    $th = Get-PmConfigHeader $Target; $sh = Get-PmConfigHeader $Section
+    $plan = [ordered]@{ Type = $type; Mode = $Mode; ReIdConflicts = $ReIdConflicts; Blockers = @(); Warnings = @(); Items = New-Object System.Collections.ArrayList; MissingDependencies = @()
+        Source = [ordered]@{ PrtgVersion = $sh.PrtgVersion; ConfigVersion = $sh.ConfigVersion }; Target = [ordered]@{ PrtgVersion = $th.PrtgVersion; ConfigVersion = $th.ConfigVersion } }
+    if ($sh.ConfigVersion -gt $th.ConfigVersion) {
+        $plan.Blockers += "The backup was made with a newer PRTG (configuration format $($sh.ConfigVersion), PRTG $($sh.PrtgVersion)) than the target has (format $($th.ConfigVersion), PRTG $($th.PrtgVersion)). Update PRTG on the target to $($sh.PrtgVersion) or newer first."
+    } elseif ($sh.PrtgVersion -and $th.PrtgVersion -and $sh.PrtgVersion -ne $th.PrtgVersion) {
+        $plan.Warnings += "The backup comes from PRTG $($sh.PrtgVersion), the target runs PRTG $($th.PrtgVersion). PRTG converts older settings when it starts."
+    }
+    $map = Get-PmConfigObjectMap $Target
+    $created = @{}   # id -> $true for objects this plan creates (keeps their id)
+    $pendingDeps = New-Object System.Collections.ArrayList
+    $depNotes = @{}
+    $noteDep = {
+        param([string]$Key, [string]$Text)
+        if (-not $depNotes.ContainsKey($Key)) { $depNotes[$Key] = $Text }
+    }
+    $checkRefs = {
+        param($El, [string]$What)
+        foreach ($nid in (Get-PmTriggerRefs (Get-PmChildElement $El 'trigger'))) {
+            $t = $map[[int]$nid]
+            if (-not $t -or $t.LocalName -ne 'notification') { & $noteDep "notification:$nid" "Notification template $nid (used by the triggers of $What) is not on the target - restore Notifications too, or the trigger sends nothing." }
+        }
+        $sid = Get-PmRefId (Get-PmDataValue $El 'schedule')
+        if ($sid -gt 0) { $t = $map[[int]$sid]; if (-not $t -or $t.LocalName -ne 'schedule') { & $noteDep "schedule:$sid" "Schedule $sid (used by $What) is not on the target - restore Notifications (they include the schedules)." } }
+        # checked after the whole plan: the dependency can be an object this plan creates later (e.g. its own sensor)
+        $did = Get-PmRefId (Get-PmDataValue $El 'dependency')
+        if ($did -gt 0) { [void]$pendingDeps.Add(@{ Id = [int]$did; What = $What }) }
+    }
+
+    switch ($type) {
+        'devices' {
+            $treeRoot = @(Get-PmChildElements (Get-PmChildElement $sr 'tree'))[0]
+            if (-not $treeRoot) { throw 'The saved device tree is empty.' }
+            $state = @{}   # id -> action of the saved objects (to decide about their children)
+            foreach ($o in (Get-PmTreeObjects -Root $treeRoot)) {
+                $what = "$($o.Type) '$($o.Name)' ($($o.Id))"
+                $pAction = if ($o.ParentId -ge 0) { $state[$o.ParentId] } else { 'root' }
+                if ($pAction -eq 'create-new-id' -or $pAction -eq 'inside-new-id') {
+                    $state[$o.Id] = 'inside-new-id'; $created[[int]$o.Id] = $true
+                    [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'create-new-id' -Reason 'comes with its parent, which gets a new id'))
+                    & $checkRefs $o.Element $what; continue
+                }
+                if ($pAction -in 'conflict', 'skipped-parent') {
+                    $state[$o.Id] = 'skipped-parent'
+                    [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'skip' -Reason "its parent ($($o.ParentId)) is not restored"))
+                    continue
+                }
+                $t = $map[[int]$o.Id]
+                if (-not $t) {
+                    $pExists = ($o.ParentId -lt 0) -or $map.ContainsKey([int]$o.ParentId) -or $created.ContainsKey([int]$o.ParentId)
+                    if (-not $pExists) {
+                        $state[$o.Id] = 'skipped-parent'
+                        [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'skip' -Reason "its parent ($($o.ParentId)) is not on the target"))
+                        continue
+                    }
+                    $state[$o.Id] = 'create'; $created[[int]$o.Id] = $true
+                    [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'create' -Reason 'not on the target'))
+                    & $checkRefs $o.Element $what; continue
+                }
+                $tName = Get-PmObjectName $t
+                if ($t.LocalName -ne $o.Type -or ($tName -ne $o.Name -and $Mode -eq 'merge')) {
+                    $why = if ($t.LocalName -ne $o.Type) { "id $($o.Id) is a $($t.LocalName) '$tName' on the target" } else { "id $($o.Id) is named '$tName' on the target" }
+                    if ($ReIdConflicts -and $o.ParentId -ge 0) {
+                        $state[$o.Id] = 'create-new-id'; $created[[int]$o.Id] = $true
+                        [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'create-new-id' -Reason "$why - created with a new id (its history does not follow)"))
+                        & $checkRefs $o.Element $what
+                    } else {
+                        $state[$o.Id] = 'conflict'
+                        [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'conflict' -Reason "$why (ID conflict)"))
+                    }
+                    continue
+                }
+                $tParent = if ($t.ParentNode -and $t.ParentNode.ParentNode) { Get-PmObjectId $t.ParentNode.ParentNode } else { $null }
+                $moved = ($o.ParentId -ge 0 -and $null -ne $tParent -and [int]$tParent -ne $o.ParentId)
+                $same = ((Get-PmSettingsXml $t) -eq (Get-PmSettingsXml $o.Element))
+                if ($Mode -eq 'merge' -or $same) {
+                    $state[$o.Id] = 'skip'
+                    $why = if ($same) { 'identical on the target' } else { 'already on the target (merge keeps it)' }
+                    if ($moved) { $why += "; it is in another place on the target (parent $tParent)" }
+                    [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'skip' -Reason $why))
+                    continue
+                }
+                $state[$o.Id] = 'update'
+                [void]$plan.Items.Add((New-PmPlanItem -Id $o.Id -Type $o.Type -Name $o.Name -ParentId $o.ParentId -Action 'update' -Reason $(if ($moved) { "settings differ; stays where it is on the target (parent $tParent)" } else { 'settings differ' })))
+                & $checkRefs $o.Element $what
+            }
+        }
+        'notifications' {
+            $schedById = @{}
+            foreach ($s in (Get-PmChildElements (Get-PmChildElement $sr 'schedules'))) { $schedById[[int]$s.GetAttribute('id')] = $s }
+            $needSched = @{}
+            foreach ($n in (Get-PmChildElements (Get-PmChildElement $sr 'notifications'))) {
+                $id = [int]$n.GetAttribute('id'); $name = Get-PmObjectName $n
+                $t = $map[$id]
+                $sid = Get-PmRefId (Get-PmDataValue $n 'schedule')
+                $act = $null
+                if (-not $t) { $act = 'create'; $why = 'not on the target' }
+                elseif ($t.LocalName -ne 'notification' -or ((Get-PmObjectName $t) -ne $name -and $Mode -eq 'merge')) {
+                    $why = if ($t.LocalName -ne 'notification') { "id $id is a $($t.LocalName) on the target" } else { "id $id is named '$(Get-PmObjectName $t)' on the target" }
+                    if ($ReIdConflicts) { $act = 'create-new-id'; $why += ' - created with a new id (triggers on the target keep pointing at the old one)' } else { $act = 'conflict'; $why += ' (ID conflict)' }
+                } elseif ((Get-PmSettingsXml $t) -eq (Get-PmSettingsXml $n)) { $act = 'skip'; $why = 'identical on the target' }
+                elseif ($Mode -eq 'merge') { $act = 'skip'; $why = 'already on the target (merge keeps it)' }
+                else { $act = 'update'; $why = 'settings differ' }
+                [void]$plan.Items.Add((New-PmPlanItem -Id $id -Type 'notification' -Name $name -ParentId -3 -Action $act -Reason $why))
+                if ($act -in 'create', 'update', 'create-new-id' -and $sid -gt 0) { $needSched[$sid] = $name }
+            }
+            foreach ($sid in $needSched.Keys) {
+                $t = $map[[int]$sid]
+                if ($t -and $t.LocalName -eq 'schedule') { continue }
+                if ($schedById.ContainsKey([int]$sid) -and -not $t) {
+                    [void]$plan.Items.Add((New-PmPlanItem -Id $sid -Type 'schedule' -Name (Get-PmObjectName $schedById[[int]$sid]) -ParentId -7 -Action 'create' -Reason "used by notification '$($needSched[$sid])'" -Kind 'schedule'))
+                } else { & $noteDep "schedule:$sid" "Schedule $sid (used by notification '$($needSched[$sid])') is not on the target and not in the backup." }
+            }
+        }
+        'triggers' {
+            foreach ($w in (Get-PmChildElements (Get-PmChildElement $sr 'triggers'))) {
+                $oid = [int]$w.GetAttribute('id'); $otype = $w.GetAttribute('type'); $oname = $w.GetAttribute('name')
+                $what = "$otype '$oname' ($oid)"
+                $t = $map[$oid]
+                $items = @(Get-PmChildElements (Get-PmChildElement $w 'trigger'))
+                if (-not $t -or $t.LocalName -ne $otype) {
+                    $why = if ($t) { "id $oid is a $($t.LocalName) on the target" } else { 'the object is not on the target' }
+                    foreach ($i in $items) { [void]$plan.Items.Add((New-PmPlanItem -Id ([int]$i.GetAttribute('id')) -Type "$($i.LocalName) trigger" -Name $what -ParentId $oid -Action 'skip' -Reason $why -Kind 'trigger')) }
+                    continue
+                }
+                $tt = Get-PmChildElement $t 'trigger'
+                foreach ($i in $items) {
+                    $iid = $i.GetAttribute('id')
+                    $have = $null
+                    if ($tt) { foreach ($x in (Get-PmChildElements $tt)) { if ($x.LocalName -eq $i.LocalName -and $x.GetAttribute('id') -eq $iid) { $have = $x; break } } }
+                    if (-not $have) { $act = 'create'; $why = 'not on the target' }
+                    elseif (($have.OuterXml -replace '\s+', ' ') -eq ($i.OuterXml -replace '\s+', ' ')) { $act = 'skip'; $why = 'identical on the target' }
+                    elseif ($Mode -eq 'merge') { $act = 'conflict'; $why = 'the target has a different trigger with this id (merge keeps it)' }
+                    else { $act = 'update'; $why = 'settings differ' }
+                    [void]$plan.Items.Add((New-PmPlanItem -Id ([int]$iid) -Type "$($i.LocalName) trigger" -Name $what -ParentId $oid -Action $act -Reason $why -Kind 'trigger'))
+                    if ($act -in 'create', 'update') {
+                        foreach ($f in $PmTriggerRefFields) {
+                            $nid = Get-PmRefId (Get-PmDataValue $i $f)
+                            if ($nid -gt 0) { $tn = $map[[int]$nid]; if (-not $tn -or $tn.LocalName -ne 'notification') { & $noteDep "notification:$nid" "Notification template $nid (used by a trigger of $what) is not on the target - restore Notifications too." } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    foreach ($d in $pendingDeps) {
+        if (-not $map.ContainsKey($d.Id) -and -not $created.ContainsKey($d.Id)) { & $noteDep "dependency:$($d.Id)" "Object $($d.Id) (the dependency of $($d.What)) is not on the target and not in the backup - PRTG removes the dependency." }
+    }
+    $plan.MissingDependencies = @($depNotes.Keys | Sort-Object | ForEach-Object { $depNotes[$_] })
+    $items = @($plan.Items)
+    $plan.Counts = [ordered]@{
+        create = @($items | Where-Object { $_.Action -in 'create', 'create-new-id' }).Count; update = @($items | Where-Object Action -eq 'update').Count
+        skip = @($items | Where-Object Action -eq 'skip').Count; conflict = @($items | Where-Object Action -eq 'conflict').Count
+    }
+    $plan.Items = $items
+    return [pscustomobject]$plan
+}
+
+function Copy-PmSettings {
+    <# Replaces data / trigger / channels / notifies of a target object with the saved ones (history and children stay). #>
+    param($TargetElement, $SourceElement)
+    $doc = $TargetElement.OwnerDocument
+    foreach ($n in 'data', 'trigger', 'channels', 'notifies') {
+        $src = Get-PmChildElement $SourceElement $n
+        if (-not $src) { continue }
+        $new = $doc.ImportNode($src, $true)
+        $old = Get-PmChildElement $TargetElement $n
+        if ($old) { [void]$TargetElement.ReplaceChild($new, $old) } else { [void]$TargetElement.PrependChild($new) }
+    }
+}
+
+function Invoke-PmSectionMerge {
+    <#
+        Applies a restore plan to a configuration document in memory (the caller saves it).
+        Returns counts and the id map of objects that got new ids.
+    #>
+    param([Parameter(Mandatory)]$Target, [Parameter(Mandatory)]$Section, [Parameter(Mandatory)]$Plan)
+    $sr = $Section.DocumentElement
+    $map = Get-PmConfigObjectMap $Target
+    $max = [int]('0' + $Target.DocumentElement.GetAttribute('max'))
+    foreach ($k in $map.Keys) { if ($k -gt $max) { $max = $k } }
+    $done = [ordered]@{ created = 0; updated = 0; reIded = 0; skipped = 0; conflicts = 0 }
+    $idMap = @{}
+    $byId = @{}; foreach ($i in @($Plan.Items)) { $byId["$($i.Kind):$($i.Id):$($i.ParentId):$($i.Type)"] = $i }
+    $getNodes = {
+        param($Element)
+        $n = Get-PmChildElement $Element 'nodes'
+        if (-not $n) { $n = $Target.CreateElement('nodes'); [void]$Element.AppendChild($n) }
+        return $n
+    }
+    switch ($Plan.Type) {
+        'devices' {
+            $treeRoot = @(Get-PmChildElements (Get-PmChildElement $sr 'tree'))[0]
+            foreach ($o in (Get-PmTreeObjects -Root $treeRoot)) {
+                $it = $byId["object:$($o.Id):$($o.ParentId):$($o.Type)"]
+                if (-not $it) { continue }
+                switch ($it.Action) {
+                    'create' {
+                        $parent = $map[[int]$o.ParentId]
+                        if (-not $parent) { throw "Restore stopped: the parent $($o.ParentId) of $($o.Type) '$($o.Name)' does not exist." }
+                        $new = $Target.ImportNode($o.Element, $true)
+                        $kids = Get-PmChildElement $new 'nodes'
+                        if ($kids) { foreach ($c in @(Get-PmChildElements $kids)) { [void]$kids.RemoveChild($c) } }
+                        [void](& $getNodes $parent).AppendChild($new)
+                        $map[[int]$o.Id] = $new; $done.created++
+                    }
+                    'update' { Copy-PmSettings -TargetElement $map[[int]$o.Id] -SourceElement $o.Element; $done.updated++ }
+                    'create-new-id' {
+                        $parentItem = @($Plan.Items | Where-Object { $_.Kind -eq 'object' -and $_.Id -eq $o.ParentId }) | Select-Object -First 1
+                        if ($parentItem -and $parentItem.Action -eq 'create-new-id') { continue }   # came along with its parent
+                        $parent = $map[[int]$o.ParentId]
+                        if (-not $parent) { throw "Restore stopped: the parent $($o.ParentId) of $($o.Type) '$($o.Name)' does not exist." }
+                        $new = $Target.ImportNode($o.Element, $true)
+                        foreach ($e in @($new.SelectNodes('descendant-or-self::*[@id]'))) {
+                            if ($e -ne $new -and (-not $e.ParentNode -or $e.ParentNode.LocalName -ne 'nodes')) { continue }
+                            $old = [int]$e.GetAttribute('id'); $max++
+                            $e.SetAttribute('id', [string]$max); $idMap[$old] = $max; $done.reIded++
+                        }
+                        foreach ($d in @($new.SelectNodes('descendant-or-self::data/dependency'))) {
+                            $ref = Get-PmRefId $d.InnerText
+                            if ($idMap.ContainsKey($ref)) { $d.InnerText = [string]$idMap[$ref] }
+                        }
+                        [void](& $getNodes $parent).AppendChild($new)
+                    }
+                    'skip' { $done.skipped++ }
+                    'conflict' { $done.conflicts++ }
+                }
+            }
+        }
+        'notifications' {
+            $nc = Get-PmConfigContainer -Doc $Target -Id -3
+            $sc = Get-PmConfigContainer -Doc $Target -Id -7
+            if (-not $nc -or -not $sc) { throw 'The target configuration has no notification / schedule folder.' }
+            $src = @{}; foreach ($n in (Get-PmChildElements (Get-PmChildElement $sr 'notifications'))) { $src[[int]$n.GetAttribute('id')] = $n }
+            $srcS = @{}; foreach ($n in (Get-PmChildElements (Get-PmChildElement $sr 'schedules'))) { $srcS[[int]$n.GetAttribute('id')] = $n }
+            foreach ($it in @($Plan.Items | Where-Object Kind -eq 'schedule')) {
+                if ($it.Action -ne 'create') { continue }
+                $new = $Target.ImportNode($srcS[[int]$it.Id], $true); [void]$sc.AppendChild($new); $map[[int]$it.Id] = $new; $done.created++
+            }
+            foreach ($it in @($Plan.Items | Where-Object Kind -eq 'object')) {
+                $s = $src[[int]$it.Id]
+                switch ($it.Action) {
+                    'create' { $new = $Target.ImportNode($s, $true); [void]$nc.AppendChild($new); $map[[int]$it.Id] = $new; $done.created++ }
+                    'update' { Copy-PmSettings -TargetElement $map[[int]$it.Id] -SourceElement $s; $done.updated++ }
+                    'create-new-id' { $new = $Target.ImportNode($s, $true); $max++; $idMap[[int]$it.Id] = $max; $new.SetAttribute('id', [string]$max); [void]$nc.AppendChild($new); $done.reIded++ }
+                    'skip' { $done.skipped++ }
+                    'conflict' { $done.conflicts++ }
+                }
+            }
+        }
+        'triggers' {
+            $src = @{}; foreach ($w in (Get-PmChildElements (Get-PmChildElement $sr 'triggers'))) { $src[[int]$w.GetAttribute('id')] = $w }
+            foreach ($it in @($Plan.Items)) {
+                if ($it.Action -eq 'skip') { $done.skipped++; continue }
+                if ($it.Action -eq 'conflict') { $done.conflicts++; continue }
+                $obj = $map[[int]$it.ParentId]; $w = $src[[int]$it.ParentId]
+                $kind = ($it.Type -split ' ')[0]
+                $item = $null
+                foreach ($x in (Get-PmChildElements (Get-PmChildElement $w 'trigger'))) { if ($x.LocalName -eq $kind -and [int]$x.GetAttribute('id') -eq $it.Id) { $item = $x; break } }
+                if (-not $obj -or -not $item) { continue }
+                $tt = Get-PmChildElement $obj 'trigger'
+                if (-not $tt) { $tt = $Target.CreateElement('trigger'); [void]$obj.PrependChild($tt) }
+                $new = $Target.ImportNode($item, $true)
+                if ($it.Action -eq 'update') {
+                    foreach ($x in (Get-PmChildElements $tt)) { if ($x.LocalName -eq $kind -and [int]$x.GetAttribute('id') -eq $it.Id) { [void]$tt.ReplaceChild($new, $x); break } }
+                    $done.updated++
+                } else { [void]$tt.AppendChild($new); $done.created++ }
+            }
+        }
+    }
+    $highest = $max
+    foreach ($k in (Get-PmConfigObjectMap $Target).Keys) { if ($k -gt $highest) { $highest = $k } }
+    if ($highest -gt [int]('0' + $Target.DocumentElement.GetAttribute('max'))) { $Target.DocumentElement.SetAttribute('max', [string]$highest) }
+    return [pscustomobject]@{ Counts = [pscustomobject]$done; IdMap = $idMap; Max = $highest }
 }
 
 function Invoke-PmReg {
@@ -634,7 +1200,7 @@ function New-PmShadowCopy {
 
 function Clear-PmStaleSnapshots {
     <#
-        Removes VSS snapshots that PRTG Mover itself created in an earlier, interrupted run
+        Removes VSS snapshots that PRTG Manager itself created in an earlier, interrupted run
         (recognised by their C:\PrtgMoverVss_* link). Other snapshots are never touched.
     #>
     $removed = 0
@@ -772,8 +1338,8 @@ function Get-PmPrtgLicenseState {
 
 function Remove-PmPrtgLicense {
     <#
-        Removes the PRTG license data from THIS server: license name, key, hash and install
-        date in the registry, and license files in the data folder. PRTG is stopped first,
+        Removes the PRTG license from THIS server: license name, key and the activation hash of
+        that key in the registry, and license files in the data folder. PRTG is stopped first,
         because the core writes its settings back when it stops. A copy of what is removed is
         kept in <work root>\rollback\license-<timestamp>.
         Nothing else is changed: system id, configuration and monitoring data stay as they are.
@@ -785,10 +1351,10 @@ function Remove-PmPrtgLicense {
     $describe = { param($s) if ($s -and $s.Known) { "$($s.Edition), licensed for `"$($s.Name)`", $($s.MaxSensors) sensors" } else { 'no license line in the core log' } }
     $before = Get-PmPrtgLicenseState
     Write-PmLog "License before: $(& $describe $before)"
-    $values = @(Get-PmLicenseValues)
+    $values = @(Get-PmLicenseValues | Where-Object { $_.Name -in $PmLicenseOwnValues })
     $files = @(Get-PmLicenseFiles -DataPath $prtg.DataPath)
     if (-not $values.Count -and -not $files.Count) {
-        Write-PmLog 'There is no license data on this server - nothing to remove.' 'OK'
+        Write-PmLog 'There is no license on this server (no license name, key or activation) - nothing to remove.' 'OK'
         return (New-PmResult @{ Removed = @(); Rollback = $null; Before = $before; After = $before; Healthy = $null; WebUrl = $null; Core = $prtg.CoreStatus })
     }
 
@@ -807,12 +1373,12 @@ function Remove-PmPrtgLicense {
     Stop-PmPrtgServices
     Write-PmProgress 45 'Removing license data'
     $removed = @()
-    foreach ($v in @(Get-PmLicenseValues)) {
+    foreach ($v in @(Get-PmLicenseValues | Where-Object { $_.Name -in $PmLicenseOwnValues })) {
         Remove-ItemProperty -LiteralPath $v.Path -Name $v.Name -ErrorAction Stop
         $removed += $v.Name
     }
     foreach ($f in @(Get-PmLicenseFiles -DataPath $prtg.DataPath)) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; $removed += $f.Name }
-    $left = @(Get-PmLicenseValues | ForEach-Object { $_.Name })
+    $left = @(Get-PmLicenseValues | Where-Object { $_.Name -in $PmLicenseOwnValues } | ForEach-Object { $_.Name })
     if ($left.Count) { throw "These license values could not be removed: $($left -join ', ')" }
     Write-PmLog "Removed: $(@($removed | Select-Object -Unique) -join ', ')" 'OK'
 
@@ -836,6 +1402,11 @@ function Remove-PmPrtgLicense {
         Healthy = $(if ($health) { [bool]$health.Healthy }); WebUrl = $(if ($health) { $health.Url }); Core = (Get-PmPrtgInfo).CoreStatus
     }
 }
+
+# The license itself: what the PRTG Administration Tool writes and PRTG's activation of that key. PRTG's own
+# bookkeeping (LicenseInstalled = first install date, SensorCountPausedByLicenseMax) is not part of it and is
+# never removed - removing the install date could look like resetting a trial.
+$PmLicenseOwnValues = 'LicenseName', 'LicenseKey', 'LicenseHash'
 
 function Get-PmLicenseFiles {
     param([string]$DataPath)
@@ -927,7 +1498,7 @@ function Set-PmPrtgFirewall {
     <# Opens inbound TCP for the PRTG web ports and the remote-probe port (23560). #>
     param([int[]]$Ports)
     $ports = @($Ports) + 23560 | Where-Object { $_ } | Select-Object -Unique | Sort-Object
-    $name = 'PRTG Mover - PRTG Core (web + probes)'
+    $name = 'PRTG Manager - PRTG Core (web + probes)'
     Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol TCP -LocalPort $ports -Action Allow -Profile Any | Out-Null
     return $ports
@@ -943,8 +1514,6 @@ function Get-PmSystemInfo {
     if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
         try { $osVersion = [string](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Version } catch { }
     }
-    $vpn = @()
-    try { $vpn = @(Get-VpnConnection -AllUserConnection -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Server = $_.ServerAddress; Type = [string]$_.TunnelType; Status = [string]$_.ConnectionStatus } }) } catch { }
     $prtg = Get-PmPrtgInfo
     $dataSize = 0; $stats = $null
     if ($prtg.Installed) {
@@ -971,12 +1540,461 @@ function Get-PmSystemInfo {
         PrtgConfigStats = $stats
         PrtgLicense  = $(if ($prtg.Installed) { try { Get-PmPrtgLicenseReport } catch { [pscustomobject]@{ Error = "$($_.Exception.Message)" } } })
         PrtgLicenseState = $(if ($prtg.Installed) { try { Get-PmPrtgLicenseState } catch { $null } })
-        VpnAllUsers  = $vpn
         Profiles     = @(Get-PmUserProfiles | Select-Object -ExpandProperty Name)
         Disks        = $disks
         SystemDrive  = $env:SystemDrive
         RdpPort      = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue).PortNumber
         PSVersion    = $PSVersionTable.PSVersion.ToString()
+    }
+}
+
+# ---------------------------------------------------------------- configuration parts: backup and restore on a server
+
+function Get-PmPrtgConfigPath {
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
+    return (Join-Path $prtg.DataPath 'PRTG Configuration.dat')
+}
+
+function Get-PmPrtgSection {
+    <#
+        READ-ONLY. One part of the PRTG configuration of this server (devices, notifications or triggers)
+        as XML text. PRTG keeps running; nothing is written on this server.
+    #>
+    param([Parameter(Mandatory)][ValidateSet('devices', 'notifications', 'triggers')][string]$Type)
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
+    $cfg = Join-Path $prtg.DataPath 'PRTG Configuration.dat'
+    Write-PmLog "Reading $cfg - PRTG keeps running, nothing on this server is changed." 'STEP'
+    $doc = Read-PmPrtgConfig -Path $cfg
+    $sec = Export-PmConfigSection -Doc $doc -Type $Type
+    $sum = Get-PmSectionSummary -Section $sec
+    $text = ConvertTo-PmXmlText -Doc $sec
+    Write-PmLog ("Part '{0}' read: {1}" -f $Type, (($sum.PSObject.Properties | Where-Object { $_.Name -notin 'type' } | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', ')) 'OK'
+    New-PmResult @{ Type = $Type; Packed = (ConvertTo-PmPackedText $text); Summary = $sum; Header = (Get-PmConfigHeader $doc); PrtgVersion = $prtg.Version; Computer = $env:COMPUTERNAME; Os = (Get-PmOsCaption) }
+}
+
+function Save-PmPrtgConfig {
+    <# Writes a configuration document over PRTG Configuration.dat (same BOM as before), via a temp file that is parsed again first. #>
+    param([Parameter(Mandatory)]$Doc, [Parameter(Mandatory)][string]$Path)
+    $orig = [IO.File]::ReadAllBytes($Path)
+    $bom = ($orig.Length -ge 3 -and $orig[0] -eq 0xEF -and $orig[1] -eq 0xBB -and $orig[2] -eq 0xBF)
+    $tmp = "$Path.pm-new"
+    [IO.File]::WriteAllBytes($tmp, (ConvertTo-PmXmlBytes -Doc $Doc -Bom $bom))
+    [void](Read-PmPrtgConfig -Path $tmp -Tries 1)   # must parse, or nothing is replaced
+    Copy-Item -LiteralPath $tmp -Destination $Path -Force
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+}
+
+function Get-PmSectionRestorePreview {
+    <# READ-ONLY. What restoring a saved part would do on this server. #>
+    param([Parameter(Mandatory)][string]$Packed, [ValidateSet('merge', 'overwrite')][string]$Mode = 'merge', [bool]$ReIdConflicts = $false)
+    $cfg = Get-PmPrtgConfigPath
+    $target = Read-PmPrtgConfig -Path $cfg
+    $section = Read-PmXmlText -Text (ConvertFrom-PmPackedText $Packed)
+    $plan = Get-PmSectionRestorePlan -Target $target -Section $section -Mode $Mode -ReIdConflicts $ReIdConflicts
+    Write-PmLog ("Preview ({0}, {1}): {2} to create, {3} to update, {4} unchanged, {5} conflict(s), {6} missing dependenc(ies)." -f $plan.Type, $Mode, $plan.Counts.create, $plan.Counts.update, $plan.Counts.skip, $plan.Counts.conflict, @($plan.MissingDependencies).Count) 'OK'
+    New-PmResult @{ Plan = $plan; Prtg = (Get-PmPrtgInfo) }
+}
+
+function Invoke-PmSectionRestore {
+    <#
+        Restores a saved part (devices, notifications or triggers) into the PRTG of this server:
+          1. plan against the current configuration (blockers stop here, nothing changed)
+          2. rollback copy of PRTG Configuration.dat into <work root>\rollback\config-<time>
+          3. PRTG stopped (the core writes its configuration when it stops), plan made again on that state
+          4. merge in memory, written via a temp file that must parse, then PRTG started and checked
+          5. PRTG does not come up -> the rollback copy is put back and PRTG started again
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Packed, [ValidateSet('merge', 'overwrite')][string]$Mode = 'merge', [bool]$ReIdConflicts = $false,
+        [bool]$StartServices = $true, [int]$HealthTimeoutMinutes = 15, [bool]$AllowConflicts = $true
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-PmIsAdmin)) { throw 'Restoring into PRTG needs administrator rights on this server.' }
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
+    $cfg = Join-Path $prtg.DataPath 'PRTG Configuration.dat'
+    $section = Read-PmXmlText -Text (ConvertFrom-PmPackedText $Packed)
+    Write-PmProgress 5 'Planning'
+    $plan = Get-PmSectionRestorePlan -Target (Read-PmPrtgConfig -Path $cfg) -Section $section -Mode $Mode -ReIdConflicts $ReIdConflicts
+    if (@($plan.Blockers).Count) { throw "Nothing was changed: $(@($plan.Blockers) -join ' ')" }
+    if (-not $AllowConflicts -and $plan.Counts.conflict) { throw "Nothing was changed: $($plan.Counts.conflict) conflict(s) - see the preview." }
+    if (-not ($plan.Counts.create + $plan.Counts.update)) {
+        Write-PmLog "Nothing to restore: every item is already on this server or in conflict ($($plan.Counts.skip) unchanged, $($plan.Counts.conflict) conflict(s)). PRTG was not stopped." 'OK'
+        return (New-PmResult @{ Plan = $plan; Applied = $null; Rollback = $null; Healthy = $null; RolledBack = $false; Changed = $false })
+    }
+    Write-PmProgress 15 'Saving a rollback copy'
+    $rb = Join-Path (Get-PmWorkRoot) ('rollback\config-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Force -Path $rb | Out-Null
+    $wasRunning = ($prtg.CoreStatus -eq 'Running')
+    Write-PmLog "Stopping PRTG (the configuration can only be changed while the core is stopped)..." 'STEP'
+    Write-PmProgress 25 'Stopping PRTG'
+    Stop-PmPrtgServices
+    Copy-Item -LiteralPath $cfg -Destination (Join-Path $rb 'PRTG Configuration.dat') -Force
+    Write-PmLog "Rollback copy: $rb\PRTG Configuration.dat" 'OK'
+    $applied = $null; $health = $null; $rolledBack = $false; $err = $null
+    try {
+        Write-PmProgress 40 'Merging'
+        $target = Read-PmPrtgConfig -Path $cfg
+        $plan = Get-PmSectionRestorePlan -Target $target -Section $section -Mode $Mode -ReIdConflicts $ReIdConflicts
+        if (@($plan.Blockers).Count) { throw (@($plan.Blockers) -join ' ') }
+        $applied = Invoke-PmSectionMerge -Target $target -Section $section -Plan $plan
+        Save-PmPrtgConfig -Doc $target -Path $cfg
+        Write-PmLog ("Configuration written: {0} created, {1} updated, {2} with new ids, {3} unchanged, {4} conflict(s) left as they are." -f $applied.Counts.created, $applied.Counts.updated, $applied.Counts.reIded, $applied.Counts.skipped, $applied.Counts.conflicts) 'OK'
+        Write-PmLog "Configuration now: $(Get-PmPrtgConfigStats -Path $cfg)" 'INFO'
+        if ($StartServices -or $wasRunning) {
+            Write-PmProgress 60 'Starting PRTG'
+            $box = @{}
+            Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
+            $health = $box.Health
+            if (-not $health.Healthy) { throw "PRTG did not come up completely with the restored configuration ($($health.Message))." }
+            Write-PmLog "PRTG is up with the restored configuration: $($health.Url)" 'OK'
+        }
+    } catch {
+        $err = "$($_.Exception.Message)"
+        Write-PmLog "Restore failed: $err - putting the rollback copy back." 'ERROR'
+        try {
+            Stop-PmPrtgServices
+            Copy-Item -LiteralPath (Join-Path $rb 'PRTG Configuration.dat') -Destination $cfg -Force
+            $rolledBack = $true
+            if ($wasRunning) {
+                $box = @{}; Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts); $health = $box.Health
+                Write-PmLog "Rolled back. PRTG is $(if ($health.Healthy) { "up again with the previous configuration: $($health.Url)" } else { "NOT up ($($health.Message)) - check the core log" })." $(if ($health.Healthy) { 'WARN' } else { 'ERROR' })
+            } else { Write-PmLog 'Rolled back (PRTG was stopped before and stays stopped).' 'WARN' }
+        } catch { Write-PmLog "Rollback failed too: $($_.Exception.Message). The previous configuration is in $rb." 'ERROR' }
+    }
+    Write-PmProgress 100 'Done'
+    New-PmResult @{ Plan = $plan; Applied = $(if ($applied) { $applied.Counts }); Rollback = $rb; Healthy = $(if ($health) { [bool]$health.Healthy }); WebUrl = $(if ($health) { $health.Url }); RolledBack = $rolledBack; Error = $err; Changed = (-not $rolledBack -and -not $err) }
+}
+
+# ---------------------------------------------------------------- history (graph data)
+
+function Get-PmGraphFiles {
+    <# Files of Monitoring Database below $Root: relative path, day, device id, size. Days older than $Days are left out (0 = all). #>
+    param([Parameter(Mandatory)][string]$Root, [int]$Days = 0)
+    if (-not (Test-Path -LiteralPath $Root)) { return }
+    $from = if ($Days -gt 0) { (Get-Date).Date.AddDays(-$Days).ToString('yyyyMMdd') } else { '00000000' }
+    $base = (Get-Item -LiteralPath $Root).FullName.TrimEnd('\')
+    foreach ($f in (Get-ChildItem -LiteralPath $Root -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        $rel = $f.FullName.Substring($base.Length + 1)
+        $day = ''; if ($rel -match '^(\d{8})\\') { $day = $Matches[1] }
+        if ($day -and $day -lt $from) { continue }
+        $dev = 0; if ($f.Name -match '^Device (\d+)\.') { $dev = [int]$Matches[1] }
+        [pscustomobject]@{ Rel = $rel; Day = $day; Device = $dev; Size = $f.Length }
+    }
+}
+
+function Get-PmGraphDayFolders {
+    <# Day folders older than $Days (to exclude from a history backup). #>
+    param([Parameter(Mandatory)][string]$Root, [int]$Days)
+    if ($Days -le 0 -or -not (Test-Path -LiteralPath $Root)) { return }
+    $from = (Get-Date).Date.AddDays(-$Days).ToString('yyyyMMdd')
+    Get-ChildItem -LiteralPath $Root -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d{8}$' -and $_.Name -lt $from } | ForEach-Object { $_.FullName }
+}
+
+function Get-PmGraphRestorePlan {
+    <#
+        PURE. What restoring history files would do: files that are new, that exist already (kept in merge,
+        replaced in overwrite) and files of devices the target configuration does not have (their history
+        would not be shown). $TargetFiles = relative paths already on the target; $TargetDevices = device ids.
+    #>
+    param([object[]]$Files, [string[]]$TargetFiles = @(), [int[]]$TargetDevices = @(), [ValidateSet('merge', 'overwrite')][string]$Mode = 'merge')
+    $have = @{}; foreach ($t in @($TargetFiles)) { if ($t) { $have[$t.ToLowerInvariant()] = $true } }
+    $devs = @{}; foreach ($d in @($TargetDevices)) { $devs[[int]$d] = $true }
+    $new = 0; $exist = 0; $newBytes = [int64]0; $unknown = @{}
+    foreach ($f in @($Files)) {
+        if (-not $f) { continue }
+        if ($have.ContainsKey(([string]$f.Rel).ToLowerInvariant())) { $exist++ } else { $new++; $newBytes += [int64]$f.Size }
+        if ([int]$f.Device -gt 0 -and -not $devs.ContainsKey([int]$f.Device)) { $unknown[[int]$f.Device] = 1 + [int]$unknown[[int]$f.Device] }
+    }
+    $warn = @()
+    if ($unknown.Count) { $warn += "History of $($unknown.Count) device(s) that are not in the target configuration ($((@($unknown.Keys | Sort-Object) | Select-Object -First 15) -join ', ')): PRTG does not show it until devices with these ids exist (restore Devices first)." }
+    [pscustomobject]@{
+        Mode = $Mode; Files = @($Files).Count; New = $new; Existing = $exist; NewBytes = $newBytes
+        Replace = $(if ($Mode -eq 'overwrite') { $exist } else { 0 }); Keep = $(if ($Mode -eq 'merge') { $exist } else { 0 })
+        UnknownDevices = @($unknown.Keys | Sort-Object); Warnings = $warn
+    }
+}
+
+function Get-PmGraphTargetFacts {
+    <# READ-ONLY. History files and device ids of this server (for the graph restore preview). #>
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
+    $root = Join-Path $prtg.DataPath 'Monitoring Database'
+    $files = @(Get-PmGraphFiles -Root $root | ForEach-Object { $_.Rel })
+    $devices = @()
+    try { $doc = Read-PmPrtgConfig -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat'); $devices = @($doc.SelectNodes('//nodes/device[@id]') | ForEach-Object { [int]$_.GetAttribute('id') }) } catch { Write-PmLog "Device ids could not be read: $($_.Exception.Message)" 'WARN' }
+    New-PmResult @{ Files = $files; Devices = $devices; Prtg = $prtg }
+}
+
+function Restore-PmGraphData {
+    <#
+        Copies history files of a package into Monitoring Database of this server with PRTG stopped:
+        merge keeps files that exist, overwrite replaces them. The graph cache is moved aside so PRTG
+        recalculates the graphs from the data. Nothing is deleted.
+    #>
+    param([Parameter(Mandatory)][string]$StageGraphs, [ValidateSet('merge', 'overwrite')][string]$Mode = 'merge', [bool]$StartServices = $true, [int]$HealthTimeoutMinutes = 15)
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
+    $dest = Join-Path $prtg.DataPath 'Monitoring Database'
+    $files = @(Get-PmGraphFiles -Root $StageGraphs)
+    $plan = Get-PmGraphRestorePlan -Files $files -TargetFiles @(Get-PmGraphFiles -Root $dest | ForEach-Object { $_.Rel }) -Mode $Mode
+    Write-PmLog ("History: {0} file(s) in the package, {1} new, {2} already on this server ({3})." -f $plan.Files, $plan.New, $plan.Existing, $(if ($Mode -eq 'overwrite') { 'replaced' } else { 'kept' })) 'INFO'
+    foreach ($w in $plan.Warnings) { Write-PmLog $w 'WARN' }
+    if (($Mode -eq 'merge' -and -not $plan.New) -or -not $plan.Files) {
+        Write-PmLog 'Nothing to copy - every history file of the package is already on this server. PRTG was not stopped.' 'OK'
+        return [pscustomobject]@{ PmType = 'graphs'; Copied = 0; Replaced = 0; Failed = 0; Plan = $plan; Healthy = $true; WebUrl = $null }
+    }
+    $wasRunning = ($prtg.CoreStatus -eq 'Running')
+    Write-PmLog 'Stopping PRTG (history files are only written while the core is stopped)...' 'STEP'
+    Stop-PmPrtgServices
+    $copied = 0; $replaced = 0; $failed = 0
+    try {
+        foreach ($f in $files) {
+            $to = Join-Path $dest $f.Rel
+            $exists = Test-Path -LiteralPath $to
+            if ($exists -and $Mode -eq 'merge') { continue }
+            try {
+                $dir = Split-Path $to -Parent
+                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+                Copy-Item -LiteralPath (Join-Path $StageGraphs $f.Rel) -Destination $to -Force
+                if ($exists) { $replaced++ } else { $copied++ }
+            } catch { $failed++; if ($failed -le 5) { Write-PmLog "Could not copy $($f.Rel): $($_.Exception.Message)" 'WARN' } }
+        }
+        $cache = @(Get-ChildItem -LiteralPath $prtg.DataPath -Filter 'PRTG Graph Data Cache*' -File -ErrorAction SilentlyContinue)
+        foreach ($c in $cache) { Rename-Item -LiteralPath $c.FullName -NewName ('{0}.pre-restore-{1}' -f $c.Name, (Get-Date -Format 'yyyyMMdd-HHmmss')) -ErrorAction SilentlyContinue }
+        if ($cache.Count) { Write-PmLog 'Graph cache moved aside - PRTG recalculates the graphs from the history on start (may take a while).' 'INFO' }
+    } finally {
+        $health = $null
+        if ($StartServices -or $wasRunning) {
+            $box = @{}; Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts); $health = $box.Health
+        }
+    }
+    Write-PmLog ("History restored: {0} new, {1} replaced, {2} failed. PRTG {3}." -f $copied, $replaced, $failed, $(if ($health) { if ($health.Healthy) { "is up: $($health.Url)" } else { "did NOT come up ($($health.Message))" } } else { 'left stopped' })) $(if ($failed -or ($health -and -not $health.Healthy)) { 'WARN' } else { 'OK' })
+    return [pscustomobject]@{ PmType = 'graphs'; Copied = $copied; Replaced = $replaced; Failed = $failed; Plan = $plan; Healthy = $(if ($health) { [bool]$health.Healthy }); WebUrl = $(if ($health) { $health.Url }) }
+}
+
+# ---------------------------------------------------------------- license: status, backup, install, restore
+
+$PmLicenseKeyPath = 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server'
+
+function Get-PmLicenseHint {
+    <# A plain explanation and what to do, from the license state / last activation line. #>
+    param($State)
+    if (-not $State -or -not $State.Known) { return 'PRTG wrote no license line yet. It writes one when the core starts; check again in a minute.' }
+    $e = [string]$State.LastError
+    if ($e -match '403') { return "Paessler's activation server refused this activation (HTTP 403). The key is already activated on another system, blocked or expired. Move the activation in the Paessler shop (Activation Center) or ask Paessler / your reseller to reset it; then try again." }
+    if ($e -match '(?i)timeout|could not connect|unable to connect|resolve|proxy') { return 'PRTG could not reach the Paessler activation server. Allow HTTPS to the internet (or set the proxy in PRTG), or activate offline in the PRTG web interface: Setup > License Status > Offline activation.' }
+    if ($e -match '(?i)invalid|wrong|not valid') { return 'The license name or key was not accepted. Enter both exactly as shown in the Paessler shop (the name is case sensitive).' }
+    if ($State.NeedsActivation -and -not $State.Name) { return 'No license is installed. Enter a license (trial or bought) here or in PRTG: Setup > License Information.' }
+    if ($State.NeedsActivation) { return 'The license must be activated for this server. PRTG does it online by itself (AutoActivation); without internet use the offline activation in Setup > License Status.' }
+    return "Licensed: $($State.Edition), $($State.MaxSensors) sensors."
+}
+
+function Get-PmPrtgLicenseStatus {
+    <# READ-ONLY. License state of the PRTG on this server - without the key. #>
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { return (New-PmResult @{ Installed = $false; Computer = $env:COMPUTERNAME }) }
+    $rep = Get-PmPrtgLicenseReport -Days 3 -MaxLines 400
+    $vals = @(Get-PmLicenseValues)
+    $state = Get-PmPrtgLicenseState
+    New-PmResult @{
+        Installed = $true; Computer = $env:COMPUTERNAME; PrtgVersion = $prtg.Version; Core = $prtg.CoreStatus; State = $state; Hint = (Get-PmLicenseHint $state)
+        ValueNames = @($vals | ForEach-Object { $_.Name } | Select-Object -Unique); HasKey = [bool]@($vals | Where-Object { $_.Name -eq 'LicenseKey' -and [string]$_.Value }).Count
+        HasName = [bool]@($vals | Where-Object { $_.Name -eq 'LicenseName' -and [string]$_.Value }).Count
+        Fingerprints = @($rep.Values); SystemId = $rep.SystemId; AutoActivation = $rep.AutoActivation; LogLines = @($rep.LogLines | Select-Object -Last 12)
+    }
+}
+
+function Backup-PmPrtgLicense {
+    <#
+        READ-ONLY. The license values (registry) and license files of this PRTG, encrypted HERE with the backup
+        password - the key never leaves this server in clear.
+    #>
+    param([Parameter(Mandatory)][string]$Password)
+    Assert-PmBackupPassword $Password
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
+    $vals = @(Get-PmLicenseValues)
+    if (-not $vals.Count) { throw 'There is no license data on this server to back up.' }
+    $rec = [ordered]@{
+        format = 'prtg-license/1'; computer = $env:COMPUTERNAME; created = (Get-Date).ToUniversalTime().ToString('o'); prtgVersion = $prtg.Version
+        values = @($vals | ForEach-Object {
+                $v = $_.Value
+                $kind = [string]$_.Kind
+                [ordered]@{ path = ([string]$_.Path -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''); name = $_.Name; kind = $kind; value = $(if ($v -is [byte[]]) { [Convert]::ToBase64String($v) } elseif ($v -is [array]) { @($v | ForEach-Object { [string]$_ }) } else { [string]$v }) }
+            })
+        files = @(Get-PmLicenseFiles -DataPath $prtg.DataPath | ForEach-Object { [ordered]@{ name = $_.Name; data = [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName)) } })
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $rec -Depth 5 -Compress))
+    $blob = Protect-PmBytes -Data $bytes -Password $Password
+    $state = Get-PmPrtgLicenseState
+    Write-PmLog ("License backed up (encrypted on this server): {0} value(s){1}." -f $vals.Count, $(if (@($rec.files).Count) { ", $(@($rec.files).Count) file(s)" } else { '' })) 'OK'
+    New-PmResult @{ Envelope = [Convert]::ToBase64String($blob); ValueNames = @($vals | ForEach-Object { $_.Name }); FileNames = @($rec.files | ForEach-Object { $_.name }); State = $state; PrtgVersion = $prtg.Version; Computer = $env:COMPUTERNAME }
+}
+
+function Save-PmLicenseRollback {
+    <# Copy of the current license data (registry keys + files) before it is changed. Returns the folder. #>
+    param($Prtg)
+    $keep = Join-Path (Get-PmWorkRoot) ('rollback\license-{0}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Force -Path $keep | Out-Null
+    foreach ($k in @($Prtg.RegistryKeys)) {
+        $native = $k -replace '^HKLM:\\', 'HKLM\'
+        if ((Invoke-PmReg -Verb export -Key $native -File (Join-Path $keep (($native -replace '[\\: ]', '_') + '.reg'))) -ne 0) { throw "Could not save a copy of $native - nothing was changed." }
+    }
+    foreach ($f in @(Get-PmLicenseFiles -DataPath $Prtg.DataPath)) { Copy-Item -LiteralPath $f.FullName -Destination $keep -Force }
+    return $keep
+}
+
+function Get-PmCoreLogMark {
+    <# Current length of every core log file: lines written after this mark are "new". #>
+    $prtg = Get-PmPrtgInfo
+    $m = @{}
+    $dir = Join-Path ([string]$prtg.DataPath) 'Logs'
+    if ($prtg.DataPath -and (Test-Path -LiteralPath $dir)) {
+        foreach ($lf in (Get-ChildItem -LiteralPath $dir -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'core' -or $_.DirectoryName -match '\\core$' })) { $m[$lf.FullName] = [int64]$lf.Length }
+    }
+    return $m
+}
+
+function Get-PmCoreLogLinesSince {
+    <# License / activation lines the core wrote after $Mark (keys masked). #>
+    param([hashtable]$Mark = @{})
+    $prtg = Get-PmPrtgInfo
+    $dir = Join-Path ([string]$prtg.DataPath) 'Logs'
+    $out = New-Object System.Collections.ArrayList
+    if (-not $prtg.DataPath -or -not (Test-Path -LiteralPath $dir)) { return }
+    foreach ($lf in (Get-ChildItem -LiteralPath $dir -Recurse -File -Filter '*.log' -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'core' -or $_.DirectoryName -match '\\core$' })) {
+        $from = [int64]0; if ($Mark.ContainsKey($lf.FullName)) { $from = [int64]$Mark[$lf.FullName] }
+        if ($lf.Length -le $from) { continue }
+        try {
+            $fs = New-Object IO.FileStream($lf.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
+            $sr = New-Object IO.StreamReader($fs)
+            try { while (-not $sr.EndOfStream) { $l = $sr.ReadLine(); if ($l -match '(?i)licen|activat|edition|trial|freeware') { [void]$out.Add(($l -replace '[0-9A-Za-z]{6}(-[0-9A-Za-z]{6}){3,}', '<key>' -replace '[A-Za-z0-9+/=-]{32,}', '<masked>')) } } }
+            finally { $sr.Dispose(); $fs.Dispose() }
+        } catch { }
+    }
+    return $out
+}
+
+function Wait-PmLicenseLine {
+    <# After a start: waits (up to $Seconds) for the license line the core writes after $Mark, then returns the state (Fresh = from this start). #>
+    param([hashtable]$Mark = @{}, [int]$Seconds = 150)
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    do {
+        $lines = @(Get-PmCoreLogLinesSince -Mark $Mark)
+        $st = ConvertTo-PmLicenseState -LogLines $lines
+        if ($st.Known) { $st | Add-Member -NotePropertyName Fresh -NotePropertyValue $true -Force; return $st }
+        Start-Sleep -Seconds 10
+    } while ((Get-Date) -lt $deadline)
+    $st = Get-PmPrtgLicenseState
+    $st | Add-Member -NotePropertyName Fresh -NotePropertyValue $false -Force
+    return $st
+}
+
+function Install-PmPrtgLicense {
+    <#
+        Puts a license into the PRTG of this server the way the PRTG Administration Tool does it: license
+        name and key in the registry (HKLM\...\PRTG Network Monitor\Server), with PRTG stopped. PRTG then
+        activates it itself with Paessler when it starts - nothing here bypasses or fakes the activation.
+          - LicenseName + LicenseKey : a trial or bought key the owner got from Paessler
+          - Envelope + Password      : a license backup made by PRTG Manager (restores every saved value)
+        A copy of the current license data is kept in <work root>\rollback\license-<time>.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'The backup password decrypts on this server only; it is never stored or logged.')]
+    param(
+        [string]$LicenseName, [string]$LicenseKey, [ValidateSet('trial', 'commercial', 'restore')][string]$Kind = 'commercial',
+        [string]$Envelope, [string]$Password, [int]$HealthTimeoutMinutes = 15, [bool]$Force = $false,
+        # where PRTG keeps name and key (only changed by tests)
+        [string]$LicenseKeyPath = $PmLicenseKeyPath
+    )
+    $ErrorActionPreference = 'Stop'
+    if (-not (Test-PmIsAdmin)) { throw 'Changing the PRTG license needs administrator rights on this server.' }
+    $prtg = Get-PmPrtgInfo
+    if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
+    $values = @(); $files = @()
+    if ($Envelope) {
+        if (-not $Password) { throw 'The license backup is encrypted - enter its password.' }
+        $rec = [Text.Encoding]::UTF8.GetString((Unprotect-PmBytes -Envelope ([Convert]::FromBase64String($Envelope)) -Password $Password)) | ConvertFrom-Json
+        if ($rec.format -ne 'prtg-license/1') { throw "Unknown license backup format '$($rec.format)'." }
+        $values = @($rec.values | ForEach-Object { $_ }); $files = @($rec.files | ForEach-Object { $_ })
+        $Kind = 'restore'
+        Write-PmLog "License backup of $($rec.computer) ($($rec.created)) decrypted on this server: $($values.Count) value(s)." 'OK'
+        if ($rec.computer -and $rec.computer -ne $env:COMPUTERNAME) { Write-PmLog "The backup comes from $($rec.computer). A PRTG license is activated per system - on this server PRTG asks Paessler for a new activation." 'WARN' }
+    } else {
+        $LicenseName = ([string]$LicenseName).Trim(); $LicenseKey = ([string]$LicenseKey).Trim()
+        if (-not $LicenseName -or -not $LicenseKey) { throw 'Enter the license name and the license key exactly as Paessler sent them.' }
+        if ($LicenseKey.Length -lt 20 -or $LicenseKey -notmatch '^[A-Za-z0-9\-+/=]+$') { throw 'This does not look like a PRTG license key (letters, digits and dashes, usually several groups). Copy it again from the Paessler e-mail or shop.' }
+    }
+    $before = Get-PmPrtgLicenseState
+    if (-not $Force -and $before.Known -and -not $before.NeedsActivation -and $Kind -ne 'restore') {
+        throw "PRTG on this server already runs with an active license ($($before.Edition), $($before.MaxSensors) sensors). Remove it first or confirm replacing it."
+    }
+    Write-PmProgress 10 'Saving a copy of the current license'
+    $keep = Save-PmLicenseRollback -Prtg $prtg
+    Write-PmLog "Copy of the current license data (to undo this): $keep" 'OK'
+    Write-PmProgress 25 'Stopping PRTG'
+    Write-PmLog 'Stopping PRTG (license values are only read by the core when it starts)...' 'STEP'
+    $mark = Get-PmCoreLogMark
+    Stop-PmPrtgServices
+    try {
+        if ($values.Count) {
+            foreach ($v in @(Get-PmLicenseValues)) { Remove-ItemProperty -LiteralPath $v.Path -Name $v.Name -ErrorAction SilentlyContinue }
+            foreach ($v in $values) {
+                $path = 'Registry::' + [string]$v.path
+                if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
+                $val = switch ([string]$v.kind) { 'Binary' { [Convert]::FromBase64String([string]$v.value) } 'DWord' { [int]$v.value } 'QWord' { [long]$v.value } 'MultiString' { [string[]]@($v.value) } default { [string]$v.value } }
+                New-ItemProperty -LiteralPath $path -Name ([string]$v.name) -Value $val -PropertyType ([string]$v.kind) -Force | Out-Null
+            }
+            foreach ($f in $files) { [IO.File]::WriteAllBytes((Join-Path $prtg.DataPath ([IO.Path]::GetFileName([string]$f.name))), [Convert]::FromBase64String([string]$f.data)) }
+            Write-PmLog "License values restored: $(@($values | ForEach-Object { $_.name }) -join ', ')" 'OK'
+        } else {
+            # a new key: the activation data of the old one is dropped so PRTG activates the new key
+            if (-not (Test-Path $LicenseKeyPath)) { New-Item -Path $LicenseKeyPath -Force | Out-Null }
+            foreach ($n in 'LicenseHash', 'SensorCountPausedByLicenseMax') { Remove-ItemProperty -LiteralPath $LicenseKeyPath -Name $n -ErrorAction SilentlyContinue }
+            New-ItemProperty -LiteralPath $LicenseKeyPath -Name 'LicenseName' -Value $LicenseName -PropertyType String -Force | Out-Null
+            New-ItemProperty -LiteralPath $LicenseKeyPath -Name 'LicenseKey' -Value $LicenseKey -PropertyType String -Force | Out-Null
+            Write-PmLog "$(if ($Kind -eq 'trial') { 'Trial license' } else { 'License' }) '$LicenseName' written (key #$(Get-PmShortHash $LicenseKey), $($LicenseKey.Length) characters)." 'OK'
+        }
+    } catch {
+        Write-PmLog "Writing the license failed: $($_.Exception.Message) - restoring the copy." 'ERROR'
+        foreach ($r in (Get-ChildItem -LiteralPath $keep -Filter '*.reg' -File)) { [void](Invoke-PmReg -Verb import -File $r.FullName) }
+        $box = @{}; Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
+        throw
+    }
+    Write-PmProgress 50 'Starting PRTG'
+    $box = @{}
+    Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts)
+    $health = $box.Health
+    Write-PmProgress 80 'Waiting for the activation result'
+    Write-PmLog 'Waiting for PRTG to report the license (it activates online with Paessler)...' 'STEP'
+    $after = Wait-PmLicenseLine -Mark $mark -Seconds 150
+    $hint = Get-PmLicenseHint $after
+    $ok = [bool]($after.Known -and -not $after.NeedsActivation)
+    Write-PmLog ("License now: {0}. {1}" -f $(if ($after.Known) { "$($after.Edition), $($after.MaxSensors) sensors$(if ($after.NeedsActivation) { ', NOT activated' })" } else { 'no license line yet' }), $hint) $(if ($ok) { 'OK' } else { 'WARN' })
+    if ($after.LastError) { Write-PmLog "Last activation message of PRTG: $($after.LastError)" 'WARN' }
+    Write-PmProgress 100 'Done'
+    New-PmResult @{ Kind = $Kind; Before = $before; After = $after; Activated = $ok; Hint = $hint; Rollback = $keep; Healthy = [bool]$health.Healthy; WebUrl = $health.Url; Core = (Get-PmPrtgInfo).CoreStatus }
+}
+
+# ---------------------------------------------------------------- full restore preview
+
+function Get-PmRestoreTargetFacts {
+    <# READ-ONLY. What the full-restore preview needs to know about this server. #>
+    $prtg = Get-PmPrtgInfo
+    $stats = $null; $dataBytes = [int64]0; $lic = $null
+    if ($prtg.Installed) {
+        $stats = Get-PmPrtgConfigStats -Path (Join-Path $prtg.DataPath 'PRTG Configuration.dat')
+        $dataBytes = Get-PmDirectorySize -Path $prtg.DataPath
+        try { $lic = Get-PmPrtgLicenseState } catch { }
+    }
+    $drive = Get-PmLogicalDisk -Path $(if ($prtg.DataPath) { $prtg.DataPath } else { $env:SystemDrive + '\' })
+    New-PmResult @{
+        Computer = $env:COMPUTERNAME; Os = (Get-PmOsCaption); IsAdmin = (Test-PmIsAdmin); Prtg = $prtg; ConfigStats = $stats; DataBytes = $dataBytes
+        FreeBytes = $(if ($drive) { [int64]$drive.FreeSpace }); License = $lic
+        NetRelease = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction SilentlyContinue).Release
     }
 }
 
@@ -988,7 +2006,6 @@ function Invoke-PmRemoteBackup {
         [string]$WorkRoot,
         [bool]$IncludePrtg = $true,
         [bool]$IncludeHistory = $true,
-        [bool]$IncludeVpn = $true,
         [bool]$IncludeDesktop = $true,
         [string[]]$ExtraPaths = @(),
         [ValidateSet('Restart', 'KeepStopped', 'Disable')][string]$SourceAfter = 'Restart',
@@ -997,6 +2014,10 @@ function Invoke-PmRemoteBackup {
         [bool]$IncludeProgram = $true,
         [bool]$IncludeLogs = $false,
         [bool]$IncludeAutoBackups = $false,
+        # full = PRTG with configuration, program, registry, license, history; graphs = only the history (Monitoring Database)
+        [ValidateSet('full', 'graphs')][string]$Scope = 'full',
+        # graphs: only the last N days of history (0 = all)
+        [int]$HistoryDays = 0,
         # Stage directly into this folder (e.g. the manager's disk via \\tsclient) and skip zipping on the source.
         [string]$StageDir,
         [string]$LogDir,
@@ -1019,20 +2040,69 @@ function Invoke-PmRemoteBackup {
     Write-PmLog "Mode: $modeText. Robocopy log: $(if ($global:PmRobocopyLog) { $global:PmRobocopyLog } else { 'off' })" 'DEBUG'
 
     $manifest = [ordered]@{
-        tool = 'prtg-mover'; formatVersion = 1; jobId = $JobId
+        tool = 'prtg-manager'; format = 'prtg-manager-backup'; formatVersion = 2; type = $Scope; jobId = $JobId
         createdUtc = (Get-Date).ToUniversalTime().ToString('o')
         source = [ordered]@{ computer = $env:COMPUTERNAME; os = (Get-PmOsCaption) }
         prtg = [ordered]@{ included = $false }
-        vpn = [ordered]@{ included = $false; allUsers = @(); users = @{} }
         desktop = [ordered]@{ included = $false; users = @() }
         extra = @()
         warnings = @()
     }
 
     Write-PmLog "Backup started on $env:COMPUTERNAME (staging: $stage)" 'STEP'
+    $shadow = $null
+
+    # ---- history only (graph data): PRTG keeps running, copied from a VSS snapshot
+    if ($Scope -eq 'graphs') {
+        $IncludeDesktop = $false; $ExtraPaths = @()
+        Write-PmProgress 5 'History: discovering installation'
+        $prtg = Get-PmPrtgInfo
+        if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found) - there is no history to back up.' }
+        Write-PmLog "PRTG $($prtg.Version) found. History folder: $(Join-Path $prtg.DataPath 'Monitoring Database'). PRTG keeps running, nothing is stopped or changed." 'STEP'
+        Clear-PmStaleSnapshots
+        $dataSource = $prtg.DataPath
+        try {
+            $shadow = New-PmShadowCopy -Path $prtg.DataPath
+            $dataSource = Join-Path $shadow.Link $prtg.DataPath.Substring($shadow.Volume.Length)
+            Write-PmLog "Consistent VSS snapshot of $($shadow.Volume) created - copying from the snapshot." 'OK'
+        } catch {
+            Write-PmLog "VSS snapshot not available ($($_.Exception.Message)) - copying live files (the file of today may be incomplete)." 'WARN'
+            $manifest.warnings += 'History backup without VSS snapshot (live copy)'
+        }
+        try {
+            $mdb = Join-Path $dataSource 'Monitoring Database'
+            if (-not (Test-Path -LiteralPath $mdb)) { throw "This PRTG has no history folder ($mdb)." }
+            $excl = @(Get-PmGraphDayFolders -Root $mdb -Days $HistoryDays)
+            $gfiles = @(Get-PmGraphFiles -Root $mdb -Days $HistoryDays)
+            $gbytes = [int64](($gfiles | Measure-Object -Property Size -Sum).Sum)
+            $days = @($gfiles | Where-Object { $_.Day } | ForEach-Object { $_.Day } | Sort-Object -Unique)
+            # which devices the history belongs to (id + name), so a restore can check the target has them
+            $index = @()
+            try {
+                $cdoc = Read-PmPrtgConfig -Path (Join-Path $dataSource 'PRTG Configuration.dat')
+                $index = @($cdoc.SelectNodes('//nodes/device[@id]') | ForEach-Object { [ordered]@{ id = [int]$_.GetAttribute('id'); name = (Get-PmObjectName $_) } })
+                $manifest.prtg = [ordered]@{ included = $false; version = $prtg.Version; configVersion = (Get-PmConfigHeader $cdoc).ConfigVersion; dataPath = $prtg.DataPath }
+            } catch { Write-PmLog "Device names could not be read from the configuration: $($_.Exception.Message)" 'WARN'; $manifest.prtg = [ordered]@{ included = $false; version = $prtg.Version; dataPath = $prtg.DataPath } }
+            New-Item -ItemType Directory -Force -Path (Join-Path $stage 'prtg') | Out-Null
+            ConvertTo-Json -InputObject @($index) -Depth 3 | Set-Content -LiteralPath (Join-Path $stage 'prtg\graphs-index.json') -Encoding UTF8
+            if ($PullMode) {
+                $pullItems += [pscustomobject]@{ Source = $mdb; Target = 'prtg\graphs'; ExcludeDirs = @($excl); ExcludeFiles = @('*.tmp') }
+            } else {
+                $code = Invoke-PmRobocopy -Source $mdb -Destination (Join-Path $stage 'prtg\graphs') -ExcludeDirs $excl -ExcludeFiles @('*.tmp')
+                if (-not (Test-PmRobocopyOk $code)) { throw "robocopy of the history failed with exit code $code. $(Get-PmRobocopyErrors)" }
+            }
+            $manifest.graphs = [ordered]@{
+                included = $true; days = $HistoryDays; from = $(if ($days.Count) { $days[0] } else { $null }); to = $(if ($days.Count) { $days[-1] } else { $null })
+                files = $gfiles.Count; bytes = $gbytes; devices = @($gfiles | Where-Object { $_.Device -gt 0 } | ForEach-Object { $_.Device } | Sort-Object -Unique)
+            }
+            Write-PmLog ("History: {0} file(s), {1:N2} GB, {2} day(s){3}, {4} device(s)." -f $gfiles.Count, ($gbytes / 1GB), $days.Count, $(if ($days.Count) { " ($($days[0]) - $($days[-1]))" } else { '' }), @($manifest.graphs.devices).Count) 'OK'
+        } finally {
+            if ($shadow -and -not $PullMode) { Remove-PmShadowCopy -Shadow $shadow; Write-PmLog 'VSS snapshot removed.'; $shadow = $null }
+        }
+    }
 
     # ---- PRTG
-    if ($IncludePrtg) {
+    if ($IncludePrtg -and $Scope -eq 'full') {
         Write-PmProgress 5 'PRTG: discovering installation'
         $prtg = Get-PmPrtgInfo
         if (-not $prtg.Installed) {
@@ -1194,56 +2264,6 @@ function Invoke-PmRemoteBackup {
         }
     }
 
-    # ---- Windows VPN (RAS phonebooks)
-    if ($IncludeVpn) {
-        Write-PmProgress 50 'VPN: exporting Windows VPN connections'
-        $allPbkDir = Join-Path $env:ProgramData 'Microsoft\Network\Connections\Pbk'
-        $vpnStage = Join-Path $stage 'vpn'
-        New-Item -ItemType Directory -Force -Path (Join-Path $vpnStage 'allusers'), (Join-Path $vpnStage 'users') | Out-Null
-        foreach ($pbk in (Get-ChildItem -LiteralPath $allPbkDir -Filter '*.pbk' -File -ErrorAction SilentlyContinue)) {
-            Copy-Item -LiteralPath $pbk.FullName -Destination (Join-Path $vpnStage 'allusers') -Force
-            $manifest.vpn.allUsers += @(Get-PmPbkEntries -Path $pbk.FullName | ForEach-Object { $_.Name })
-        }
-        foreach ($prof in (Get-PmUserProfiles)) {
-            $userPbkDir = Join-Path $prof.Path 'AppData\Roaming\Microsoft\Network\Connections\Pbk'
-            $files = @(Get-ChildItem -LiteralPath $userPbkDir -Filter '*.pbk' -File -ErrorAction SilentlyContinue)
-            if ($files.Count -gt 0) {
-                $dst = Join-Path $vpnStage "users\$($prof.Name)"
-                New-Item -ItemType Directory -Force -Path $dst | Out-Null
-                $names = @()
-                foreach ($f in $files) { Copy-Item -LiteralPath $f.FullName -Destination $dst -Force; $names += @(Get-PmPbkEntries -Path $f.FullName | ForEach-Object { $_.Name }) }
-                $manifest.vpn.users[$prof.Name] = $names
-            }
-        }
-        try {
-            Get-VpnConnection -AllUserConnection -ErrorAction Stop | Select-Object Name, ServerAddress, TunnelType, AuthenticationMethod, EncryptionLevel, SplitTunneling, RememberCredential |
-                ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $vpnStage 'vpn-connections.json') -Encoding UTF8
-        } catch { }
-        # routes of every connection: bound to the connection, live on its interface, persistent into it
-        $routeDir = Join-Path $vpnStage 'routes'
-        New-Item -ItemType Directory -Force -Path $routeDir | Out-Null
-        $manifest.vpn.routes = @()
-        $all = @($manifest.vpn.allUsers | Select-Object -Unique)
-        # connections of single users too: their interface and the persistent routes are read the same way;
-        # routes bound to the connection can only be read for the account this backup runs as
-        $perUser = @($manifest.vpn.users.Values | ForEach-Object { $_ } | Where-Object { $_ -and ($all -notcontains $_) } | Select-Object -Unique)
-        foreach ($item in (@($all | ForEach-Object { @{ Name = $_; AllUsers = $true } }) + @($perUser | ForEach-Object { @{ Name = $_; AllUsers = $false } }))) {
-            $n = $item.Name
-            try {
-                $rb = Get-PmVpnRouteBackup -Name $n -AllUsers $item.AllUsers
-                $file = 'routes-{0}.json' -f ($n -replace '[^\w\.-]', '_')
-                ConvertTo-Json -InputObject $rb -Depth 5 | Set-Content -Path (Join-Path $routeDir $file) -Encoding UTF8
-                $manifest.vpn.routes += [ordered]@{ vpn = $n; file = $file; scope = $rb.scope; connected = [bool]$rb.tunnelIp; connection = @($rb.connectionRoutes).Count; live = @($rb.liveRoutes).Count; persistent = @($rb.persistentRoutes).Count }
-                if ($rb.tunnelIp) { Write-PmLog ("VPN '{0}': routes saved - {1} bound to the connection, {2} live, {3} persistent." -f $n, @($rb.connectionRoutes).Count, @($rb.liveRoutes).Count, @($rb.persistentRoutes).Count) }
-                else { Write-PmLog ("VPN '{0}' is NOT connected: its live routes cannot be read. Saved: {1} route(s) bound to the connection and {2} persistent route(s) whose gateway no connected network reaches (assumed to belong to a VPN). Connect the VPN and back up again for a complete route backup." -f $n, @($rb.connectionRoutes).Count, @($rb.persistentRoutes).Count) 'WARN' }
-            } catch { Write-PmLog "VPN '$n': routes could not be read: $($_.Exception.Message)" 'WARN' }
-        }
-        $manifest.vpn.included = $true
-        $userCount = ($manifest.vpn.users.Values | ForEach-Object { $_ } | Measure-Object).Count
-        Write-PmLog "VPN: $($manifest.vpn.allUsers.Count) all-user and $userCount per-user connection(s) exported." 'OK'
-        Write-PmLog 'Note: saved VPN passwords / machine certificates are protected by Windows (DPAPI) and are NOT migrated.' 'WARN'
-    }
-
     # ---- Desktop files
     if ($IncludeDesktop) {
         Write-PmProgress 60 'Desktop: copying user desktops'
@@ -1304,7 +2324,7 @@ function Invoke-PmRemoteBackup {
         Write-PmProgress 80 'Staging done'
         return (New-PmResult @{ StageDir = $stage; Manifest = ($manifest | ConvertTo-Json -Depth 8); SourceHealth = $sourceHealth; TunnelCopy = [bool]$TunnelCopy })
     }
-    $zipName = 'PRTG_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $zipName = 'PRTG-{2}_{0}_{1}.zip' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss'), $Scope.ToUpperInvariant()
     $zipPath = Join-Path $outDir $zipName
     Write-PmLog "Compressing to $zipPath ..." 'STEP'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1323,15 +2343,42 @@ function Invoke-PmRemoteBackup {
 
 # ---------------------------------------------------------------- RESTORE (runs on target)
 
+function Undo-PmPrtgRestore {
+    <#
+        Puts PRTG back to the state before a failed full restore: the previous data folder (renamed
+        back) and the PRTG registry keys (cleared and imported from the copy taken before the restore).
+        The restored data folder is kept as <data>.failed-restore-<time>. Nothing is deleted.
+    #>
+    param([Parameter(Mandatory)][string]$DataPath, [Parameter(Mandatory)][string]$OldPath, [Parameter(Mandatory)][string]$RegBackup, [string]$Stamp, [int]$HealthTimeoutMinutes = 15, [int[]]$Ports = @())
+    Write-PmLog 'ROLLBACK: putting the previous PRTG data folder and registry back...' 'STEP'
+    Stop-PmPrtgServices
+    if (-not (Test-Path -LiteralPath $OldPath)) { throw "The previous data folder $OldPath is gone - cannot roll back." }
+    if (Test-Path -LiteralPath $DataPath) { Rename-Item -LiteralPath $DataPath -NewName ('{0}.failed-restore-{1}' -f (Split-Path $DataPath -Leaf), $Stamp) }
+    Rename-Item -LiteralPath $OldPath -NewName (Split-Path $DataPath -Leaf)
+    Write-PmLog "Previous data folder is back in $DataPath (the restored one is kept as $DataPath.failed-restore-$Stamp)." 'OK'
+    $regs = @(Get-ChildItem -LiteralPath $RegBackup -Filter '*.reg' -File -ErrorAction SilentlyContinue)
+    if ($regs.Count) {
+        # reg import only adds and overwrites; the keys are cleared first so values the restore added go away too
+        foreach ($k in 'HKLM\SOFTWARE\WOW6432Node\Paessler', 'HKLM\SOFTWARE\Paessler') {
+            if (Test-Path ('Registry::' + $k)) { & reg.exe delete $k /f 2>&1 | Out-Null }
+        }
+        $bad = @($regs | Where-Object { (Invoke-PmReg -Verb import -File $_.FullName) -ne 0 } | ForEach-Object { $_.Name })
+        if ($bad.Count) { Write-PmLog "Registry copy could not be imported: $($bad -join ', ') (files in $RegBackup)." 'ERROR' } else { Write-PmLog "Previous PRTG registry imported from $RegBackup." 'OK' }
+    }
+    $box = @{}
+    Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts $Ports
+    $h = $box.Health
+    Write-PmLog "ROLLBACK done - PRTG $(if ($h.Healthy) { "is up again with the previous data: $($h.Url)" } else { "did NOT come up ($($h.Message))" })." $(if ($h.Healthy) { 'WARN' } else { 'ERROR' })
+    [pscustomobject]@{ PmType = 'undo'; Healthy = [bool]$h.Healthy; Url = $h.Url }
+}
+
+
 function Invoke-PmRemoteRestore {
     param(
         [Parameter(Mandatory)][string]$JobId,
         [string]$ZipPath,
         [string]$WorkRoot,
         [bool]$RestorePrtg = $true,
-        [bool]$RestoreVpn = $true,
-        # with the VPN connections: the routes bound to them and the persistent routes into them
-        [bool]$RestoreRoutes = $true,
         [bool]$RestoreDesktop = $true,
         [bool]$RestoreExtra = $true,
         [string]$InstallerPath,
@@ -1339,8 +2386,11 @@ function Invoke-PmRemoteRestore {
         [bool]$AllowDowngrade = $false,
         [bool]$StartServices = $true,
         [int]$HealthTimeoutMinutes = 15,
-        [bool]$ConnectVpn = $false,
         [bool]$RemovePackage = $true,
+        # history packages: merge keeps files that exist on the target, overwrite replaces them
+        [ValidateSet('merge', 'overwrite')][string]$GraphMode = 'merge',
+        # full restore: put the previous PRTG back automatically when the restored one does not come up
+        [bool]$AutoRollback = $true,
         [bool]$CopyLicense = $true,
         [bool]$OpenFirewall = $true,
         [string]$ExpectedSha256,
@@ -1359,7 +2409,7 @@ function Invoke-PmRemoteRestore {
     $stage = if ($direct) { $StageDir } else { Join-Path $WorkRoot "restore\$JobId" }
     if ($LogDir) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null; $global:PmRobocopyLog = Join-Path $LogDir "robocopy-$JobId-$env:COMPUTERNAME.log" } else { $global:PmRobocopyLog = $null }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $report = [ordered]@{ Computer = $env:COMPUTERNAME; Prtg = 'skipped'; License = 'skipped'; Vpn = 'skipped'; Desktop = 'skipped'; Extra = 'skipped'; WebUrl = $null; Version = $null; Errors = @() }
+    $report = [ordered]@{ Computer = $env:COMPUTERNAME; Prtg = 'skipped'; License = 'skipped'; History = 'skipped'; Desktop = 'skipped'; Extra = 'skipped'; WebUrl = $null; Version = $null; RolledBack = $false; Errors = @() }
 
     Write-PmLog "Restore started on $env:COMPUTERNAME" 'STEP'
 
@@ -1400,9 +2450,37 @@ function Invoke-PmRemoteRestore {
     $manifest = Get-Content -LiteralPath (Join-Path $stage 'manifest.json') -Raw | ConvertFrom-Json
     }
     Write-PmLog "Package from $($manifest.source.computer) created $($manifest.createdUtc)" 'OK'
+    if ($manifest.PSObject.Properties['vpn'] -and $manifest.vpn -and $manifest.vpn.included) {
+        Write-PmLog 'This older package also holds Windows VPN connections. PRTG Manager restores only PRTG - import the package in VPN Manager (Backups > Import) to restore the VPN part.' 'WARN'
+    }
+
+    # ---- history only (graph data)
+    if ($RestorePrtg -and [string]$manifest.type -eq 'graphs') {
+        try {
+            $prtgNow = Get-PmPrtgInfo
+            if (-not $prtgNow.Installed) { throw 'PRTG is not installed on this server - restore a full backup first.' }
+            if ($manifest.prtg.version -and $prtgNow.Version) {
+                $srcV = [version]($manifest.prtg.version -replace '[^\d\.]', ''); $dstV = [version]($prtgNow.Version -replace '[^\d\.]', '')
+                if ($dstV -lt $srcV -and -not $AllowDowngrade) { throw "PRTG on this server ($dstV) is older than the one of the backup ($srcV) - update PRTG first (or allow downgrade)." }
+            }
+            Write-PmProgress 30 'History: copying'
+            $gbox = @{}
+            Restore-PmGraphData -StageGraphs (Join-Path $stage 'prtg\graphs') -Mode $GraphMode -StartServices $StartServices -HealthTimeoutMinutes $HealthTimeoutMinutes | ForEach-Object { if ($_.PmType -eq 'graphs') { $gbox.R = $_ } else { $_ } }
+            $g = $gbox.R
+            $report.History = "restored ($($g.Copied) new, $($g.Replaced) replaced, $($g.Failed) failed)"
+            $report.Prtg = if ($null -eq $g.Healthy) { 'not-started' } elseif ($g.Healthy) { 'ok' } else { 'unhealthy' }
+            $report.WebUrl = $g.WebUrl
+            if ($g.Failed) { $report.Errors += "History: $($g.Failed) file(s) could not be copied." }
+            if ($g.Healthy -eq $false) { $report.Errors += 'PRTG did not come up completely after the history restore.' }
+        } catch {
+            $report.History = 'failed'; $report.Errors += "History: $_"
+            Write-PmLog "History restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'History restore'
+        }
+    }
 
     # ---- PRTG
     if ($RestorePrtg -and $manifest.prtg.included) {
+        $undo = $null
         try {
             Write-PmProgress 15 'PRTG: checking installation'
             $prtg = Get-PmPrtgInfo
@@ -1494,12 +2572,15 @@ function Invoke-PmRemoteRestore {
                 $native = $k -replace '^HKLM:\\', 'HKLM\'
                 [void](Invoke-PmReg -Verb export -Key $native -File (Join-Path $regBackup (($native -replace '[\\: ]', '_') + '.reg')))
             }
+            $old = $null
             if (Test-Path -LiteralPath $dataPath) {
                 $old = "$dataPath.pre-restore-$stamp"
                 try { Rename-Item -LiteralPath $dataPath -NewName (Split-Path $old -Leaf); Write-PmLog "Existing data folder kept as $old" }
                 catch { Invoke-PmRobocopy -Source $dataPath -Destination $old | Out-Null; Write-PmLog "Existing data folder copied to $old" }
             }
             Write-PmLog "Rollback copy of registry: $regBackup" 'OK'
+            # from here on a failure can be undone: the previous data folder and registry are kept
+            if ($old -and (Test-Path -LiteralPath $old)) { $undo = @{ DataPath = $dataPath; Old = $old; Reg = $regBackup; Ports = @($prtg.ListenPorts) } }
 
             Write-PmProgress 45 'PRTG: restoring data folder'
             $srcData = Join-Path $stage 'prtg\data'
@@ -1601,52 +2682,24 @@ function Invoke-PmRemoteRestore {
                     $report.Prtg = 'unhealthy'
                     $report.Errors += "PRTG did not come up completely within $HealthTimeoutMinutes min ($($health.Message))."
                     Write-PmLog "PRTG did NOT come up completely ($($health.Message)). See '$dataPath\Logs\core' on the target. Rollback data: $dataPath.pre-restore-$stamp" 'ERROR'
+                    if ($AutoRollback -and $undo) {
+                        $ubox = @{}
+                        Undo-PmPrtgRestore -DataPath $undo.DataPath -OldPath $undo.Old -RegBackup $undo.Reg -Stamp $stamp -HealthTimeoutMinutes $HealthTimeoutMinutes -Ports $undo.Ports | ForEach-Object { if ($_.PmType -eq 'undo') { $ubox.R = $_ } else { $_ } }
+                        $report.RolledBack = $true; $report.Prtg = if ($ubox.R -and $ubox.R.Healthy) { 'rolled-back' } else { 'rolled-back-unhealthy' }
+                    }
                 }
             } else { $report.Prtg = 'restored-not-started' }
         } catch {
             $report.Prtg = 'failed'; $report.Errors += "PRTG: $_"
             Write-PmLog "PRTG restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'PRTG restore'
+            if ($AutoRollback -and $undo) {
+                try {
+                    $ubox = @{}
+                    Undo-PmPrtgRestore -DataPath $undo.DataPath -OldPath $undo.Old -RegBackup $undo.Reg -Stamp $stamp -HealthTimeoutMinutes $HealthTimeoutMinutes -Ports $undo.Ports | ForEach-Object { if ($_.PmType -eq 'undo') { $ubox.R = $_ } else { $_ } }
+                    $report.RolledBack = $true; $report.Prtg = if ($ubox.R -and $ubox.R.Healthy) { 'rolled-back' } else { 'rolled-back-unhealthy' }
+                } catch { Write-PmLog "Rollback failed: $($_.Exception.Message). The previous data is in $($undo.Old), the registry copy in $($undo.Reg)." 'ERROR' }
+            }
         }
-    }
-
-    # ---- VPN
-    if ($RestoreVpn -and $manifest.vpn.included) {
-        Write-PmProgress 90 'VPN: importing connections'
-        try {
-            $added = @()
-            $allDst = Join-Path $env:ProgramData 'Microsoft\Network\Connections\Pbk'
-            foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $stage 'vpn\allusers') -Filter '*.pbk' -File -ErrorAction SilentlyContinue)) {
-                $added += @(Merge-PmPbk -SourcePath $f.FullName -TargetPath (Join-Path $allDst $f.Name))
-            }
-            $profiles = @{}
-            foreach ($p in (Get-PmUserProfiles)) { $profiles[$p.Name.ToLowerInvariant()] = $p.Path }
-            foreach ($uDir in (Get-ChildItem -LiteralPath (Join-Path $stage 'vpn\users') -Directory -ErrorAction SilentlyContinue)) {
-                $key = $uDir.Name.ToLowerInvariant()
-                foreach ($f in (Get-ChildItem -LiteralPath $uDir.FullName -Filter '*.pbk' -File)) {
-                    if ($profiles.ContainsKey($key)) {
-                        $added += @(Merge-PmPbk -SourcePath $f.FullName -TargetPath (Join-Path $profiles[$key] "AppData\Roaming\Microsoft\Network\Connections\Pbk\$($f.Name)"))
-                    } else {
-                        # No such profile on target: publish the per-user connections for all users instead.
-                        $added += @(Merge-PmPbk -SourcePath $f.FullName -TargetPath (Join-Path $allDst $f.Name))
-                        Write-PmLog "User '$($uDir.Name)' has no profile on target - its VPN connections were added for all users." 'WARN'
-                    }
-                }
-            }
-            Write-PmLog "VPN connections added: $(if ($added.Count) { $added -join ', ' } else { 'none (already present)' })" 'OK'
-            if ($RestoreRoutes) {
-                foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $stage 'vpn\routes') -Filter 'routes-*.json' -File -ErrorAction SilentlyContinue)) {
-                    try { $rb = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json; [void](Restore-PmVpnRoutes -Backup $rb -AllUsers ("$($rb.scope)" -ne 'User')) }
-                    catch { Write-PmLog "Routes from $($f.Name) could not be put back: $($_.Exception.Message)" 'WARN' }
-                }
-            }
-            if ($ConnectVpn) {
-                foreach ($name in @($manifest.vpn.allUsers)) {
-                    & rasdial.exe $name | Out-Null
-                    if ($LASTEXITCODE -eq 0) { Write-PmLog "VPN '$name' connected." 'OK' } else { Write-PmLog "VPN '$name' could not connect (rasdial $LASTEXITCODE) - credentials must be entered once on the target." 'WARN' }
-                }
-            }
-            $report.Vpn = 'ok'
-        } catch { $report.Vpn = 'failed'; $report.Errors += "VPN: $_"; Write-PmLog "VPN restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'VPN restore' }
     }
 
     # ---- Desktop
@@ -1769,7 +2822,7 @@ function Get-PmHostFacts {
 }
 
 function Clear-PmRemoteStages {
-    <# Removes PRTG Mover's own temporary restore folders / chunks of earlier (cancelled) runs, except $Keep. #>
+    <# Removes PRTG Manager's own temporary restore folders / chunks of earlier (cancelled) runs, except $Keep. #>
     param([string]$Keep)
     $root = Join-Path (Get-PmWorkRoot) 'restore'
     $removed = @()

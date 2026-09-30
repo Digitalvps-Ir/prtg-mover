@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.0.0 â€” 2026-09-30
+
+PRTG Mover is now **PRTG Manager**. Windows VPN connections and routes moved to **VPN Manager** (the former VPN Watch).
+
+### Added
+- **Backup types**: *Full* (as before), *History* (graph data of all days or the last N days, from a VSS snapshot), *Devices* (probes, groups, devices, sensors with settings, channels and triggers), *Notifications* (templates and the schedules they use), *Triggers* (every trigger of every object) and *License* (always encrypted on the server). Parts are read from `PRTG Configuration.dat` without writing anything on the server.
+- **Restore for every type, always with a preview**: items to create, update, skip, conflicts (including ID conflicts), missing dependencies (notifications, schedules, dependencies, devices of a history package) and blockers (newer configuration format, older PRTG on the target, disk space, no PRTG and no program clone, no administrator rights). Restore is only enabled after a preview without blockers; a full restore needs an explicit confirmation.
+- **Restore modes for configuration parts**: merge (only add), overwrite (also update existing objects) and new ids for objects whose id is taken on the target (with everything below them; dependencies inside follow). The highest id of the configuration is raised as needed.
+- **Automatic rollback**: a full restore puts the previous data folder and PRTG registry back when it fails or PRTG does not come up; a part restore puts the saved `PRTG Configuration.dat` back; license changes keep a copy of the previous license.
+- **License page**: status (edition, name, sensors, activation, last activation message, value names, system-id fingerprint), add a free trial license, activate an authorized license (the key is written like the PRTG Administration Tool does it and PRTG activates it online with Paessler; the result is read from log lines written after that start and explained), license backup and restore, license removal with the server name as confirmation.
+- **Backup password**: any package can be encrypted (AES-256-CBC + HMAC-SHA256, PBKDF2-SHA256 200 000 rounds, file `.pmenc`); a wrong password or a changed file is detected before anything is decrypted.
+- **Backups page**: one table with type, source, created, size, format and PRTG version, encrypted and valid; actions Download, **Validate** (file checksum, zip, format, every file checksum, configuration checksum, history file count, password/HMAC), **Inspect** (metadata, sections, counts, checksums, file list) and Delete; upload of `.zip` and `.pmenc`.
+- **Package format 2**: `manifest.json` with format, type, app version, source, components, sections, counts, per-file SHA-256 and encryption; the sidecar keeps the last validation. Packages of format 1 still restore.
+- **Structured errors**: API errors carry `operation`, `component`, `reason`, `code` and a `hint`; the dashboard shows the hint.
+- **Audit** of backups, restores, validations, license changes and deletions; passwords and keys never appear in job records, logs or the audit trail.
+- **Command line**: `-Scope Graphs -HistoryDays`, `-Action BackupPart -Part Devices|Notifications|Triggers|License`, `-BackupPassword`.
+
+### Changed
+- Product name, dashboard, shortcuts, task (*PRTG Manager Dashboard*), scripts (`Start-PrtgManager.ps1`, `Open-PrtgManager.ps1`, `src\PrtgManager.psm1`, â€¦) renamed. The old script names remain as forwarders. The installer updates an installation in `C:\PrtgMover` in place and replaces its own old shortcuts and task; new installations go to `C:\PrtgManager`.
+- Package names: `PRTG-FULL_â€¦`, `PRTG-GRAPHS_â€¦`, `PRTG-DEVICES_â€¦`, `PRTG-NOTIFICATIONS_â€¦`, `PRTG-TRIGGERS_â€¦`, `PRTG-LICENSE_â€¦`.
+- **Delete** moves a package to the Recycle Bin instead of deleting it.
+- **Remove license** removes the license (name, key, activation hash, license files) and leaves PRTG's own bookkeeping (install date, paused-sensor counter) alone.
+- A server with the role *Source* is refused as a restore target by the engine too, not only by the dashboard.
+- `Setup-All.cmd` installs PRTG Manager and VPN Manager (`-SkipPrtgManager`, `-SkipVpnManager`, `-PrtgManagerPath`, `-VpnManagerPath`; the old parameter names still work).
+
+### Removed
+- VPN connections, VPN routes and VPN-only backups (`IncludeVpn`, `RestoreVpn`, `RestoreRoutes`, `ConnectVpn`, the VPN section of the Backups page). Use VPN Manager; it imports old PRTG Mover packages.
+
+### Fixed
+- A dependency of a restored object on another object restored in the same run (for example a device that depends on its own sensor) is no longer reported as missing.
 ## 1.9.1 — 2026-09-29
 
 ### Fixed
