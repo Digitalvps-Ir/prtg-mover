@@ -889,6 +889,8 @@ Describe 'PRTG configuration parts (devices, notifications, triggers)' {
     It 'does not count values PRTG re-encrypted on a save as a change' {
         $t = & $NewTarget
         $t.SelectSingleNode("//device[@id='40']/data/windowsloginpassword/cell").InnerText = 'BBBBreencrypted222'
+        # a timestamp PRTG keeps up to date by itself is no setting either
+        $ts = $t.CreateElement('location_last_updated'); $ts.InnerText = '46294.5'; [void]$t.SelectSingleNode("//device[@id='40']/data").AppendChild($ts)
         (Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices') -Mode overwrite).Counts.update | Should -Be 0
     }
 

@@ -697,13 +697,17 @@ function Get-PmSettingsXml {
     return $sb.ToString()
 }
 
+# Fields PRTG keeps up to date by itself (timestamps, tree state in the web interface): not settings.
+$PmVolatileFields = 'location_last_updated', 'lastdiscovery', 'treestate'
+
 function ConvertTo-PmComparableXml {
     <#
-        XML text in one canonical form for comparisons: encrypted cells masked, <x></x> written as <x />,
-        whitespace collapsed. Two texts that mean the same compare equal.
+        XML text in one canonical form for comparisons: encrypted cells masked, fields PRTG updates by itself
+        left out, <x></x> written as <x />, whitespace collapsed. Two texts that mean the same compare equal.
     #>
     param([string]$Xml)
     $x = $Xml -replace '(<cell[^>]*\bcrypt="[^"]*"[^>]*>)[^<]*(</cell>)', '$1*$2'
+    foreach ($v in $PmVolatileFields) { $x = [regex]::Replace($x, "<$v\b[^>]*?(?:/>|>.*?</$v>)", '', [Text.RegularExpressions.RegexOptions]::Singleline) }
     $x = $x -replace '>\s+<', '><'
     $x = $x -replace '<([\w\.:-]+)((?:\s[^<>]*?)?)\s*></\1>', '<$1$2 />'
     $x = $x -replace '\s*/>', ' />'

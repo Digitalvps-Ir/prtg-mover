@@ -326,7 +326,14 @@
     $$('#migrateForm [data-for]').forEach((el) => { el.hidden = el.dataset.for !== t; });
     $('#typeHint').textContent = TYPE_HINT[t] || '';
     const enc = f.Encrypt;
-    if (t === 'license') { enc.checked = true; enc.disabled = true; } else { enc.disabled = false; }
+    if (t === 'license') {
+      if (!enc.checked) enc.dataset.forced = '1';
+      enc.checked = true; enc.disabled = true;
+    } else {
+      // the tick the License type forced goes away with it; one the user set stays
+      if (enc.dataset.forced) { enc.checked = false; delete enc.dataset.forced; }
+      enc.disabled = false;
+    }
     $('#pwFields').hidden = !enc.checked;
     updateMigrateButton();
   }
@@ -667,6 +674,8 @@
     if (!targets.length) return fail(new Error('Select at least one target server.'));
     const pw = f.Password.value;
     if (!$('#restorePwRow').hidden && !pw) return fail(new Error('Enter the backup password of this package.'));
+    // an earlier preview no longer counts while this one runs
+    state.preview = null; $('#restoreGo').disabled = true;
     const box = $('#previewBox'); box.innerHTML = '<p class="muted">Reading the target… nothing is changed.</p>';
     $('#previewState').textContent = '(running)';
     try {
