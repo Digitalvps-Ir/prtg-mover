@@ -145,7 +145,12 @@ try {
             # the engine never restores into a server marked as source - checked before anything is decrypted or sent
             foreach ($srv in $targets) { Assert-PmNotSource -Server $srv -What 'restore into' }
             if ($ptype -in 'devices', 'notifications', 'triggers', 'license') {
-                foreach ($srv in $targets) { [void](Invoke-PmSectionRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -Path $file -Options $options -Password $pw -Job $job) }
+                $job.result = @(foreach ($srv in $targets) {
+                        $r = Invoke-PmSectionRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -Path $file -Options $options -Password $pw -Job $job
+                        # a license restore that leaves PRTG unhealthy reports ok = $false without throwing
+                        if (-not $r.ok) { $exit = 2; Add-PmJobLog -Job $job -Level ERROR -Message "$($srv.name): the $($r.type) was restored, but PRTG did not come back healthy$(if ($r.hint) { " - $($r.hint)" })" }
+                        $r
+                    })
             } else {
                 $plain = Get-PmPlainPackage -Path $file -Password $pw -Job $job
                 try {
@@ -153,7 +158,7 @@ try {
                         $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -BackupPath $plain.Path -Options $options -Job $job
                         if (@($rep.Errors).Count) { $exit = 2 }
                     }
-                } finally { if ($plain.Temp) { Remove-Item -LiteralPath $plain.Path -Force -ErrorAction SilentlyContinue } }
+                } finally { Remove-PmPlainPackage $plain }   # the decrypted zip and the folder it was extracted into
             }
         }
         'RemoveLicense' {

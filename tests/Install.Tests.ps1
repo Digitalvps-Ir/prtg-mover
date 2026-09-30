@@ -349,4 +349,29 @@ Describe 'Upgrade path and command line (review findings)' {
         $prefix | Should -Be 'PRTG-FULL_SRV_'
         [IO.File]::ReadAllText((Join-Path $Root 'cli\Invoke-PrtgManager.ps1')) | Should -Match ([regex]::Escape("-replace '_\d{8}-\d{6}\.(zip|pmenc)$', '_'"))
     }
+    It 'removes the decrypted zip and its restore extract after a restore, and never a package that was not encrypted' {
+        Import-Module (Join-Path $Root 'src\PrtgManager.psm1') -Force -DisableNameChecking
+        $mgr = Join-Path $Work 'plain-mgr'; New-Item -ItemType Directory -Force -Path $mgr | Out-Null
+        Set-PmRoot -Path $mgr
+        $stage = Join-Path (Get-PmPath Data) 'staging'
+        New-Item -ItemType Directory -Force -Path (Join-Path $stage 'restore-decrypted-PRTG-FULL_SRV_20260101-000000\PRTG') | Out-Null
+        $zip = Join-Path $stage 'decrypted-PRTG-FULL_SRV_20260101-000000.zip'; Set-Content -LiteralPath $zip -Value 'x'
+        Set-Content -LiteralPath (Join-Path $stage 'restore-decrypted-PRTG-FULL_SRV_20260101-000000\PRTG\PRTG Configuration.dat') -Value '<config/>'
+        Remove-PmPlainPackage ([pscustomobject]@{ Path = $zip; Temp = $true })
+        Test-Path -LiteralPath $zip | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $stage 'restore-decrypted-PRTG-FULL_SRV_20260101-000000') | Should -BeFalse
+        $plainZip = Join-Path $Work 'PRTG-FULL_SRV_20260101-000000.zip'; Set-Content -LiteralPath $plainZip -Value 'x'
+        Remove-PmPlainPackage ([pscustomobject]@{ Path = $plainZip; Temp = $false })
+        Test-Path -LiteralPath $plainZip | Should -BeTrue
+        $cli = [IO.File]::ReadAllText((Join-Path $Root 'cli\Invoke-PrtgManager.ps1'))
+        $cli | Should -Match 'finally \{ Remove-PmPlainPackage \$plain \}'
+        [IO.File]::ReadAllText((Join-Path $Root 'src\PrtgManager.psm1')) | Should -Match 'finally \{ Remove-PmPlainPackage \$plain \}'
+    }
+    It 'a part restore that reports ok = false fails the command line and the dashboard job' {
+        $cli = [IO.File]::ReadAllText((Join-Path $Root 'cli\Invoke-PrtgManager.ps1'))
+        $restore = $cli.Substring($cli.IndexOf("'Restore' {")); $restore = $restore.Substring(0, $restore.IndexOf("'RemoveLicense' {"))
+        $restore | Should -Match 'if \(-not \$r\.ok\) \{ \$exit = 2'
+        $psm = [IO.File]::ReadAllText((Join-Path $Root 'src\PrtgManager.psm1'))
+        $psm | Should -Match 'if \(\$r\.ok\) \{ Set-PmCheckpoint -Job \$Job -TargetDone \$id \}\s+else \{ \$failed\+\+'
+    }
 }

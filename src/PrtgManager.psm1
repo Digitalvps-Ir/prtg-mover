@@ -892,6 +892,19 @@ function Get-PmPlainPackage {
     return [pscustomobject]@{ Path = $tmp; Temp = $true }
 }
 
+function Remove-PmPlainPackage {
+    <#
+        Removes what a decrypted package left on the manager: the temporary zip and the folder a restore
+        extracted it into (data\staging\restore-<name>). Nothing is removed for a package that was not
+        encrypted - its zip is the backup itself.
+    #>
+    param($Plain)
+    if (-not $Plain -or -not $Plain.Temp) { return }
+    Remove-Item -LiteralPath $Plain.Path -Force -ErrorAction SilentlyContinue
+    $extract = Join-Path (Get-PmPath Data) ('staging\restore-' + [IO.Path]::GetFileNameWithoutExtension($Plain.Path))
+    if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 # ======================================================================= PRTG parts, license, previews (flows)
 
 function Assert-PmNotSource {
@@ -2305,15 +2318,20 @@ function Invoke-PmJob {
                     $results = @(); $failed = 0
                     foreach ($id in $targets) {
                         $srv = Get-PmServer -Id $id
-                        try { $results += Invoke-PmSectionRestoreFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Path $file -Options $options -Password $pw -Job $Job; Set-PmCheckpoint -Job $Job -TargetDone $id }
-                        catch { $failed++; Add-PmJobError -Job $Job -ErrorRecord $_ -Context "$($srv.name): "; $results += [pscustomobject]@{ target = $srv.name; ok = $false; error = "$_" } }
+                        try {
+                            $r = Invoke-PmSectionRestoreFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Path $file -Options $options -Password $pw -Job $Job
+                            $results += $r
+                            # a license restore that leaves PRTG unhealthy reports ok = $false without throwing
+                            if ($r.ok) { Set-PmCheckpoint -Job $Job -TargetDone $id }
+                            else { $failed++; Add-PmJobLog -Job $Job -Level ERROR -Message "$($srv.name): the $($r.type) was restored, but PRTG did not come back healthy$(if ($r.hint) { " - $($r.hint)" })" }
+                        } catch { $failed++; Add-PmJobError -Job $Job -ErrorRecord $_ -Context "$($srv.name): "; $results += [pscustomobject]@{ target = $srv.name; ok = $false; error = "$_" } }
                     }
                     $Job.result = $results
                     if ($failed) { throw "$failed of $($targets.Count) target(s) reported errors." }
                 } else {
                     $plain = Get-PmPlainPackage -Path $file -Password $pw -Job $Job
                     try { $Job.result = Invoke-PmMultiRestore -File $plain.Path -TargetIds $targets -Options $options -Credentials $creds -Job $Job -Base 0 -Span 100 }
-                    finally { if ($plain.Temp) { Remove-Item -LiteralPath $plain.Path -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath (Join-Path (Get-PmPath Data) ("staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($plain.Path))) -Recurse -Force -ErrorAction SilentlyContinue } }
+                    finally { Remove-PmPlainPackage $plain }
                 }
             }
             'restore-preview' {
