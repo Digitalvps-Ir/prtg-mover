@@ -81,7 +81,8 @@ h2.mt { margin-top: 22px; }
 .lic-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 ul.plain { margin: 6px 0 0 18px; padding: 0; font-size: .85rem; line-height: 1.7; }
 ul.plain li { margin: 4px 0; }
-.danger-confirm { background: var(--red-soft); color: var(--red); border-left: 3px solid var(--red); border-radius: var(--radius-sm); padding: 9px 11px; }
+.danger-confirm { background: var(--red-soft); color: var(--red); border-left: 3px solid var(--red); border-radius: var(--radius-sm); padding: 9px 11px 9px 37px; }
+.danger-confirm > input { left: 11px; top: 13px; }
 .danger-confirm span { color: var(--ink); }
 .counts { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
 

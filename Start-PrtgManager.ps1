@@ -242,7 +242,7 @@ function Invoke-PmRoute {
                 $bytes = [IO.File]::ReadAllBytes($file)
                 $res = $Ctx.Response; $res.StatusCode = 200; $res.ContentType = $ct; $res.ContentLength64 = $bytes.Length
                 $res.Headers['Cache-Control'] = 'public, max-age=604800'; $res.Headers['X-Content-Type-Options'] = 'nosniff'
-                try { $res.OutputStream.Write($bytes, 0, $bytes.Length) } finally { $res.OutputStream.Close() }
+                try { $res.OutputStream.Write($bytes, 0, $bytes.Length) } finally { $res.Close() }
                 return
             }
             Send-PmResponse -Ctx $Ctx -Body ([IO.File]::ReadAllText($file, [Text.Encoding]::UTF8)) -ContentType $ct

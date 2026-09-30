@@ -100,6 +100,7 @@ nav a:hover { background: #ffffff0d; color: #fff; }
 nav a.active { background: #194b40; border-color: #2a6c5b; color: #eafff7; font-weight: 600; }
 nav a.active svg { opacity: 1; }
 .pill { margin-left: auto; background: var(--amber); color: #fff; border-radius: 999px; font-size: .7rem; font-weight: 700; padding: 0 7px; line-height: 19px; min-width: 20px; text-align: center; }
+:root[data-theme="dark"] .pill { color: #2a1d05; }
 .sidebar-foot { margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--nav-line); border-radius: 10px; background: var(--nav-soft); color: #91a5b2; font-size: .72rem; line-height: 1.5; word-break: break-word; }
 .sidebar-foot .avatar { display: grid; place-items: center; width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px; background: #194b40; color: #eafff7; font: 700 12px/1 Arial, sans-serif; }
 .sidebar-foot b { display: block; color: #e8f0f4; font-size: .8rem; }

@@ -66,7 +66,7 @@
   });
   const small = window.matchMedia('(max-width: 900px)');
   const setNav = (open) => { $('#app').classList.toggle('nav-open', open); $('#navOpen').setAttribute('aria-expanded', String(open)); if (open) $('#sidebar nav a.active')?.focus(); };
-  const setFold = (folded) => { $('#app').classList.toggle('nav-folded', folded); $$('#sidebar nav a').forEach((a) => { a.title = folded ? a.textContent.trim() : ''; }); };
+  const setFold = (folded) => { $('#app').classList.toggle('nav-folded', folded); $$('#sidebar nav a').forEach((a) => { a.title = folded ? (a.querySelector('.grow') || a).textContent.trim() : ''; }); };
   try { setFold(localStorage.getItem('dv-nav') === 'folded'); } catch (e) { /* no storage */ }
   // one button: a drawer on small screens, fold / unfold the menu on large ones
   $('#navOpen').addEventListener('click', () => {
