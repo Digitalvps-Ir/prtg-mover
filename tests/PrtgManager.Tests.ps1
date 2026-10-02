@@ -146,6 +146,81 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
     }
 }
 
+Describe 'Full restore into a server where PRTG is already installed (simulated installation)' {
+    BeforeAll {
+        # a "PRTG" that is installed in a test folder: its services, registry, firewall and health check are mocked
+        function New-InstalledCase([string]$Name) {
+            $root = Join-Path $Work "installed-$Name"
+            $tgt = Join-Path $root 'target-data'
+            New-Item -ItemType Directory -Force -Path (Join-Path $tgt 'Monitoring Database'), (Join-Path $root 'stage\prtg\data'), (Join-Path $root 'wr') | Out-Null
+            'OLD CONFIG' | Set-Content (Join-Path $tgt 'PRTG Configuration.dat')
+            'old history' | Set-Content (Join-Path $tgt 'Monitoring Database\old.dat')
+            $cfg = Join-Path $root 'stage\prtg\data\PRTG Configuration.dat'
+            'NEW CONFIG FROM THE SOURCE' | Set-Content $cfg
+            $man = [ordered]@{ type = 'full'; createdUtc = '2026-10-01T00:00:00Z'; stagingBytes = 1024; source = @{ computer = 'SRC' }
+                prtg = [ordered]@{ included = $true; version = '25.4.114.1032'; dataPath = (Join-Path $root 'source-data-path'); configSha256 = (Get-FileHash $cfg -Algorithm SHA256).Hash; registryFiles = @(); programFolders = @(); listenPorts = @(443); programCloned = $true; licenseValueNames = @() } }
+            ConvertTo-Json $man -Depth 5 | Set-Content (Join-Path $root 'stage\manifest.json')
+            [pscustomobject]@{ Root = $root; Target = $tgt; Stage = (Join-Path $root 'stage'); WorkRoot = (Join-Path $root 'wr'); SourcePath = (Join-Path $root 'source-data-path') }
+        }
+        function Register-InstalledMocks([string]$TargetData) {
+            $script:InstTarget = $TargetData
+            Mock Get-PmPrtgInfo { [pscustomobject]@{ Installed = $true; Version = '25.4.114.1032'; DataPath = $script:InstTarget; ProgramPath = (Join-Path $Work 'no-program'); RegistryKeys = @(); ListenPorts = @(443); ListenEndpoints = @('10.0.0.5:443') } }
+            Mock Stop-PmPrtgServices { }
+            Mock Invoke-PmReg { 0 }
+            Mock Set-PmPrtgWebBinding { }
+            Mock Set-PmPrtgFirewall { @(443) }
+            Mock Get-PmLicenseValues { @() }
+            Mock Get-PmPrtgLicenseState { [pscustomobject]@{ Known = $false } }
+            Mock New-Service { throw 'nothing may be installed: PRTG is installed already' }
+        }
+    }
+
+    It 'installs nothing, restores into the installed PRTG data folder (not the source path) and keeps the old one for the rollback' {
+        $c = New-InstalledCase 'ok'
+        Register-InstalledMocks $c.Target
+        Mock Invoke-PmHealthCheck { $Box.Health = [pscustomobject]@{ Healthy = $true; Url = 'https://10.0.0.5/'; Version = '25.4.114.1032'; Core = 'Running'; Probe = 'Running'; Message = '' } }
+        $out = @(Invoke-PmRemoteRestore -JobId 'inst1' -StageDir $c.Stage -WorkRoot $c.WorkRoot -RestoreDesktop $false -RestoreExtra $false -CopyLicense $false)
+        $r = ($out | Where-Object PmType -eq 'result').Report
+        $r.Prtg | Should -Be 'ok'
+        @($r.Errors).Count | Should -Be 0
+        Get-Content (Join-Path $c.Target 'PRTG Configuration.dat') | Should -Be 'NEW CONFIG FROM THE SOURCE'
+        Test-Path $c.SourcePath | Should -BeFalse -Because 'PRTG is installed here: its own data folder is used, not the source path'
+        $kept = @(Get-ChildItem $c.Root -Directory | Where-Object Name -like 'target-data.pre-restore-*')
+        $kept.Count | Should -Be 1
+        Get-Content (Join-Path $kept[0].FullName 'PRTG Configuration.dat') | Should -Be 'OLD CONFIG'
+        Should -Invoke New-Service -Times 0 -Exactly
+        @($out | Where-Object { $_.PmType -eq 'log' -and $_.Message -like '*already installed here - nothing is installed*' }).Count | Should -Be 1
+    }
+
+    It 'puts the previous data back when the restored PRTG does not come up' {
+        $c = New-InstalledCase 'rollback'
+        Register-InstalledMocks $c.Target
+        $script:HealthCalls = 0
+        Mock Invoke-PmHealthCheck { $script:HealthCalls++; $Box.Health = [pscustomobject]@{ Healthy = ($script:HealthCalls -gt 1); Url = 'https://10.0.0.5/'; Version = '25.4.114.1032'; Core = 'Running'; Probe = 'Running'; Message = 'web interface does not answer' } }
+        $out = @(Invoke-PmRemoteRestore -JobId 'inst2' -StageDir $c.Stage -WorkRoot $c.WorkRoot -RestoreDesktop $false -RestoreExtra $false -CopyLicense $false -AutoRollback $true)
+        $r = ($out | Where-Object PmType -eq 'result').Report
+        $r.RolledBack | Should -BeTrue
+        $r.Prtg | Should -Be 'rolled-back'
+        Get-Content (Join-Path $c.Target 'PRTG Configuration.dat') | Should -Be 'OLD CONFIG'
+        Test-Path (Join-Path $c.Target 'Monitoring Database\old.dat') | Should -BeTrue
+        @(Get-ChildItem $c.Root -Directory | Where-Object Name -like 'target-data.failed-restore-*').Count | Should -Be 1   # the restored data is kept, not deleted
+    }
+
+    It 'the preview says nothing is installed, names the data folder and warns when the space is tight' {
+        $man = [pscustomobject]@{ stagingBytes = 10GB; prtg = [pscustomobject]@{ version = '25.4.114.1032'; programCloned = $true; configStats = 'devices=27'; dataPath = 'D:\PRTG Data'; programFolders = @() } }
+        $facts = [pscustomobject]@{ Computer = 'NEW'; IsAdmin = $true; ConfigStats = 'devices=20'; DataBytes = 5GB; FreeBytes = 15GB; NetRelease = 0; License = $null
+            Prtg = [pscustomobject]@{ Installed = $true; Version = '25.4.114.1032'; DataPath = 'C:\ProgramData\Paessler\PRTG Network Monitor' } }
+        $p = Get-PmFullRestorePreview -Manifest $man -Facts $facts
+        @($p.Blockers).Count | Should -Be 0
+        ($p.Items | Where-Object Item -eq 'PRTG program').Detail | Should -Match 'already installed - it is kept, nothing is installed'
+        ($p.Items | Where-Object Item -eq 'PRTG data folder').Detail | Should -Match ([regex]::Escape('C:\ProgramData\Paessler\PRTG Network Monitor gets the restored data'))
+        ($p.Items | Where-Object Item -eq 'PRTG data folder').Detail | Should -Match ([regex]::Escape('the source used D:\PRTG Data'))
+        @($p.Warnings | Where-Object { $_ -like 'Free space on the target is tight*' }).Count | Should -Be 1
+        $facts.FreeBytes = 11GB
+        @((Get-PmFullRestorePreview -Manifest $man -Facts $facts).Blockers | Where-Object { $_ -like 'Not enough free space*' }).Count | Should -Be 1
+    }
+}
+
 Describe 'RDP agent transport (end to end, local)' {
     BeforeAll {
         $env:PRTGMOVER_TEST = '1'

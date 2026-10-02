@@ -1034,8 +1034,11 @@ function Get-PmFullRestorePreview {
     $p = $Manifest.prtg
     $tp = $Facts.Prtg
     if ($tp.Installed) {
+        # PRTG is already installed: nothing is installed, the program and its services stay; only the data, registry and customisations are replaced
+        [void]$items.Add([pscustomobject]@{ Action = 'skip'; Item = 'PRTG program'; Detail = "PRTG $($tp.Version) is already installed - it is kept, nothing is installed$(if ($p.programCloned) { ' (the program clone in the package is not used)' })" })
         [void]$items.Add([pscustomobject]@{ Action = 'update'; Item = 'PRTG configuration'; Detail = "replaced: target has $($Facts.ConfigStats); backup has $($p.configStats)" })
-        [void]$items.Add([pscustomobject]@{ Action = 'update'; Item = 'PRTG data folder'; Detail = ("the current one ({0:N2} GB) is kept as <data>.pre-restore-<time> for the rollback" -f ($Facts.DataBytes / 1GB)) })
+        $dp = if ($tp.DataPath) { [string]$tp.DataPath } else { '<data>' }
+        [void]$items.Add([pscustomobject]@{ Action = 'update'; Item = 'PRTG data folder'; Detail = ("{0} gets the restored data; the current one ({1:N2} GB) is kept as {0}.pre-restore-<time> for the rollback$(if ($p.dataPath -and ([string]$p.dataPath).TrimEnd('\') -ine $dp) { " (the source used $($p.dataPath))" })" -f $dp, ($Facts.DataBytes / 1GB)) })
     } else {
         [void]$items.Add([pscustomobject]@{ Action = 'create'; Item = 'PRTG'; Detail = $(if ($p.programCloned) { 'installed from the program clone in the package (no installer)' } elseif ($Options.InstallerFile) { "installed with $($Options.InstallerFile)" } else { 'NOT installed here and the package has no program clone' }) })
         if (-not $p.programCloned -and -not $Options.InstallerFile) { $blockers += 'PRTG is not installed on the target, the package has no program clone and no installer was chosen.' }
@@ -1048,8 +1051,11 @@ function Get-PmFullRestorePreview {
         if ($tv -lt $sv) { if ($Options.AllowDowngrade) { $warn += "Target PRTG $tv is older than the backup ($sv) - allowed by 'Allow downgrade', PRTG may not start." } else { $blockers += "Target PRTG $tv is older than the backup ($sv). Update PRTG on the target first." } }
         elseif ($tv -gt $sv) { $warn += "Target PRTG $tv is newer than the backup ($sv) - PRTG converts the configuration when it starts." }
     }
+    # the same rule as the restore on the target: the extracted package + the restored data + 1 GB (the current data folder is kept beside it)
     $need = [int64]$Manifest.stagingBytes; if (-not $need) { $need = $PackageBytes }
-    if ($Facts.FreeBytes -and $Facts.FreeBytes -lt ($need + 2GB)) { $blockers += ("Not enough free space on the target: {0:N1} GB free, about {1:N1} GB needed." -f ($Facts.FreeBytes / 1GB), (($need + 2GB) / 1GB)) }
+    $required = [int64](2 * $need + 1GB)
+    if ($Facts.FreeBytes -and $Facts.FreeBytes -lt ($need + 2GB)) { $blockers += ("Not enough free space on the target: {0:N1} GB free, at least {1:N1} GB needed." -f ($Facts.FreeBytes / 1GB), (($need + 2GB) / 1GB)) }
+    elseif ($Facts.FreeBytes -and $Facts.FreeBytes -lt $required) { $warn += ("Free space on the target is tight: {0:N1} GB free. A package sent as a zip is unpacked there and then copied into place - that needs about {1:N1} GB and the restore stops before changing anything if it is not there. The current data folder is kept beside the restored one for the rollback." -f ($Facts.FreeBytes / 1GB), ($required / 1GB)) }
     if ([int]$p.netFrameworkRelease -and [int]$Facts.NetRelease -and [int]$Facts.NetRelease -lt [int]$p.netFrameworkRelease) { $deps += ".NET Framework on the target (release $($Facts.NetRelease)) is older than on the source ($($p.netFrameworkRelease)); install the same version if PRTG does not start." }
     if (-not $Facts.IsAdmin) { $blockers += 'The connection to the target has no administrator rights.' }
     return [pscustomobject]@{ Type = 'full'; Items = @($items); Blockers = $blockers; Warnings = $warn; MissingDependencies = $deps; Target = [pscustomobject]@{ Computer = $Facts.Computer; PrtgVersion = $tp.Version; Installed = [bool]$tp.Installed; ConfigStats = $Facts.ConfigStats; FreeBytes = $Facts.FreeBytes }; Rollback = 'automatic: the previous data folder and registry are put back when the restored PRTG does not come up' }
