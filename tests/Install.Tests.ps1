@@ -136,7 +136,7 @@ Describe 'Installer' -Skip:($env:OS -ne 'Windows_NT') {
         $text | Should -Match 'updated from PRTG Mover'
         Test-Path -LiteralPath (Join-Path $old 'src\PrtgMover.psm1') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $old 'src\PrtgManager.psm1') | Should -BeTrue
-        [IO.File]::ReadAllText((Join-Path $old 'Start-PrtgMover.ps1')) | Should -Match 'PRTG Mover is now PRTG Manager'
+        Test-Path -LiteralPath (Join-Path $old 'Start-PrtgMover.ps1') | Should -BeFalse -Because 'the old script names are not shipped any more; the update removes them'
         [IO.File]::ReadAllText((Join-Path $old 'config\servers.json')) | Should -Match 'Keep'
         Test-Path -LiteralPath (Join-Path $old 'backups\PRTG_OLD_20260101-000000.zip') | Should -BeTrue
         Test-Path -LiteralPath (Join-Path $Links 'PRTG Mover.lnk') | Should -BeFalse
@@ -144,15 +144,6 @@ Describe 'Installer' -Skip:($env:OS -ne 'Windows_NT') {
         Test-Path -LiteralPath (Join-Path $Startup 'PRTG Mover.lnk') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $Startup 'PRTG Manager.lnk') | Should -BeTrue -Because 'the old start with Windows is carried over'
         Remove-Item -LiteralPath (Join-Path $Startup 'PRTG Manager.lnk'), (Join-Path $Links 'PRTG Manager.lnk') -Force
-    }
-
-    It 'the old script names forward to the new ones' {
-        # a port another program holds: the forwarded Start-PrtgManager.ps1 refuses it with exit code 1
-        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start()
-        try { $o = & powershell -NoProfile -ExecutionPolicy Bypass -Command "& '$(Join-Path $Root 'Start-PrtgMover.ps1')' -Port $($l.LocalEndpoint.Port) -NoBrowser; `$LASTEXITCODE" 2>&1 } finally { $l.Stop() }
-        ($o | Select-Object -Last 1) | Should -Be '1'
-        ($o -join ' ') | Should -Match 'used by another program'
-        [IO.File]::ReadAllText((Join-Path $Root 'Start-PrtgMover.cmd')) | Should -Match 'Start-PrtgManager\.cmd'
     }
 
     It 'installs from a zip file' {

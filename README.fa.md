@@ -142,7 +142,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 اطلاعات شما (`config\`، `data\`، `backups\`، `installers\`) با به‌روزرسانی یا حذف برنامه هرگز دست نمی‌خورد.
 
-**نصب هر دو برنامه با یک فایل (PRTG Manager و VPN Manager):** دستور `tools\Build-SetupAll.ps1 -VpnManagerSource <VPN Manager folder>` فایل `Setup-All.cmd` را می‌سازد. روی یک کامپیوتر ویندوزی رویش دوبار کلیک کنید: هر دو برنامه را نصب یا به‌روز می‌کند (PRTG Manager در `C:\PrtgManager` و VPN Manager در `C:\VpnManager`؛ نصب‌های قدیمی‌تر همان‌جا به‌روز می‌شوند)، میان‌برها را می‌سازد، هر دو را همراه ویندوز اجرا می‌کند و هر دو داشبورد را تست می‌کند. گزینه‌ها: `-SkipPrtgManager`، `-SkipVpnManager`، `-PrtgManagerPath`، `-VpnManagerPath`، `-NoAutostart` (نام‌های قدیمی مثل `-PrtgMoverPath` هم هنوز کار می‌کنند).
+**نصب هر دو برنامه با یک فایل (PRTG Manager و VPN Manager):** فایل آمادهٔ **`Setup-All.cmd`** را از آخرین [Release](https://github.com/Digitalvps-Ir/prtg-mover/releases/latest) همین مخزن دانلود کنید (همین فایل در Releaseهای [vpn-watch](https://github.com/Digitalvps-Ir/vpn-watch/releases/latest) هم هست)، یا خودتان با دستور `tools\Build-SetupAll.ps1 -VpnManagerSource <VPN Manager folder>` آن را بسازید. روی یک کامپیوتر ویندوزی آن را با Run as administrator اجرا کنید: هر دو برنامه را نصب یا به‌روز می‌کند (PRTG Manager در `C:\PrtgManager` و VPN Manager در `C:\VpnManager`؛ نصب‌های قدیمی‌تر همان‌جا به‌روز می‌شوند)، میان‌برها را می‌سازد، هر دو را همراه ویندوز اجرا می‌کند و هر دو داشبورد را تست می‌کند. گزینه‌ها: `-SkipPrtgManager`، `-SkipVpnManager`، `-PrtgManagerPath`، `-VpnManagerPath`، `-NoAutostart` (نام‌های قدیمی مثل `-PrtgMoverPath` هم هنوز کار می‌کنند).
 
 ## <a name="quick-start-migrate-a-prtg-server"></a>شروع سریع: انتقال یک سرور PRTG
 
@@ -232,7 +232,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ## <a name="coming-from-prtg-mover"></a>آمدن از PRTG Mover
 
-- نصب‌کننده و `Setup-All.cmd` نصب موجود در `C:\PrtgMover` را همان‌جا به‌روز می‌کنند؛ سرورها، اطلاعات ورود و بکاپ‌ها سر جایشان می‌مانند. میان‌برها و تسک اجرای خودکار با ویندوز به **PRTG Manager** تغییر نام می‌دهند؛ فایل‌های `Start-PrtgMover.ps1`، `Start-PrtgMover.cmd`، `Open-PrtgMover.ps1`، `tools\Enable-PrtgMoverRemoting.ps1` و `cli\Invoke-PrtgMover.ps1` به‌شکل فایل‌های کوچکی می‌مانند که کار را به نسخهٔ جدید می‌سپارند (Forwarder)، تا میان‌برها و تسک‌های قدیمی همچنان کار کنند.
+- نصب‌کننده و `Setup-All.cmd` نصب موجود در `C:\PrtgMover` را همان‌جا به‌روز می‌کنند؛ سرورها، اطلاعات ورود و بکاپ‌ها سر جایشان می‌مانند. میان‌برها و تسک اجرای خودکار با ویندوز به **PRTG Manager** تغییر نام می‌دهند و فایل‌های نام قدیمی (`Start-PrtgMover.ps1`، `Open-PrtgMover.ps1` و ...) از پوشهٔ نصب پاک می‌شوند (از نسخهٔ 2.1.1 دیگر فایل Forwarder همراه برنامه نیست).
 - بسته‌های PRTG Mover (فرمت 1) با نوع *Full* نمایش داده می‌شوند و مثل قبل بازگردانی می‌شوند. بخش VPN آن‌ها اینجا نادیده گرفته می‌شود — بسته را در **VPN Manager** وارد (Import) کنید. بسته‌هایی که فقط VPN دارند (`VPN_*.zip`) دیگر در PRTG Manager نمایش داده نمی‌شوند.
 - این نام‌ها به‌عنوان شناسهٔ فنی باقی مانده‌اند: پوشهٔ کاری روی سرورها `C:\PrtgMover` (کپی‌های Rollback آنجا هستند)، پیشوند لینک VSS یعنی `PrtgMoverVss_`، متغیرهای محیطی `PRTGMOVER_*` و نام مخزن GitHub یعنی `prtg-mover`.
 

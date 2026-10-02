@@ -140,7 +140,7 @@ The installer copies the program to `C:\PrtgManager` (an existing PRTG Mover ins
 
 Your data (`config\`, `data\`, `backups\`, `installers\`) is never touched by an update or an uninstall.
 
-**PRTG Manager and VPN Manager in one file:** `tools\Build-SetupAll.ps1 -VpnManagerSource <VPN Manager folder>` builds `Setup-All.cmd`. Double-click it on a Windows computer: it installs or updates both (PRTG Manager in `C:\PrtgManager`, VPN Manager in `C:\VpnManager`; older installations are updated in place), creates the shortcuts, starts both with Windows and tests both dashboards. Options: `-SkipPrtgManager`, `-SkipVpnManager`, `-PrtgManagerPath`, `-VpnManagerPath`, `-NoAutostart` (the old names such as `-PrtgMoverPath` still work).
+**PRTG Manager and VPN Manager in one file:** download the ready-made **`Setup-All.cmd`** from the latest [release](https://github.com/Digitalvps-Ir/prtg-mover/releases/latest) of this repository (the same file is attached to the releases of [vpn-watch](https://github.com/Digitalvps-Ir/vpn-watch/releases/latest)), or build it yourself with `tools\Build-SetupAll.ps1 -VpnManagerSource <VPN Manager folder>`. Run it as administrator on a Windows computer on a Windows computer: it installs or updates both (PRTG Manager in `C:\PrtgManager`, VPN Manager in `C:\VpnManager`; older installations are updated in place), creates the shortcuts, starts both with Windows and tests both dashboards. Options: `-SkipPrtgManager`, `-SkipVpnManager`, `-PrtgManagerPath`, `-VpnManagerPath`, `-NoAutostart` (the old names such as `-PrtgMoverPath` still work).
 
 ## Quick start: migrate a PRTG server
 
@@ -224,7 +224,7 @@ Part packages contain `devices.xml`, `notifications.xml`, `triggers.xml` (a `<pr
 
 ## Coming from PRTG Mover
 
-- The installer and `Setup-All.cmd` update an installation in `C:\PrtgMover` in place; servers, credentials and backups stay. Shortcuts and the start-with-Windows task are renamed to **PRTG Manager**; `Start-PrtgMover.ps1`, `Start-PrtgMover.cmd`, `Open-PrtgMover.ps1`, `tools\Enable-PrtgMoverRemoting.ps1` and `cli\Invoke-PrtgMover.ps1` remain as small forwarders so older shortcuts and tasks keep working.
+- The installer and `Setup-All.cmd` update an installation in `C:\PrtgMover` in place; servers, credentials and backups stay. Shortcuts and the start-with-Windows task are renamed to **PRTG Manager**, and the files of the earlier name (`Start-PrtgMover.ps1`, `Open-PrtgMover.ps1`, ...) are removed from the installation (2.1.1 and later ship no forwarders any more).
 - Packages of PRTG Mover (format 1) are listed as *Full* and restore as before. Their VPN part is ignored here — import the package in **VPN Manager**. VPN-only packages (`VPN_*.zip`) are not listed in PRTG Manager any more.
 - Kept as technical identifiers: the work folder on the servers `C:\PrtgMover` (rollback copies live there), the VSS link prefix `PrtgMoverVss_`, environment variables `PRTGMOVER_*`, the GitHub repository name `prtg-mover`.
 
