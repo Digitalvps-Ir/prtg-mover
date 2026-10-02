@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.2 — 2026-10-02
+
+### Fixed
+- **Setup-All left an old dashboard running after an update.** When exactly one dashboard of the installation was running, Windows PowerShell 5.1 returned it as a single `CimInstance`, and that has no `.Count`. So the VPN Manager step never stopped it. The old VPN Watch backend (started as SYSTEM by its old boot task) kept serving port 8770 with the new web files. The new *VPN Manager Dashboard* task did not start, because the port was taken. Found while installing on Prtg-New. Both lookups are wrapped in `@()` now, and a test runs the lookup against one real process.
+
+
 ## 2.0.1 — 2026-10-02
 
 ### Fixed
