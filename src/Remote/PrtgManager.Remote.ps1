@@ -2512,6 +2512,7 @@ function Invoke-PmRemoteRestore {
         try {
             Write-PmProgress 15 'PRTG: checking installation'
             $prtg = Get-PmPrtgInfo
+            $wasInstalled = [bool]$prtg.Installed   # PRTG already on this server: nothing is installed, its own data folder is used
             $cloneDir = Join-Path $stage 'prtg\programfull'
             if (-not $prtg.Installed -and -not $InstallerPath -and $manifest.prtg.programCloned -and (Test-Path -LiteralPath $cloneDir)) {
                 # ---- clone install: same program files + same Windows services as the source
@@ -2584,13 +2585,24 @@ function Invoke-PmRemoteRestore {
             Stop-PmPrtgServices
             Write-PmLog 'Target PRTG services stopped.' 'OK'
 
-            # Data path: keep the source path when the drive exists here, otherwise use the target default.
-            $srcData = [string]$manifest.prtg.dataPath
-            $dataPath = $prtg.DataPath
-            if ($srcData) {
-                $qual = Split-Path $srcData -Qualifier -ErrorAction SilentlyContinue
-                if ($qual -and (Test-Path "$qual\")) { $dataPath = $srcData }
+            # Data path. PRTG was already installed here: its own data folder takes the restored data, so the
+            # current folder is set aside and the rollback can put it back (a different path from the source
+            # would leave the target's data where it is and make the rollback impossible).
+            # A new installation keeps the source path when that drive exists here, otherwise the default.
+            $srcDataPath = ([string]$manifest.prtg.dataPath).TrimEnd('\')
+            $dataPath = ([string]$prtg.DataPath).TrimEnd('\')
+            if ($wasInstalled) {
+                Write-PmLog "PRTG $($prtg.Version) is already installed here - nothing is installed; the restored data goes into its data folder $dataPath (the current one is kept for the rollback)." 'OK'
+                if ($srcDataPath -and $srcDataPath -ine $dataPath) { Write-PmLog "The source kept its data in $srcDataPath - here PRTG keeps using $dataPath." 'INFO' }
+            } elseif ($srcDataPath) {
+                $qual = Split-Path $srcDataPath -Qualifier -ErrorAction SilentlyContinue
+                if ($qual -and (Test-Path "$qual\")) { $dataPath = $srcDataPath }
                 else { Write-PmLog "Drive $qual does not exist on target - using $dataPath instead." 'WARN' }
+            }
+            if (-not $dataPath) {
+                # the registry of this PRTG names no data folder: PRTG's default
+                $dataPath = Join-Path $env:ProgramData 'Paessler\PRTG Network Monitor'
+                Write-PmLog "PRTG names no data folder in the registry here - using the default $dataPath." 'WARN'
             }
 
             Write-PmProgress 35 'PRTG: backing up current target state'
@@ -2611,15 +2623,15 @@ function Invoke-PmRemoteRestore {
             if ($old -and (Test-Path -LiteralPath $old)) { $undo = @{ DataPath = $dataPath; Old = $old; Reg = $regBackup; Ports = @($prtg.ListenPorts) } }
 
             Write-PmProgress 45 'PRTG: restoring data folder'
-            $srcData = Join-Path $stage 'prtg\data'
-            if ($MoveFromStage -and -not (Test-Path -LiteralPath $dataPath) -and ((Split-Path $srcData -Qualifier) -eq (Split-Path $dataPath -Qualifier))) {
+            $stageData = Join-Path $stage 'prtg\data'
+            if ($MoveFromStage -and -not (Test-Path -LiteralPath $dataPath) -and ((Split-Path $stageData -Qualifier) -eq (Split-Path $dataPath -Qualifier))) {
                 # Same volume: move instead of copy - no second copy of the data on the target disk.
                 New-Item -ItemType Directory -Force -Path (Split-Path $dataPath -Parent) | Out-Null
-                Move-Item -LiteralPath $srcData -Destination $dataPath
+                Move-Item -LiteralPath $stageData -Destination $dataPath
                 $code = 0
                 Write-PmLog 'Data folder moved into place (no extra disk space used).' 'OK'
             } else {
-                $code = Invoke-PmRobocopy -Source $srcData -Destination $dataPath -Mirror
+                $code = Invoke-PmRobocopy -Source $stageData -Destination $dataPath -Mirror
             }
             if (-not (Test-PmRobocopyOk $code)) { throw "robocopy restore of data failed ($code)" }
             if ($manifest.prtg.configSha256) {
@@ -2640,7 +2652,8 @@ function Invoke-PmRemoteRestore {
                     if ((Invoke-PmReg -Verb import -File $file) -eq 0) { Write-PmLog "Registry imported: $rf" 'OK' } else { Write-PmLog "reg import failed: $rf" 'WARN' }
                 }
             }
-            if ($dataPath -ne $srcData) {
+            # the imported registry names the SOURCE's data folder: point it to the one used here
+            if ($dataPath -ine $srcDataPath) {
                 foreach ($core in 'HKLM:\SOFTWARE\WOW6432Node\Paessler\PRTG Network Monitor\Server\Core', 'HKLM:\SOFTWARE\Paessler\PRTG Network Monitor\Server\Core') {
                     if (Test-Path $core) { Set-ItemProperty -Path $core -Name 'Datapath' -Value ($dataPath + '\') }
                 }

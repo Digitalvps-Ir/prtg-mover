@@ -1,6 +1,20 @@
 # Changelog
 
-## 2.0.0 â€” 2026-09-30
+## 2.0.1 — 2026-10-02
+
+### Fixed
+Full restore to a server where PRTG is **already installed** (nothing is installed, the data is replaced, the old data folder is kept for the rollback):
+- When the source's data path also existed on the target (for example `D:\PRTG Data` on both), the restore wrote there instead of into the data folder the installed PRTG uses. The target's own data folder was not set aside, so the rollback had nothing to put back and two data folders were left. On an installed target the restore now always uses the data folder of the installed PRTG and logs the source path when it differs.
+- The `Datapath` registry value was rewritten on every restore, because it was compared with the staging folder instead of the source data path. It is now only changed when the data path really differs.
+- A target with PRTG installed but no `Datapath` value in the registry got no data folder. It now falls back to `%ProgramData%\Paessler\PRTG Network Monitor` with a warning.
+- The preview's disk check did not match the target's own check. It now blocks below the package size + 2 GB and warns below twice the package size + 1 GB (the space a zip transfer needs). The preview also says that the installed PRTG program is kept and which data folder gets the restored data.
+- Eight broken characters (dashes and ellipses saved in the wrong encoding) in this changelog.
+
+### Added
+- End-to-end tests for a restore into an installed PRTG: the data goes into the installed data folder, the previous folder is kept as `.pre-restore-<time>`, nothing is installed, and an unhealthy PRTG after the restore gets its previous data back.
+
+
+## 2.0.0 — 2026-09-30
 
 PRTG Mover is now **PRTG Manager**. Windows VPN connections and routes moved to **VPN Manager** (the former VPN Watch).
 
@@ -18,8 +32,8 @@ PRTG Mover is now **PRTG Manager**. Windows VPN connections and routes moved to 
 - **Command line**: `-Scope Graphs -HistoryDays`, `-Action BackupPart -Part Devices|Notifications|Triggers|License`, `-BackupPassword`.
 
 ### Changed
-- Product name, dashboard, shortcuts, task (*PRTG Manager Dashboard*), scripts (`Start-PrtgManager.ps1`, `Open-PrtgManager.ps1`, `src\PrtgManager.psm1`, â€¦) renamed. The old script names remain as forwarders. The installer updates an installation in `C:\PrtgMover` in place and replaces its own old shortcuts and task; new installations go to `C:\PrtgManager`.
-- Package names: `PRTG-FULL_â€¦`, `PRTG-GRAPHS_â€¦`, `PRTG-DEVICES_â€¦`, `PRTG-NOTIFICATIONS_â€¦`, `PRTG-TRIGGERS_â€¦`, `PRTG-LICENSE_â€¦`.
+- Product name, dashboard, shortcuts, task (*PRTG Manager Dashboard*), scripts (`Start-PrtgManager.ps1`, `Open-PrtgManager.ps1`, `src\PrtgManager.psm1`, …) renamed. The old script names remain as forwarders. The installer updates an installation in `C:\PrtgMover` in place and replaces its own old shortcuts and task; new installations go to `C:\PrtgManager`.
+- Package names: `PRTG-FULL_…`, `PRTG-GRAPHS_…`, `PRTG-DEVICES_…`, `PRTG-NOTIFICATIONS_…`, `PRTG-TRIGGERS_…`, `PRTG-LICENSE_…`.
 - **Delete** moves a package to the Recycle Bin instead of deleting it.
 - **Remove license** removes the license (name, key, activation hash, license files) and leaves PRTG's own bookkeeping (install date, paused-sensor counter) alone.
 - A server with the role *Source* is refused as a restore target by the engine too, not only by the dashboard.
