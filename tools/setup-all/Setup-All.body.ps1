@@ -78,7 +78,8 @@ try {
     # ------------------------------------------------------------ PRTG Manager
     if (-not $SkipPrtgManager) {
         Step "PRTG Manager -> $PrtgManagerPath"
-        $run = Get-Dashboard $PrtgManagerPath 'Start-PrtgManager.ps1', 'Start-PrtgMover.ps1'
+        # @(): one running dashboard comes back as a single CimInstance, which has no .Count in Windows PowerShell 5.1
+        $run = @(Get-Dashboard $PrtgManagerPath 'Start-PrtgManager.ps1', 'Start-PrtgMover.ps1')
         foreach ($d in $run) {
             # A dashboard is only stopped when it says itself that no job is running. No answer means: do not touch it.
             $port = if ($d.CommandLine -match '-Port\s+(\d+)') { [int]$Matches[1] } else { 8765 }
@@ -121,7 +122,7 @@ try {
     if (-not $SkipVpnManager) {
         Step "VPN Manager -> $VpnManagerPath"
         $src = "$tmp\files\VpnManager"
-        $run = Get-Dashboard $VpnManagerPath 'Start-VpnManager.ps1', 'Start-VpnWatch.ps1'
+        $run = @(Get-Dashboard $VpnManagerPath 'Start-VpnManager.ps1', 'Start-VpnWatch.ps1')
         if ($run.Count) { $run | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep -Seconds 1; Ok 'the running dashboard was stopped for the update' }
         New-Item -ItemType Directory -Force -Path $VpnManagerPath | Out-Null
         foreach ($item in (Get-ChildItem -LiteralPath $src -Force)) {

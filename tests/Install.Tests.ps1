@@ -306,6 +306,22 @@ Describe 'Setup-All never stops a dashboard it cannot ask' {
         $guard.Contains('$d.CommandLine -match') | Should -BeTrue -Because 'the port is taken from the running process'
         $guard | Should -Match 'if \(\$busy\) \{ throw'
     }
+
+    It 'finds and counts ONE running dashboard (a single CimInstance has no .Count in Windows PowerShell 5.1)' -Skip:($env:OS -ne 'Windows_NT') {
+        # Prtg-New 2026-10-02: the old VPN Watch dashboard kept running after the update, because $run.Count was empty
+        $body = [IO.File]::ReadAllText((Join-Path $Root 'tools\setup-all\Setup-All.body.ps1'))
+        ([regex]::Matches($body, '\$run = @\(Get-Dashboard ')).Count | Should -Be 2
+        $fn = $body.Substring($body.IndexOf('function Get-Dashboard')); $fn = $fn.Substring(0, $fn.IndexOf("`n}") + 2)
+        . ([ScriptBlock]::Create($fn))
+        $folder = Join-Path $Work 'dash probe'
+        $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', "Start-Sleep 60 # $folder\Start-VpnWatch.ps1"
+        try {
+            Start-Sleep -Milliseconds 800
+            $run = @(Get-Dashboard $folder 'Start-VpnManager.ps1', 'Start-VpnWatch.ps1')
+            $run.Count | Should -Be 1
+            $run[0].ProcessId | Should -Be $p.Id
+        } finally { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 Describe 'Installer option -Local (PRTG Manager on the PRTG server itself)' -Skip:($env:OS -ne 'Windows_NT') {
