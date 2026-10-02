@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.1.1 — 2026-10-03
+
+### Removed
+- The forwarders of the earlier name: `Start-PrtgMover.ps1`, `Start-PrtgMover.cmd`, `Open-PrtgMover.ps1`, `cli\Invoke-PrtgMover.ps1`, `tools\Enable-PrtgMoverRemoting.ps1`. Every installation, task and shortcut uses the new names since 2.0; an update removes these files from an installed folder too. Old installations are still found and updated in place.
+
+### Added
+- `Setup-All.cmd` (PRTG Manager + VPN Manager in one file) is attached to the GitHub releases of this repository and of vpn-watch; README explains where to get it.
+
 ## 2.1.0 — 2026-10-02
 
 Fixes from a review of PRTG Manager running in local mode on the PRTG servers themselves (as SYSTEM, from the task at system start).

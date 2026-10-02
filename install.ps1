@@ -104,9 +104,7 @@ $ErrorActionPreference = 'Stop'
 $script:RoleGiven = $PSBoundParameters.ContainsKey('Role')
 $script:StepNo = 0
 $ProgramItems = 'agent', 'cli', 'docs', 'src', 'tools', 'web', 'tests', '.github', 'config\servers.example.json',
-    'Start-PrtgManager.ps1', 'Start-PrtgManager.cmd', 'Open-PrtgManager.ps1', 'install.ps1', 'install.cmd', 'VERSION', 'README.md', 'README.fa.md', 'CHANGELOG.md', 'LICENSE', '.gitignore', '.gitattributes',
-    # the earlier names (PRTG Mover) forward to the new scripts: tasks and shortcuts made by older versions keep working
-    'Start-PrtgMover.ps1', 'Start-PrtgMover.cmd', 'Open-PrtgMover.ps1'
+    'Start-PrtgManager.ps1', 'Start-PrtgManager.cmd', 'Open-PrtgManager.ps1', 'install.ps1', 'install.cmd', 'VERSION', 'README.md', 'README.fa.md', 'CHANGELOG.md', 'LICENSE', '.gitignore', '.gitattributes'
 $RequiredFiles = 'Start-PrtgManager.ps1', 'src\PrtgManager.psm1', 'src\Remote\PrtgManager.Remote.ps1', 'web\index.html', 'web\app.js', 'VERSION'
 $DataFolders = 'config', 'data', 'backups', 'installers'
 $OldLogonTask = 'PRTG Mover Dashboard'
@@ -442,7 +440,7 @@ if ($PSVersionTable.PSVersion -lt [version]'5.1') { throw "Windows PowerShell 5.
 Write-Ok "Windows PowerShell $($PSVersionTable.PSVersion), user $env:USERDOMAIN\$env:USERNAME$(if (Test-IsAdmin) { ' (administrator)' })"
 if (-not $InstallPath) {
     # an installation in C:\PrtgMover (made under the earlier name, or already updated there) is updated where
-    # it is, so its data stays with it; the forwarder Start-PrtgMover.ps1 is part of both
+    # it is, so its data stays with it
     $InstallPath = if (-not (Test-ProgramFolder 'C:\PrtgManager') -and ((Test-OldProgramFolder 'C:\PrtgMover') -or (Test-ProgramFolder 'C:\PrtgMover'))) { 'C:\PrtgMover' } else { 'C:\PrtgManager' }
 }
 $InstallPath = [IO.Path]::GetFullPath($InstallPath).TrimEnd('\')
@@ -507,8 +505,8 @@ try {
     $kept = @()
     if (Test-Path -LiteralPath (Join-Path $InstallPath 'config\servers.json')) { $kept += 'server list' }
     if (Get-ChildItem -LiteralPath (Join-Path $InstallPath 'backups') -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -in '.zip', '.pmenc' }) { $kept += 'backups' }
-    # program files of the earlier name that the new version does not have any more
-    foreach ($gone in 'src\PrtgMover.psm1', 'src\Remote\PrtgMover.Remote.ps1', 'agent\PrtgMover-Agent.ps1', 'cli\Invoke-PrtgMover.ps1', 'tools\Enable-PrtgMoverRemoting.ps1', 'tests\PrtgMover.Tests.ps1') {
+    # program files of the earlier name (and the forwarders of 2.0 - 2.1.0) that the new version does not have any more
+    foreach ($gone in 'Start-PrtgMover.ps1', 'Start-PrtgMover.cmd', 'Open-PrtgMover.ps1', 'src\PrtgMover.psm1', 'src\Remote\PrtgMover.Remote.ps1', 'agent\PrtgMover-Agent.ps1', 'cli\Invoke-PrtgMover.ps1', 'tools\Enable-PrtgMoverRemoting.ps1', 'tests\PrtgMover.Tests.ps1') {
         $g = Join-Path $InstallPath $gone
         if ((Test-Path -LiteralPath $g) -and -not (Test-Path -LiteralPath (Join-Path $from $gone))) { Remove-Item -LiteralPath $g -Force }
     }
