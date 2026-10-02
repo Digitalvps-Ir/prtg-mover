@@ -30,7 +30,7 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 | `\\tsclient\…` does not exist on the server | The Remote Desktop session was not opened with the dashboard's **RDP** button, or drive access was not allowed in the connection dialog. Close the session and open it with the **RDP** button. |
 | `Waiting for the agent…` although the agent runs | The Remote Desktop window was closed. The agent can only reach the manager while the session is connected. Minimizing the window is fine. |
 | `Agent … is not elevated` | Start PowerShell on the server with *Run as administrator* before pasting the agent command. |
-| `The client cannot connect to the destination…` | WinRM isn't enabled on the server, or a firewall blocks it. Run `tools\Enable-PrtgMoverRemoting.ps1 -Https` on the server and check the port from the manager with `Test-NetConnection <ip> -Port 5986`. The firewall rule only accepts the manager's address: when that address has changed, run the script again. |
+| `The client cannot connect to the destination…` | WinRM isn't enabled on the server, or a firewall blocks it. Run `tools\Enable-PrtgManagerRemoting.ps1 -Https` on the server and check the port from the manager with `Test-NetConnection <ip> -Port 5986`. The firewall rule only accepts the manager's address: when that address has changed, run the script again. |
 | `The SSL certificate is expired` right after enabling WinRM | The manager's clock is behind the server's clock, so the new certificate is not valid yet. The tool waits until it is valid (up to 40 minutes). Sync the Windows clock of the manager to end the wait. |
 | `The WinRM client cannot process the request… TrustedHosts` | Plain WinRM (HTTP) to an IP address or to a server outside the domain. Use HTTPS (`-Https`), or on the manager (elevated) run `tools\Setup-Manager.ps1 -TrustedHosts <ip>`. |
 | `Access is denied` | Wrong credential, or a local administrator without `LocalAccountTokenFilterPolicy=1` (the enable script sets it). Use the `HOST\user` format. |
@@ -57,7 +57,11 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 | PRTG does not start after a clone | The target may lack the .NET Framework version of the source (the log shows a warning). Install it and press **Resume**. |
 | Sensors are down on the new server only | Monitored devices may only allow the old server's IP (SNMP, WMI, API). Allow the new address there. |
 | Notifications arrive twice | Both cores are running. Stop the old one when the new one is verified. |
-| VPN appears but won't connect | Saved VPN credentials and certificates can't be migrated (DPAPI). Enter the credentials once on the target; import certificates for IKEv2/SSTP. |
+| Windows VPN connections | Not part of PRTG Manager any more - use VPN Manager (it also imports the VPN part of old PRTG Mover packages). |
+| Restore button stays grey | Press Preview first; a preview with blockers (red lines) or, for a full restore, the missing confirmation keeps it disabled. |
+| The backup password is wrong or the file was changed (HMAC mismatch) | Wrong backup password, or the file was modified or damaged after it was made. Nothing was decrypted or changed. |
+| License: HTTP 403 after activation | Paessler refused the activation: the key is active on another system, blocked or expired. Move the activation in the Paessler shop (Activation Center) or ask Paessler / your reseller. |
+| Part restore reports ID conflicts | The target PRTG was set up independently and uses these ids for other objects. Use *New ids for conflicts*, or restore into the PRTG the backup came from. |
 
 ## Dashboard
 
@@ -73,10 +77,10 @@ RDP method: if the Remote Desktop session drops while a job runs, the agent keep
 
 | Symptom | Cause / fix |
 |---|---|
-| `Could not download PRTG Mover from GitHub` | The repository is private. Sign in with `git` or `gh auth login`, or download the ZIP in your browser, extract it and run `install.cmd` from that folder. |
+| `Could not download PRTG Manager from GitHub` | The repository is private. Sign in with `git` or `gh auth login`, or download the ZIP in your browser, extract it and run `install.cmd` from that folder. |
 | `The dashboard is running from C:\PrtgMover` | An update can't replace files that are in use. Close the dashboard window and run the installer again. |
 | `Script '…' is damaged` | A file was not copied completely or was changed. Get the files again and run the installer once more. |
-| `The dashboard did not answer within 45 seconds` | Antivirus software may hold back the scripts. Start `Start-PrtgMover.cmd` in the installation folder by hand and read the message in its window. |
+| `The dashboard did not answer within 45 seconds` | Antivirus software may hold back the scripts. Start `Start-PrtgManager.cmd` in the installation folder by hand and read the message in its window. |
 | Port 8765 is used by another program | Install with `-Port <other port>`; the shortcut then uses that port. |
 | Where is my data after `-Uninstall`? | Still in the installation folder: `config\`, `data\`, `backups\`, `installers\`. Delete the folder yourself when you don't need it any more. |
 

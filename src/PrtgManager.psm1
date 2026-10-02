@@ -1,8 +1,8 @@
 <#
-    PrtgMover.psm1 - manager-side module.
+    PrtgManager.psm1 - manager-side module.
 
     Runs on the "manager" machine. Opens PowerShell remoting sessions to source and
-    target servers, ships src\Remote\PrtgMover.Remote.ps1 with every call, moves the
+    target servers, ships src\Remote\PrtgManager.Remote.ps1 with every call, moves the
     backup package through the manager (so the manager always keeps a downloadable
     copy) and tracks everything as jobs that the web dashboard and CLI can follow.
 #>
@@ -13,8 +13,8 @@ $script:PmJobs = [hashtable]::Synchronized(@{})
 $script:PmJobHandles = [hashtable]::Synchronized(@{})
 $script:PmPool = $null
 
-$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeVpn', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram', 'IncludeLogs', 'IncludeAutoBackups'
-$script:PmRestoreKeys = 'RestorePrtg', 'RestoreVpn', 'RestoreRoutes', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'ConnectVpn', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage', 'TargetAddress'
+$script:PmBackupKeys = 'IncludePrtg', 'IncludeHistory', 'IncludeDesktop', 'ExtraPaths', 'SourceAfter', 'NoTouch', 'HealthTimeoutMinutes', 'IncludeProgram', 'IncludeLogs', 'IncludeAutoBackups', 'Scope', 'HistoryDays'
+$script:PmRestoreKeys = 'RestorePrtg', 'RestoreDesktop', 'RestoreExtra', 'InstallerArgs', 'AllowDowngrade', 'StartServices', 'HealthTimeoutMinutes', 'CopyLicense', 'OpenFirewall', 'MoveFromStage', 'CleanupStage', 'TargetAddress', 'GraphMode', 'AutoRollback'
 
 function Get-PmOsCaption {
     <# Windows caption when CIM exists; otherwise the runtime OS description. #>
@@ -79,7 +79,7 @@ function Get-PmPath {
         'Installers'  { Join-Path $script:PmRoot 'installers' }
         'Config'      { Join-Path $script:PmRoot 'config' }
         'Web'         { Join-Path (Split-Path $PSScriptRoot -Parent) 'web' }   # part of the program, not of the data root
-        'Remote'      { Join-Path $PSScriptRoot 'Remote\PrtgMover.Remote.ps1' }   # part of the program, not of the data root
+        'Remote'      { Join-Path $PSScriptRoot 'Remote\PrtgManager.Remote.ps1' }   # part of the program, not of the data root
     }
     if ($Name -notin 'Root', 'Remote', 'Web' -and -not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
     return $p
@@ -171,7 +171,7 @@ function Get-PmCredential {
     try { return Import-Clixml -LiteralPath $f -ErrorAction Stop }
     catch {
         # Windows protects a saved password for the account that saved it (DPAPI).
-        throw "The saved credential of this server cannot be read by $env:USERDOMAIN\$env:USERNAME: it was saved while PRTG Mover ran under another Windows account. Enter user and password again (Servers > Edit). [$($_.Exception.Message)]"
+        throw "The saved credential of this server cannot be read by $env:USERDOMAIN\$env:USERNAME: it was saved while PRTG Manager ran under another Windows account. Enter user and password again (Servers > Edit). [$($_.Exception.Message)]"
     }
 }
 
@@ -288,7 +288,7 @@ function Get-PmTsClientRoot {
     # Tests / special setups: the agent sees the manager folder under another path.
     if ($env:PRTGMOVER_TSCLIENT_ROOT) { return $env:PRTGMOVER_TSCLIENT_ROOT.TrimEnd('\') }
     $root = Get-PmPath Root
-    if ($root -notmatch '^([A-Za-z]):\\?(.*)$') { throw "RDP mode needs PRTG Mover on a local drive (current: $root)." }
+    if ($root -notmatch '^([A-Za-z]):\\?(.*)$') { throw "RDP mode needs PRTG Manager on a local drive (current: $root)." }
     $rest = $Matches[2].TrimEnd('\')
     if ($rest) { return "\\tsclient\$($Matches[1].ToUpper())\$rest" }
     return "\\tsclient\$($Matches[1].ToUpper())"
@@ -296,7 +296,7 @@ function Get-PmTsClientRoot {
 
 function Get-PmAgentCommand {
     param([Parameter(Mandatory)]$Server)
-    $script = Join-Path (Get-PmTsClientRoot) 'agent\PrtgMover-Agent.ps1'
+    $script = Join-Path (Get-PmTsClientRoot) 'agent\PrtgManager-Agent.ps1'
     return "powershell -NoProfile -ExecutionPolicy Bypass -File `"$script`" -ServerId $($Server.id)"
 }
 
@@ -324,7 +324,7 @@ function Get-PmAgentStatus {
 function Start-PmRdp {
     <#
         Opens Remote Desktop to the server from the manager (mstsc). The drive holding
-        PRTG Mover is redirected into the session, so the agent can be started from
+        PRTG Manager is redirected into the session, so the agent can be started from
         \\tsclient\... . The password is never written; Windows asks for it.
     #>
     param([Parameter(Mandatory)]$Server)
@@ -518,7 +518,7 @@ function Invoke-PmAgentCall {
 }
 function Invoke-PmRemote {
     <#
-        Executes one function of PrtgMover.Remote.ps1 on the server (WinRM session or RDP
+        Executes one function of PrtgManager.Remote.ps1 on the server (WinRM session or RDP
         agent), streaming its log / progress records into $Job. Returns the 'result' record.
     #>
     param(
@@ -550,7 +550,7 @@ function Get-PmManagerRelative {
     $root = (Get-PmPath Root).TrimEnd('\').TrimEnd('/').Replace('/', '\')
     $full = [IO.Path]::GetFullPath($LocalPath).TrimEnd('\').TrimEnd('/').Replace('/', '\')
     $inside = $full.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)
-    if (-not $inside) { throw "$LocalPath is outside the PRTG Mover folder." }
+    if (-not $inside) { throw "$LocalPath is outside the PRTG Manager folder." }
     return $full.Substring($root.Length).TrimStart('\')
 }
 
@@ -583,77 +583,578 @@ function Resolve-PmCredential {
 }
 
 # ======================================================================= backups catalogue
+# A package is a zip (or, encrypted with a backup password, a .pmenc file) in backups\ with a sidecar
+# <file>.meta.json: source, sha256 of the file, manifest (readable without the password), created,
+# encrypted, validation. Types: full, graphs, devices, notifications, triggers, license (+ legacy
+# PRTG Mover packages: formatVersion 1, full). VPN-only packages of PRTG Mover belong to VPN Manager
+# and are not listed here.
 
-function Get-PmBackups {
-    $dir = Get-PmPath Backups
-    Get-ChildItem -LiteralPath $dir -Filter '*.zip' -File | Sort-Object LastWriteTime -Descending | ForEach-Object {
-        $meta = $null
-        $side = "$($_.FullName).meta.json"
-        if (Test-Path -LiteralPath $side) { $meta = Get-Content -LiteralPath $side -Raw -Encoding UTF8 | ConvertFrom-Json }
-        $m = if ($meta) { $meta.manifest } else { $null }
-        [pscustomobject]@{
-            name     = $_.Name
-            size     = $_.Length
-            created  = $_.LastWriteTime.ToString('o')
-            source   = if ($meta) { $meta.source } else { $null }
-            sha256   = if ($meta) { $meta.sha256 } else { $null }
-            manifest = $m
-            kind     = Get-PmBackupKind -Manifest $m -Name $_.Name
-        }
-    }
+$script:PmPackageTypes = 'full', 'graphs', 'devices', 'notifications', 'triggers', 'license'
+$script:PmFormatVersion = 2
+
+function Get-PmAppVersion {
+    $f = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
+    if (Test-Path -LiteralPath $f) { return ([IO.File]::ReadAllText($f)).Trim() }
+    return 'dev'
 }
 
-function Get-PmBackupKind {
-    <# 'prtg': a backup with PRTG in it (full backup). 'vpn': VPN connections and routes only. 'files': neither. #>
+function Get-PmBackupType {
+    <# Type of a package from its manifest: full / graphs / devices / notifications / triggers / license / vpn (old VPN-only) / files. #>
     param($Manifest, [string]$Name)
     if ($Manifest) {
-        if ($Manifest.prtg -and $Manifest.prtg.included) { return 'prtg' }
-        if ($Manifest.vpn -and $Manifest.vpn.included) { return 'vpn' }
+        if ($Manifest.PSObject.Properties['type'] -and [string]$Manifest.type -in $script:PmPackageTypes) { return [string]$Manifest.type }
+        if ($Manifest.prtg -and $Manifest.prtg.included) { return 'full' }
+        if ($Manifest.PSObject.Properties['vpn'] -and $Manifest.vpn -and $Manifest.vpn.included) { return 'vpn' }
         return 'files'
     }
     if ($Name -like 'VPN_*') { return 'vpn' }
+    if ($Name -match '^PRTG-([A-Za-z]+)_') { $t = $Matches[1].ToLowerInvariant(); if ($t -in $script:PmPackageTypes) { return $t } }
+    return 'full'
+}
+
+function Get-PmBackupKind {
+    <# Kept for older callers: 'prtg' (anything with PRTG), 'vpn' (old VPN-only packages), 'files'. #>
+    param($Manifest, [string]$Name)
+    $t = Get-PmBackupType -Manifest $Manifest -Name $Name
+    if ($t -eq 'vpn') { return 'vpn' }
+    if ($t -eq 'files') { return 'files' }
     return 'prtg'
+}
+
+function Read-PmBackupMeta {
+    param([Parameter(Mandatory)][string]$Path)
+    $side = "$Path.meta.json"
+    if (-not (Test-Path -LiteralPath $side)) { return $null }
+    try { return (Get-Content -LiteralPath $side -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
+}
+
+function Write-PmBackupMeta {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Meta)
+    ConvertTo-Json -InputObject $Meta -Depth 10 | Set-Content -LiteralPath "$Path.meta.json" -Encoding UTF8
+}
+
+function Get-PmBackups {
+    <# PRTG packages on the manager, newest first, with type, source, version, encryption and the last validation. #>
+    param([switch]$IncludeVpn)
+    $dir = Get-PmPath Backups
+    Get-ChildItem -LiteralPath $dir -File | Where-Object { $_.Extension -in '.zip', '.pmenc' } | Sort-Object LastWriteTime -Descending | ForEach-Object {
+        $meta = Read-PmBackupMeta -Path $_.FullName
+        $m = if ($meta) { $meta.manifest } else { $null }
+        $type = Get-PmBackupType -Manifest $m -Name $_.Name
+        if ($type -eq 'vpn' -and -not $IncludeVpn) { return }
+        $enc = ($_.Extension -eq '.pmenc')
+        $val = if ($meta -and $meta.PSObject.Properties['validation']) { $meta.validation } else { $null }
+        $prtgVer = if ($m -and $m.prtg -and $m.prtg.version) { [string]$m.prtg.version } elseif ($m -and $m.PSObject.Properties['prtgVersion']) { [string]$m.prtgVersion } else { $null }
+        [pscustomobject]@{
+            name = $_.Name; type = $type; size = $_.Length; created = $(if ($m -and $m.createdUtc) { [string]$m.createdUtc } else { $_.LastWriteTime.ToString('o') })
+            source = $(if ($meta) { $meta.source } elseif ($m) { $m.source.computer } else { $null })
+            sha256 = $(if ($meta) { $meta.sha256 } else { $null }); manifest = $m
+            formatVersion = $(if ($m -and $m.formatVersion) { [int]$m.formatVersion } else { $null }); appVersion = $(if ($m -and $m.PSObject.Properties['appVersion']) { [string]$m.appVersion } else { $null })
+            prtgVersion = $prtgVer; encrypted = $enc; secretsEncrypted = [bool]($m -and $m.PSObject.Properties['encryption'] -and $m.encryption -and $m.encryption.secrets)
+            valid = $(if ($val) { [bool]$val.valid } else { $null }); validated = $(if ($val) { [string]$val.checked } else { $null }); validationErrors = $(if ($val) { @($val.errors) } else { @() })
+            kind = Get-PmBackupKind -Manifest $m -Name $_.Name
+        }
+    }
 }
 
 function Get-PmBackupFile {
     <# Resolves a backup name to a full path, refusing anything outside the backups folder. #>
     param([Parameter(Mandatory)][string]$Name)
     $leaf = Split-Path $Name -Leaf
-    if ($leaf -ne $Name -or $leaf -notmatch '\.zip$') { throw "Invalid backup name '$Name'." }
+    if ($leaf -ne $Name -or $leaf -notmatch '\.(zip|pmenc)$') { throw "Invalid backup name '$Name'." }
     $full = Join-Path (Get-PmPath Backups) $leaf
-    if (-not (Test-Path -LiteralPath $full)) { throw "Backup '$Name' not found." }
+    if (-not (Test-Path -LiteralPath $full)) { throw "Backup '$Name' not found in $(Get-PmPath Backups)." }
     return $full
+}
+
+function Read-PmZipText {
+    <# Text of one entry of a zip, or $null. #>
+    param([Parameter(Mandatory)][string]$ZipPath, [Parameter(Mandatory)][string]$Entry)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $e = $zip.Entries | Where-Object { $_.FullName -eq $Entry -or $_.FullName -eq $Entry.Replace('/', '\') -or $_.FullName -eq $Entry.Replace('\', '/') } | Select-Object -First 1
+        if (-not $e) { return $null }
+        $r = New-Object IO.StreamReader($e.Open(), [Text.Encoding]::UTF8)
+        try { return $r.ReadToEnd() } finally { $r.Dispose() }
+    } finally { $zip.Dispose() }
 }
 
 function Read-PmBackupManifest {
     param([Parameter(Mandatory)][string]$ZipPath)
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
-    try {
-        $entry = $zip.Entries | Where-Object { $_.FullName -eq 'manifest.json' } | Select-Object -First 1
-        if (-not $entry) { return $null }
-        $reader = New-Object IO.StreamReader($entry.Open())
-        try { return ($reader.ReadToEnd() | ConvertFrom-Json) } finally { $reader.Dispose() }
-    } finally { $zip.Dispose() }
+    if ($ZipPath -like '*.pmenc') { $meta = Read-PmBackupMeta -Path $ZipPath; if ($meta) { return $meta.manifest }; return $null }
+    $txt = Read-PmZipText -ZipPath $ZipPath -Entry 'manifest.json'
+    if (-not $txt) { return $null }
+    return ($txt | ConvertFrom-Json)
 }
 
 function Register-PmBackup {
     <# Writes the sidecar metadata used by the dashboard (also used for uploaded backups). #>
-    param([Parameter(Mandatory)][string]$ZipPath, [string]$Source)
-    $manifest = Read-PmBackupManifest -ZipPath $ZipPath
-    if (-not $manifest) { throw 'The file is not a PRTG Mover backup (manifest.json missing).' }
-    if (-not $Source) { $Source = $manifest.source.computer }
-    [pscustomobject]@{
-        source   = $Source
-        sha256   = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash
-        manifest = $manifest
-    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$ZipPath.meta.json" -Encoding UTF8
+    param([Parameter(Mandatory)][string]$ZipPath, [string]$Source, $Manifest)
+    if ($ZipPath -like '*.pmenc') {
+        if (-not $Manifest) {
+            $old = Read-PmBackupMeta -Path $ZipPath
+            if ($old) { $Manifest = $old.manifest }
+        }
+        # an uploaded encrypted package without its sidecar: only the envelope can be checked
+        $fs = [IO.File]::OpenRead($ZipPath); try { $head = New-Object byte[] 43; [void]$fs.Read($head, 0, 43) } finally { $fs.Dispose() }
+        [void](Read-PmEncHeader -Header $head)
+    } elseif (-not $Manifest) {
+        $Manifest = Read-PmBackupManifest -ZipPath $ZipPath
+        if (-not $Manifest) { throw 'The file is not a PRTG Manager backup (manifest.json missing).' }
+        if ($Manifest.tool -notin 'prtg-mover', 'prtg-manager') { throw "The file is not a PRTG Manager backup (tool '$($Manifest.tool)')." }
+    }
+    if (-not $Source -and $Manifest) { $Source = $Manifest.source.computer }
+    Write-PmBackupMeta -Path $ZipPath -Meta ([pscustomobject]@{ source = $Source; sha256 = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash; manifest = $Manifest; encrypted = ($ZipPath -like '*.pmenc'); registered = (Get-Date).ToString('o') })
 }
 
 function Remove-PmBackup {
+    <# Moves a package (and its sidecar) to the Recycle Bin - never deleted for good by PRTG Manager. #>
     param([Parameter(Mandatory)][string]$Name)
     $f = Get-PmBackupFile -Name $Name
-    Remove-Item -LiteralPath $f, "$f.meta.json" -Force -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    foreach ($x in @($f, "$f.meta.json")) {
+        if (-not (Test-Path -LiteralPath $x)) { continue }
+        if ($env:PRTGMOVER_TEST -eq '1' -and $env:PRTGMANAGER_RECYCLE) {
+            Move-Item -LiteralPath $x -Destination (Join-Path $env:PRTGMANAGER_RECYCLE (Split-Path $x -Leaf)) -Force
+            continue
+        }
+        try { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($x, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin) }
+        catch { throw "Delete backup '$Name' failed: the file could not be moved to the Recycle Bin ($($_.Exception.Message)). It was left in place." }
+    }
+}
+
+function Get-PmZipEntryHash {
+    param([Parameter(Mandatory)]$Entry)
+    $sha = [Security.Cryptography.SHA256]::Create(); $s = $Entry.Open()
+    try { return (-join ($sha.ComputeHash($s) | ForEach-Object { $_.ToString('X2') })) } finally { $s.Dispose(); $sha.Dispose() }
+}
+
+function Test-PmBackupPackage {
+    <#
+        Validates a package: readable, supported format, manifest, checksums (the file against its sidecar,
+        every listed file against the manifest, PRTG Configuration.dat against the source) and, for an
+        encrypted file, the password (HMAC) when one is given. Stores the result in the sidecar.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; used for the HMAC check only.')]
+    param([Parameter(Mandatory)][string]$Name, [string]$Password, $Job)
+    $f = Get-PmBackupFile -Name $Name
+    $meta = Read-PmBackupMeta -Path $f
+    $checks = New-Object System.Collections.ArrayList; $errors = New-Object System.Collections.ArrayList; $warn = New-Object System.Collections.ArrayList
+    $add = { param([string]$What, [bool]$Ok, [string]$Detail) [void]$checks.Add([pscustomobject]@{ check = $What; ok = $Ok; detail = $Detail }); if (-not $Ok) { [void]$errors.Add("$What - $Detail") }; Add-PmJobLog -Job $Job -Level $(if ($Ok) { 'OK' } else { 'ERROR' }) -Message "$What : $Detail" }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Validating $Name ($([math]::Round((Get-Item -LiteralPath $f).Length / 1MB, 1)) MB)..."
+    if ($meta -and $meta.sha256) {
+        $h = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash
+        & $add 'File checksum (SHA-256)' ($h -eq $meta.sha256) $(if ($h -eq $meta.sha256) { 'identical to the one taken when the package was made' } else { "changed since the package was made (now $($h.Substring(0,16))..., was $($meta.sha256.Substring(0,16))...)" })
+    } else { [void]$warn.Add('No sidecar with the original checksum (uploaded file?) - the file checksum cannot be compared.') }
+    $m = $null
+    if ($f -like '*.pmenc') {
+        try {
+            $fs = [IO.File]::OpenRead($f); try { $head = New-Object byte[] 43; [void]$fs.Read($head, 0, 43) } finally { $fs.Dispose() }
+            $hd = Read-PmEncHeader -Header $head
+            & $add 'Encryption header' $true ("AES-256-CBC + HMAC-SHA256, key from PBKDF2-{0} with {1} rounds" -f $(if ($hd.Kdf -eq 1) { 'SHA256' } else { 'SHA1' }), $hd.Iterations)
+        } catch { & $add 'Encryption header' $false "$($_.Exception.Message)" }
+        if ($Password) {
+            try { [void](Test-PmEncryptedFile -Path $f -Password $Password); & $add 'Password and integrity (HMAC)' $true 'the password is right and the file is unchanged' }
+            catch { & $add 'Password and integrity (HMAC)' $false "$($_.Exception.Message)" }
+        } else { [void]$warn.Add('Encrypted: enter the backup password to check the password and the integrity of the content (HMAC).') }
+        if ($meta) { $m = $meta.manifest }
+    } else {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = $null
+        try { $zip = [IO.Compression.ZipFile]::OpenRead($f); & $add 'Zip archive' $true "$($zip.Entries.Count) entries" }
+        catch { & $add 'Zip archive' $false "cannot be opened: $($_.Exception.Message)" }
+        if ($zip) {
+            try {
+                $me = $zip.Entries | Where-Object { $_.FullName -eq 'manifest.json' } | Select-Object -First 1
+                if (-not $me) { & $add 'Manifest' $false 'manifest.json is missing' }
+                else {
+                    $r = New-Object IO.StreamReader($me.Open()); try { $m = $r.ReadToEnd() | ConvertFrom-Json } finally { $r.Dispose() }
+                    $fv = [int]$m.formatVersion
+                    & $add 'Format' ($m.tool -in 'prtg-mover', 'prtg-manager' -and $fv -ge 1 -and $fv -le $script:PmFormatVersion) ("tool {0}, format version {1}{2}" -f $m.tool, $fv, $(if ($fv -gt $script:PmFormatVersion) { ' - made by a newer PRTG Manager, update this one' } else { '' }))
+                    foreach ($fe in @($m.files)) {
+                        if (-not $fe) { continue }
+                        $e = $zip.Entries | Where-Object { $_.FullName -eq $fe.path -or $_.FullName -eq ([string]$fe.path).Replace('/', '\') } | Select-Object -First 1
+                        if (-not $e) { & $add "File $($fe.path)" $false 'missing in the package'; continue }
+                        $eh = Get-PmZipEntryHash -Entry $e
+                        & $add "File $($fe.path)" ($eh -eq $fe.sha256) $(if ($eh -eq $fe.sha256) { 'checksum OK' } else { 'checksum does not match the manifest' })
+                    }
+                    if ($m.prtg -and $m.prtg.included -and $m.prtg.configSha256) {
+                        $ce = $zip.Entries | Where-Object { $_.FullName -in 'prtg\data\PRTG Configuration.dat', 'prtg/data/PRTG Configuration.dat' } | Select-Object -First 1
+                        if (-not $ce) { & $add 'PRTG Configuration.dat' $false 'missing in the package' }
+                        else { $ch = Get-PmZipEntryHash -Entry $ce; & $add 'PRTG Configuration.dat' ($ch -eq $m.prtg.configSha256) $(if ($ch -eq $m.prtg.configSha256) { 'identical to the configuration read on the source' } else { 'differs from the configuration read on the source' }) }
+                    }
+                    if ([string]$m.type -eq 'graphs') {
+                        $n = @($zip.Entries | Where-Object { $_.FullName -match '^prtg[\\/]graphs[\\/].+\.\w+$' }).Count
+                        & $add 'History files' ($n -eq [int]$m.graphs.files -or -not $m.graphs.files) "$n file(s) in the package, $($m.graphs.files) listed"
+                    }
+                }
+            } finally { $zip.Dispose() }
+        }
+    }
+    $valid = ($errors.Count -eq 0)
+    $res = [pscustomobject]@{ name = $Name; valid = $valid; checked = (Get-Date).ToString('o'); checks = @($checks); errors = @($errors); warnings = @($warn); passwordChecked = [bool]$Password; type = (Get-PmBackupType -Manifest $m -Name $Name) }
+    if ($meta) { $meta | Add-Member -NotePropertyName validation -NotePropertyValue ([pscustomobject]@{ valid = $valid; checked = $res.checked; errors = @($errors) }) -Force; Write-PmBackupMeta -Path $f -Meta $meta }
+    elseif ($m) { Write-PmBackupMeta -Path $f -Meta ([pscustomobject]@{ source = $m.source.computer; sha256 = (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash; manifest = $m; encrypted = ($f -like '*.pmenc'); validation = [pscustomobject]@{ valid = $valid; checked = $res.checked; errors = @($errors) } }) }
+    Write-PmAudit -Action 'backup.validated' -Data @{ name = $Name; valid = $valid; errors = $errors.Count; passwordChecked = [bool]$Password }
+    foreach ($w in $warn) { Add-PmJobLog -Job $Job -Level WARN -Message $w }
+    Add-PmJobLog -Job $Job -Level $(if ($valid) { 'OK' } else { 'ERROR' }) -Message "Validation of ${Name}: $(if ($valid) { 'VALID' } else { "INVALID ($($errors.Count) problem(s))" })"
+    return $res
+}
+
+function Get-PmBackupDetails {
+    <# Inspect: metadata, manifest, sections, counts, file list (first 300) - no secret values. #>
+    param([Parameter(Mandatory)][string]$Name)
+    $f = Get-PmBackupFile -Name $Name
+    $meta = Read-PmBackupMeta -Path $f
+    $m = if ($meta) { $meta.manifest } else { Read-PmBackupManifest -ZipPath $f }
+    $files = @(); $count = $null; $bytes = $null
+    if ($f -like '*.zip') {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [IO.Compression.ZipFile]::OpenRead($f)
+        try {
+            $count = $zip.Entries.Count; $bytes = [int64](($zip.Entries | Measure-Object Length -Sum).Sum)
+            $files = @($zip.Entries | Select-Object -First 300 | ForEach-Object { [pscustomobject]@{ path = $_.FullName; size = $_.Length } })
+        } finally { $zip.Dispose() }
+    }
+    [pscustomobject]@{
+        name = $Name; type = (Get-PmBackupType -Manifest $m -Name $Name); size = (Get-Item -LiteralPath $f).Length; encrypted = ($f -like '*.pmenc')
+        sha256 = $(if ($meta) { $meta.sha256 }); source = $(if ($meta) { $meta.source }); manifest = $m; validation = $(if ($meta -and $meta.PSObject.Properties['validation']) { $meta.validation })
+        entries = $count; unpackedBytes = $bytes; files = $files
+    }
+}
+
+function New-PmManifestV2 {
+    <# Common metadata of a PRTG Manager package (format version 2). #>
+    param([Parameter(Mandatory)][string]$Type, [Parameter(Mandatory)][string]$Computer, [string]$Os, [string]$Server, [string]$PrtgVersion, [string]$JobId)
+    return [ordered]@{
+        tool = 'prtg-manager'; format = 'prtg-manager-backup'; formatVersion = $script:PmFormatVersion; type = $Type
+        appVersion = (Get-PmAppVersion); jobId = $JobId; createdUtc = (Get-Date).ToUniversalTime().ToString('o')
+        source = [ordered]@{ computer = $Computer; os = $Os; server = $Server }
+        components = [ordered]@{ prtg = $PrtgVersion; manager = (Get-PmAppVersion); powershell = $PSVersionTable.PSVersion.ToString() }
+        prtg = [ordered]@{ included = $false; version = $PrtgVersion }
+        sections = @(); counts = [ordered]@{}; files = @(); encryption = [ordered]@{ package = $false; secrets = $false }; warnings = @()
+    }
+}
+
+function New-PmZipFromFiles {
+    <# Zip with manifest.json + the given files (path -> bytes); fills manifest.files with size + SHA-256. #>
+    param([Parameter(Mandatory)][string]$ZipPath, [Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)][hashtable]$Files)
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $list = @()
+    foreach ($k in ($Files.Keys | Sort-Object)) {
+        $b = [byte[]]$Files[$k]
+        $sha = [Security.Cryptography.SHA256]::Create(); try { $h = -join ($sha.ComputeHash($b) | ForEach-Object { $_.ToString('X2') }) } finally { $sha.Dispose() }
+        $list += [ordered]@{ path = $k; size = $b.Length; sha256 = $h }
+    }
+    $Manifest.files = @($list)
+    if (Test-Path -LiteralPath $ZipPath) { Remove-Item -LiteralPath $ZipPath -Force }
+    $zip = [IO.Compression.ZipFile]::Open($ZipPath, [IO.Compression.ZipArchiveMode]::Create)
+    try {
+        $write = { param([string]$Name, [byte[]]$Bytes) $e = $zip.CreateEntry($Name, [IO.Compression.CompressionLevel]::Optimal); $s = $e.Open(); try { $s.Write($Bytes, 0, $Bytes.Length) } finally { $s.Dispose() } }
+        & $write 'manifest.json' ([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Manifest -Depth 10)))
+        foreach ($k in ($Files.Keys | Sort-Object)) { & $write $k ([byte[]]$Files[$k]) }
+    } finally { $zip.Dispose() }
+}
+
+function Complete-PmPackage {
+    <# Registers a finished zip; with a password it is encrypted into .pmenc (the plain zip is replaced). Returns the final path. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param([Parameter(Mandatory)][string]$ZipPath, [Parameter(Mandatory)]$Manifest, [string]$Source, [string]$Password, $Job)
+    $final = $ZipPath
+    if ($Password) {
+        Add-PmJobLog -Job $Job -Level STEP -Message 'Encrypting the package with the backup password (AES-256 + HMAC-SHA256)...'
+        $enc = [IO.Path]::ChangeExtension($ZipPath, '.pmenc')
+        Protect-PmFile -Source $ZipPath -Destination $enc -Password $Password
+        $Manifest.encryption = [ordered]@{ package = $true; secrets = [bool]$Manifest.encryption.secrets; algorithm = 'AES-256-CBC + HMAC-SHA256'; kdf = $(if ((Get-PmDefaultKdf).Kdf -eq 1) { 'PBKDF2-SHA256' } else { 'PBKDF2-SHA1' }) }
+        Remove-Item -LiteralPath $ZipPath, "$ZipPath.meta.json" -Force -ErrorAction SilentlyContinue
+        $final = $enc
+    }
+    $hash = (Get-FileHash -LiteralPath $final -Algorithm SHA256).Hash
+    Write-PmBackupMeta -Path $final -Meta ([pscustomobject]@{ source = $Source; sha256 = $hash; manifest = $Manifest; encrypted = [bool]$Password; created = (Get-Date).ToString('o') })
+    Add-PmJobLog -Job $Job -Level OK -Message ("Package ready: {0} ({1:N2} MB, SHA-256 {2}{3})" -f (Split-Path $final -Leaf), ((Get-Item -LiteralPath $final).Length / 1MB), $hash, $(if ($Password) { ', encrypted' } else { '' }))
+    Write-PmAudit -Action 'backup.created' -Data @{ job = $(if ($Job) { $Job.id }); package = (Split-Path $final -Leaf); type = [string]$Manifest.type; sha256 = $hash; encrypted = [bool]$Password }
+    return $final
+}
+
+function Get-PmPlainPackage {
+    <# The zip of a package: the file itself, or for .pmenc a decrypted temp copy (Temp = $true, delete it after use). #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param([Parameter(Mandatory)][string]$Path, [string]$Password, $Job)
+    if ($Path -notlike '*.pmenc') { return [pscustomobject]@{ Path = $Path; Temp = $false } }
+    if (-not $Password) { throw "The package $(Split-Path $Path -Leaf) is encrypted - enter its backup password." }
+    $dir = Join-Path (Get-PmPath Data) 'staging'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $tmp = Join-Path $dir ('decrypted-{0}.zip' -f [IO.Path]::GetFileNameWithoutExtension($Path))
+    Add-PmJobLog -Job $Job -Level STEP -Message "Checking the password and decrypting $(Split-Path $Path -Leaf) on the manager..."
+    Unprotect-PmFile -Source $Path -Destination $tmp -Password $Password
+    Add-PmJobLog -Job $Job -Level OK -Message 'Password OK, package decrypted (the temporary copy is removed after the job).'
+    return [pscustomobject]@{ Path = $tmp; Temp = $true }
+}
+
+function Remove-PmPlainPackage {
+    <#
+        Removes what a decrypted package left on the manager: the temporary zip and the folder a restore
+        extracted it into (data\staging\restore-<name>). Nothing is removed for a package that was not
+        encrypted - its zip is the backup itself.
+    #>
+    param($Plain)
+    if (-not $Plain -or -not $Plain.Temp) { return }
+    Remove-Item -LiteralPath $Plain.Path -Force -ErrorAction SilentlyContinue
+    $extract = Join-Path (Get-PmPath Data) ('staging\restore-' + [IO.Path]::GetFileNameWithoutExtension($Plain.Path))
+    if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+function Clear-PmStaleDecrypted {
+    <#
+        Called when the dashboard starts: a restore of an encrypted package that was cut off (process
+        killed, computer restarted) never reached its cleanup, so its decrypted zip and extract stay in
+        data\staging. They are removed - unless a command-line restore (cli\Invoke-PrtgManager.ps1) is
+        running right now and may still use them. Returns the removed paths.
+    #>
+    $dir = Join-Path (Get-PmPath Data) 'staging'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $cli = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '(?i)Invoke-Prtg(Manager|Mover)\.ps1' })
+    if ($cli.Count) { Write-PmManagerLog -Level INFO -Message 'Decrypted restore copies are kept: a command-line restore is running.' -Source 'dashboard'; return @() }
+    $gone = New-Object System.Collections.ArrayList
+    foreach ($i in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'decrypted-*.zip' -or ($_.PSIsContainer -and $_.Name -like 'restore-decrypted-*') })) {
+        try { Remove-Item -LiteralPath $i.FullName -Recurse -Force -ErrorAction Stop; [void]$gone.Add($i.FullName) }
+        catch { Write-PmManagerLog -Level WARN -Message "Could not remove the decrypted copy $($i.FullName): $($_.Exception.Message)" -Source 'dashboard' }
+    }
+    if ($gone.Count) { Write-PmManagerLog -Level WARN -Message "Removed $($gone.Count) decrypted package copy/copies left by an interrupted restore: $($gone -join ', ')" -Source 'dashboard' }
+    return @($gone)
+}
+
+function Get-PmPackageUser {
+    <# The id of a running / queued job that restores or previews this package, or '' - two at once would share its decrypted copy. #>
+    param([Parameter(Mandatory)][string]$Name)
+    foreach ($j in @($script:PmJobs.Values)) {
+        if ($j.status -in 'queued', 'running' -and $j.type -in 'restore', 'restore-preview' -and $j.params -and [string]$j.params.BackupName -eq $Name) { return [string]$j.id }
+    }
+    return ''
+}
+
+# ======================================================================= PRTG parts, license, previews (flows)
+
+function Assert-PmNotSource {
+    <# PRTG Manager never changes a server that is marked as source. #>
+    param([Parameter(Mandatory)]$Server, [string]$What = 'change')
+    if ($Server.PSObject.Properties['role'] -and $Server.role -eq 'source') { throw "$($Server.name) is marked as a source server - PRTG Manager does not $What it. Set its role to 'Target' or 'Source & target' first if you really want this." }
+}
+
+function Invoke-PmSectionBackupFlow {
+    <# Backup of one part (devices / notifications / triggers / license). Nothing is written on the server. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, [Parameter(Mandatory)][ValidateSet('devices', 'notifications', 'triggers', 'license')][string]$Type, [string]$Password, $Job)
+    if ($Type -eq 'license' -and -not $Password) { throw 'A license backup contains the license key: enter a backup password (at least 8 characters) to encrypt it.' }
+    if ($Password) { Assert-PmBackupPassword $Password }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $files = @{}
+        if ($Type -eq 'license') {
+            $r = Invoke-PmRemote -Session $s -Function 'Backup-PmPrtgLicense' -Parameters @{ Password = $Password } -Job $Job -ProgressBase 10 -ProgressSpan 60
+            if (-not $r) { throw 'The server returned no result.' }
+            $m = New-PmManifestV2 -Type 'license' -Computer $r.Computer -Server $Server.name -PrtgVersion $r.PrtgVersion -JobId $Job.id
+            $m.sections = @('license'); $m.counts = [ordered]@{ values = @($r.ValueNames).Count; files = @($r.FileNames).Count }
+            $m.license = [ordered]@{ valueNames = @($r.ValueNames); fileNames = @($r.FileNames); edition = $r.State.Edition; name = $r.State.Name; maxSensors = $r.State.MaxSensors; activated = [bool]($r.State.Known -and -not $r.State.NeedsActivation) }
+            $m.encryption = [ordered]@{ package = $false; secrets = $true; algorithm = 'AES-256-CBC + HMAC-SHA256'; encryptedOn = $r.Computer }
+            $files['license.enc'] = [Convert]::FromBase64String([string]$r.Envelope)
+            $Password = $null   # the key is already encrypted on the server; the package itself stays readable
+        } else {
+            $r = Invoke-PmRemote -Session $s -Function 'Get-PmPrtgSection' -Parameters @{ Type = $Type } -Job $Job -ProgressBase 10 -ProgressSpan 60
+            if (-not $r) { throw 'The server returned no result.' }
+            $m = New-PmManifestV2 -Type $Type -Computer $r.Computer -Os $r.Os -Server $Server.name -PrtgVersion $r.PrtgVersion -JobId $Job.id
+            $m.sections = @($Type); $m.prtg.configVersion = $r.Header.ConfigVersion; $m.prtg.maxId = $r.Header.Max
+            $sum = [ordered]@{}; foreach ($p in $r.Summary.PSObject.Properties) { if ($p.Name -notin 'type', 'prtgVersion', 'configVersion') { $sum[$p.Name] = $p.Value } }
+            $m.counts = $sum
+            $files["$Type.xml"] = [Text.Encoding]::UTF8.GetBytes((ConvertFrom-PmPackedText ([string]$r.Packed)))
+        }
+        $zipName = 'PRTG-{0}_{1}_{2}.zip' -f $Type.ToUpperInvariant(), $m.source.computer, (Get-Date -Format 'yyyyMMdd-HHmmss')
+        $zip = Join-Path (Get-PmPath Backups) $zipName
+        New-PmZipFromFiles -ZipPath $zip -Manifest $m -Files $files
+        $final = Complete-PmPackage -ZipPath $zip -Manifest $m -Source $Server.name -Password $Password -Job $Job
+        return [pscustomobject]@{ backup = (Split-Path $final -Leaf); type = $Type; counts = $m.counts }
+    } finally { Close-PmSession $s }
+}
+
+function Read-PmSectionPackage {
+    <# Type + packed XML (or the license envelope) of a part package. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param([Parameter(Mandatory)][string]$Path, [string]$Password, $Job)
+    $plain = Get-PmPlainPackage -Path $Path -Password $Password -Job $Job
+    try {
+        $m = Read-PmBackupManifest -ZipPath $plain.Path
+        $type = Get-PmBackupType -Manifest $m -Name (Split-Path $Path -Leaf)
+        if ($type -eq 'license') {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [IO.Compression.ZipFile]::OpenRead($plain.Path)
+            try { $e = $zip.Entries | Where-Object { $_.FullName -eq 'license.enc' } | Select-Object -First 1; if (-not $e) { throw 'license.enc is missing in the package.' }; $ms = New-Object IO.MemoryStream; $st = $e.Open(); try { $st.CopyTo($ms) } finally { $st.Dispose() }; $env64 = [Convert]::ToBase64String($ms.ToArray()) } finally { $zip.Dispose() }
+            return [pscustomobject]@{ Type = $type; Manifest = $m; Envelope = $env64; Packed = $null }
+        }
+        if ($type -notin 'devices', 'notifications', 'triggers') { throw "This is a '$type' package - use the restore of full / history packages for it." }
+        $xml = Read-PmZipText -ZipPath $plain.Path -Entry "$type.xml"
+        if (-not $xml) { throw "$type.xml is missing in the package." }
+        return [pscustomobject]@{ Type = $type; Manifest = $m; Envelope = $null; Packed = (ConvertTo-PmPackedText $xml) }
+    } finally { if ($plain.Temp) { Remove-Item -LiteralPath $plain.Path -Force -ErrorAction SilentlyContinue } }
+}
+
+function Invoke-PmSectionRestoreFlow {
+    <# Restores a part package (devices / notifications / triggers / license) into one server. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, [Parameter(Mandatory)][string]$Path, [hashtable]$Options = @{}, [string]$Password, $Job)
+    Assert-PmNotSource -Server $Server -What 'restore into'
+    if ((Get-PmTransport $Server) -eq 'rdp') { throw "$($Server.name): restoring a part needs the WinRM or Local connection method." }
+    $pkg = Read-PmSectionPackage -Path $Path -Password $Password -Job $Job
+    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $hm = if ([int]$Options.HealthTimeoutMinutes -gt 0) { [int]$Options.HealthTimeoutMinutes } else { 15 }
+        if ($pkg.Type -eq 'license') {
+            if (-not $Password) { throw 'The license in this package is encrypted - enter the backup password.' }
+            $r = Invoke-PmRemote -Session $s -Function 'Install-PmPrtgLicense' -Parameters @{ Envelope = $pkg.Envelope; Password = $Password; HealthTimeoutMinutes = $hm; Force = $true } -Job $Job -ProgressBase 5 -ProgressSpan 90
+            Write-PmAudit -Action 'prtg.license.restored' -Data @{ server = $Server.name; package = (Split-Path $Path -Leaf); activated = [bool]$r.Activated; rollback = $r.Rollback }
+            return [pscustomobject]@{ target = $Server.name; ok = [bool]$r.Healthy; type = 'license'; activated = [bool]$r.Activated; hint = $r.Hint; after = $r.After; rollback = $r.Rollback }
+        }
+        $mode = if ([string]$Options.Mode -eq 'overwrite') { 'overwrite' } else { 'merge' }
+        $p = @{ Packed = $pkg.Packed; Mode = $mode; ReIdConflicts = [bool]$Options.ReIdConflicts; StartServices = $(if ($null -ne $Options.StartServices) { [bool]$Options.StartServices } else { $true }); HealthTimeoutMinutes = $hm }
+        $r = Invoke-PmRemote -Session $s -Function 'Invoke-PmSectionRestore' -Parameters $p -Job $Job -ProgressBase 5 -ProgressSpan 90
+        if (-not $r) { throw 'The server returned no result.' }
+        Write-PmAudit -Action 'prtg.section.restored' -Data @{ server = $Server.name; package = (Split-Path $Path -Leaf); type = $pkg.Type; mode = $mode; changed = [bool]$r.Changed; rolledBack = [bool]$r.RolledBack; created = $(if ($r.Applied) { $r.Applied.created }); updated = $(if ($r.Applied) { $r.Applied.updated }) }
+        if ($r.RolledBack) { throw "Restore of $($pkg.Type) on $($Server.name) failed and was rolled back: $($r.Error)" }
+        if ($r.Error) { throw "Restore of $($pkg.Type) on $($Server.name) failed: $($r.Error)" }
+        return [pscustomobject]@{ target = $Server.name; ok = $true; type = $pkg.Type; changed = [bool]$r.Changed; applied = $r.Applied; plan = $r.Plan.Counts; rollback = $r.Rollback; web = $r.WebUrl }
+    } finally { Close-PmSession $s }
+}
+
+function Get-PmFullRestorePreview {
+    <# PURE. Preview of a full restore from the package manifest and the facts of the target. #>
+    param([Parameter(Mandatory)]$Manifest, [Parameter(Mandatory)]$Facts, [hashtable]$Options = @{}, [int64]$PackageBytes = 0)
+    $items = New-Object System.Collections.ArrayList; $blockers = @(); $warn = @(); $deps = @()
+    $p = $Manifest.prtg
+    $tp = $Facts.Prtg
+    if ($tp.Installed) {
+        [void]$items.Add([pscustomobject]@{ Action = 'update'; Item = 'PRTG configuration'; Detail = "replaced: target has $($Facts.ConfigStats); backup has $($p.configStats)" })
+        [void]$items.Add([pscustomobject]@{ Action = 'update'; Item = 'PRTG data folder'; Detail = ("the current one ({0:N2} GB) is kept as <data>.pre-restore-<time> for the rollback" -f ($Facts.DataBytes / 1GB)) })
+    } else {
+        [void]$items.Add([pscustomobject]@{ Action = 'create'; Item = 'PRTG'; Detail = $(if ($p.programCloned) { 'installed from the program clone in the package (no installer)' } elseif ($Options.InstallerFile) { "installed with $($Options.InstallerFile)" } else { 'NOT installed here and the package has no program clone' }) })
+        if (-not $p.programCloned -and -not $Options.InstallerFile) { $blockers += 'PRTG is not installed on the target, the package has no program clone and no installer was chosen.' }
+    }
+    [void]$items.Add([pscustomobject]@{ Action = $(if ($p.includeHistory) { 'create' } else { 'skip' }); Item = 'History (graphs)'; Detail = $(if ($p.includeHistory) { 'included' } else { 'not in this package' }) })
+    [void]$items.Add([pscustomobject]@{ Action = $(if ($Options.CopyLicense -ne $false) { 'update' } else { 'skip' }); Item = 'License'; Detail = $(if ($Options.CopyLicense -ne $false) { 'the source license is copied - PRTG asks Paessler for a new activation on this server' } else { "the target keeps its own license$(if ($Facts.License -and $Facts.License.Known) { " ($($Facts.License.Edition))" })" }) })
+    [void]$items.Add([pscustomobject]@{ Action = 'update'; Item = 'Registry, customisations'; Detail = "registry of PRTG, $(@($p.programFolders).Count) customisation folder(s)" })
+    if ($p.version -and $tp.Version) {
+        $sv = [version]($p.version -replace '[^\d\.]', ''); $tv = [version]($tp.Version -replace '[^\d\.]', '')
+        if ($tv -lt $sv) { if ($Options.AllowDowngrade) { $warn += "Target PRTG $tv is older than the backup ($sv) - allowed by 'Allow downgrade', PRTG may not start." } else { $blockers += "Target PRTG $tv is older than the backup ($sv). Update PRTG on the target first." } }
+        elseif ($tv -gt $sv) { $warn += "Target PRTG $tv is newer than the backup ($sv) - PRTG converts the configuration when it starts." }
+    }
+    $need = [int64]$Manifest.stagingBytes; if (-not $need) { $need = $PackageBytes }
+    if ($Facts.FreeBytes -and $Facts.FreeBytes -lt ($need + 2GB)) { $blockers += ("Not enough free space on the target: {0:N1} GB free, about {1:N1} GB needed." -f ($Facts.FreeBytes / 1GB), (($need + 2GB) / 1GB)) }
+    if ([int]$p.netFrameworkRelease -and [int]$Facts.NetRelease -and [int]$Facts.NetRelease -lt [int]$p.netFrameworkRelease) { $deps += ".NET Framework on the target (release $($Facts.NetRelease)) is older than on the source ($($p.netFrameworkRelease)); install the same version if PRTG does not start." }
+    if (-not $Facts.IsAdmin) { $blockers += 'The connection to the target has no administrator rights.' }
+    return [pscustomobject]@{ Type = 'full'; Items = @($items); Blockers = $blockers; Warnings = $warn; MissingDependencies = $deps; Target = [pscustomobject]@{ Computer = $Facts.Computer; PrtgVersion = $tp.Version; Installed = [bool]$tp.Installed; ConfigStats = $Facts.ConfigStats; FreeBytes = $Facts.FreeBytes }; Rollback = 'automatic: the previous data folder and registry are put back when the restored PRTG does not come up' }
+}
+
+function Get-PmZipGraphFiles {
+    <# History files listed in a package (relative path below prtg\graphs, day, device, size). #>
+    param([Parameter(Mandatory)][string]$ZipPath)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $zip = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($e in $zip.Entries) {
+            if ($e.FullName -notmatch '^prtg[\\/]graphs[\\/](.+)$' -or -not $e.Name) { continue }
+            $rel = $Matches[1].Replace('/', '\')
+            $day = ''; if ($rel -match '^(\d{8})\\') { $day = $Matches[1] }
+            $dev = 0; if ($e.Name -match '^Device (\d+)\.') { $dev = [int]$Matches[1] }
+            [pscustomobject]@{ Rel = $rel; Day = $day; Device = $dev; Size = $e.Length }
+        }
+    } finally { $zip.Dispose() }
+}
+
+function Invoke-PmRestorePreviewFlow {
+    <# READ-ONLY on the target: what a restore of this package would do there. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, [Parameter(Mandatory)][string]$Path, [hashtable]$Options = @{}, [string]$Password, $Job)
+    $meta = Read-PmBackupMeta -Path $Path
+    $m = if ($meta) { $meta.manifest } else { Read-PmBackupManifest -ZipPath $Path }
+    $type = Get-PmBackupType -Manifest $m -Name (Split-Path $Path -Leaf)
+    $role = if ($Server.PSObject.Properties['role']) { [string]$Server.role } else { 'both' }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Preview of $(Split-Path $Path -Leaf) ($type) on $($Server.name) - nothing is changed there."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $out = $null
+        switch ($type) {
+            { $_ -in 'devices', 'notifications', 'triggers' } {
+                $pkg = Read-PmSectionPackage -Path $Path -Password $Password -Job $Job
+                $mode = if ([string]$Options.Mode -eq 'overwrite') { 'overwrite' } else { 'merge' }
+                $r = Invoke-PmRemote -Session $s -Function 'Get-PmSectionRestorePreview' -Parameters @{ Packed = $pkg.Packed; Mode = $mode; ReIdConflicts = [bool]$Options.ReIdConflicts } -Job $Job
+                $out = $r.Plan
+            }
+            'license' {
+                $r = Invoke-PmRemote -Session $s -Function 'Get-PmPrtgLicenseStatus' -Job $Job
+                $cur = if ($r.Installed -and $r.State -and $r.State.Known) { "$($r.State.Edition)$(if ($r.State.Name) { " - licensed for '$($r.State.Name)'" })$(if ($r.State.NeedsActivation) { ' (not activated)' })" } else { 'no license information' }
+                $items = @([pscustomobject]@{ Action = 'update'; Item = 'License'; Detail = "replaces the current license ($cur) with the one of the backup ($($m.license.edition), made on $($m.source.computer)); a copy of the current one is kept" })
+                $warn = @(); if ($m.source.computer -and $m.source.computer -ne $r.Computer) { $warn += "The backup comes from $($m.source.computer). PRTG activates per system: on $($r.Computer) PRTG asks Paessler for a new activation (the key must allow it)." }
+                $out = [pscustomobject]@{ Type = 'license'; Items = $items; Blockers = $(if (-not $r.Installed) { @('PRTG is not installed on the target.') } else { @() }); Warnings = $warn; MissingDependencies = @($(if (-not $Password) { 'The backup password is needed to restore the license.' })) | Where-Object { $_ }; Current = $r.State; Hint = $r.Hint }
+            }
+            'graphs' {
+                $plain = Get-PmPlainPackage -Path $Path -Password $Password -Job $Job
+                try { $files = @(Get-PmZipGraphFiles -ZipPath $plain.Path) } finally { if ($plain.Temp) { Remove-Item -LiteralPath $plain.Path -Force -ErrorAction SilentlyContinue } }
+                $f = Invoke-PmRemote -Session $s -Function 'Get-PmGraphTargetFacts' -Job $Job
+                $mode = if ([string]$Options.GraphMode -eq 'overwrite') { 'overwrite' } else { 'merge' }
+                $g = Get-PmGraphRestorePlan -Files $files -TargetFiles @($f.Files) -TargetDevices @($f.Devices | ForEach-Object { [int]$_ }) -Mode $mode
+                $items = @(
+                    [pscustomobject]@{ Action = 'create'; Item = 'History files'; Detail = ("{0} new file(s), {1:N2} GB" -f $g.New, ($g.NewBytes / 1GB)) },
+                    [pscustomobject]@{ Action = $(if ($mode -eq 'overwrite') { 'update' } else { 'skip' }); Item = 'History files already on the target'; Detail = "$($g.Existing) file(s) - $(if ($mode -eq 'overwrite') { 'replaced' } else { 'kept' })" }
+                )
+                $out = [pscustomobject]@{ Type = 'graphs'; Items = $items; Blockers = $(if (-not $f.Prtg.Installed) { @('PRTG is not installed on the target.') } else { @() }); Warnings = @($g.Warnings); MissingDependencies = @(); Counts = $g }
+            }
+            default {
+                $f = Invoke-PmRemote -Session $s -Function 'Get-PmRestoreTargetFacts' -Job $Job
+                $out = Get-PmFullRestorePreview -Manifest $m -Facts $f -Options $Options -PackageBytes ((Get-Item -LiteralPath $Path).Length)
+            }
+        }
+        if ($role -eq 'source') { $out.Blockers = @($out.Blockers) + "$($Server.name) is marked as a source server - PRTG Manager does not restore into it." }
+        return [pscustomobject]@{ target = $Server.name; package = (Split-Path $Path -Leaf); type = $type; preview = $out }
+    } finally { Close-PmSession $s }
+}
+
+function Invoke-PmLicenseFlow {
+    <# License actions on one server: status (read-only), install (trial / bought key), remove. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'License key typed in the dashboard; sent to the server only.')]
+    param([Parameter(Mandatory)]$Server, [pscredential]$Credential, [Parameter(Mandatory)][ValidateSet('status', 'install', 'remove')][string]$Action, [hashtable]$Options = @{}, [hashtable]$Secrets = @{}, $Job)
+    if ($Action -ne 'status') {
+        Assert-PmNotSource -Server $Server -What 'change the license of'
+        if ((Get-PmTransport $Server) -eq 'rdp') { throw "$($Server.name): license changes need the WinRM or Local connection method." }
+    }
+    Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
+    $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
+    try {
+        $hm = if ([int]$Options.HealthTimeoutMinutes -gt 0) { [int]$Options.HealthTimeoutMinutes } else { 15 }
+        switch ($Action) {
+            'status' {
+                $r = Invoke-PmRemote -Session $s -Function 'Get-PmPrtgLicenseStatus' -Job $Job
+                if (-not $r.Installed) { Add-PmJobLog -Job $Job -Level WARN -Message "$($Server.name): PRTG is not installed." }
+                else { Add-PmJobLog -Job $Job -Level $(if ($r.State.Known -and -not $r.State.NeedsActivation) { 'OK' } else { 'WARN' }) -Message "$($Server.name): $(if ($r.State.Known) { "$($r.State.Edition)$(if ($r.State.Name) { ", licensed for '$($r.State.Name)'" }), $($r.State.MaxSensors) sensors" } else { 'no license line in the core log' }). $($r.Hint)" }
+                return [pscustomobject]@{ target = $Server.name; ok = $true; action = 'status'; status = $r }
+            }
+            'install' {
+                $kind = if ([string]$Options.Kind -eq 'trial') { 'trial' } else { 'commercial' }
+                $r = Invoke-PmRemote -Session $s -Function 'Install-PmPrtgLicense' -Parameters @{ LicenseName = [string]$Secrets.LicenseName; LicenseKey = [string]$Secrets.LicenseKey; Kind = $kind; HealthTimeoutMinutes = $hm; Force = [bool]$Options.Force } -Job $Job -ProgressBase 5 -ProgressSpan 90
+                if (-not $r) { throw 'The server returned no result.' }
+                Write-PmAudit -Action 'prtg.license.installed' -Data @{ server = $Server.name; kind = $kind; activated = [bool]$r.Activated; edition = $r.After.Edition; rollback = $r.Rollback }
+                return [pscustomobject]@{ target = $Server.name; ok = [bool]$r.Healthy; action = 'install'; kind = $kind; activated = [bool]$r.Activated; hint = $r.Hint; before = $r.Before; after = $r.After; rollback = $r.Rollback; web = $r.WebUrl }
+            }
+            'remove' {
+                $r = Invoke-PmRemote -Session $s -Function 'Remove-PmPrtgLicense' -Parameters @{ HealthTimeoutMinutes = $hm } -Job $Job -ProgressBase 5 -ProgressSpan 85
+                if (-not $r) { throw 'The server returned no result.' }
+                Write-PmAudit -Action 'prtg.license.removed' -Data @{ server = $Server.name; removed = @($r.Removed); rollback = $r.Rollback; healthy = $r.Healthy }
+                $st = Invoke-PmRemote -Session $s -Function 'Get-PmPrtgLicenseStatus' -Job $Job
+                Add-PmJobLog -Job $Job -Level OK -Message "License state after the removal: $(if ($st.State.Known) { $st.State.Edition } else { 'no license line yet' }); key present: $([bool]$st.HasKey)."
+                return [pscustomobject]@{ target = $Server.name; ok = $true; action = 'remove'; removed = @($r.Removed); rollback = $r.Rollback; before = $r.Before; after = $r.After; status = $st; healthy = $r.Healthy; web = $r.WebUrl }
+            }
+        }
+    } finally { Close-PmSession $s }
 }
 
 # ======================================================================= flows
@@ -661,7 +1162,7 @@ function Remove-PmBackup {
 function Get-PmConnectHint {
     param([string]$Message, $Ports)
     if ($Ports -and -not $Ports.winrm) {
-        return "WinRM port $($Ports.winrmPort) is not reachable. Use the RDP connection method, or enable remoting on the server (tools\Enable-PrtgMoverRemoting.ps1) and open the firewall for the manager."
+        return "WinRM port $($Ports.winrmPort) is not reachable. Use the RDP connection method, or enable remoting on the server (tools\Enable-PrtgManagerRemoting.ps1) and open the firewall for the manager."
     }
     if ($Message -match 'TrustedHosts') { return 'The manager must trust this IP for WinRM: run tools\Setup-Manager.ps1 -TrustedHosts <ip> in an elevated PowerShell on the manager (or use the RDP connection method).' }
     if ($Message -match 'Access is denied|access denied') { return 'Credential rejected or not an administrator. Use HOST\Administrator (or .\Administrator) and check LocalAccountTokenFilterPolicy.' }
@@ -740,7 +1241,7 @@ function New-PmDiagnosticsBundle {
     $env = New-Object System.Text.StringBuilder
     $add = { param($k, $v) [void]$env.AppendLine(('{0,-26}: {1}' -f $k, $v)) }
     & $add 'Created' (Get-Date).ToString('o')
-    & $add 'PRTG Mover version' ((Get-Content (Join-Path (Get-PmPath Root) 'VERSION') -ErrorAction SilentlyContinue | Select-Object -First 1))
+    & $add 'PRTG Manager version' ((Get-Content (Join-Path (Get-PmPath Root) 'VERSION') -ErrorAction SilentlyContinue | Select-Object -First 1))
     & $add 'Manager' "$env:COMPUTERNAME ($env:USERDOMAIN\$env:USERNAME)"
     & $add 'OS' (Get-PmOsCaption)
     & $add 'PowerShell' $PSVersionTable.PSVersion
@@ -766,7 +1267,7 @@ function New-PmDiagnosticsBundle {
         [void]$env.AppendLine(('  {0,-14} {1,-16} method={2,-5} RDP:{3}={4} WinRM:{5}={6} credential={7} agent={8} {9}' -f $s.name, $s.host, (Get-PmTransport $s), $p.rdpPort, $p.rdp, $p.winrmPort, $p.winrm, (Test-PmCredential $s.id), $a.connected, $(if ($a.connected) { "($($a.computer), $($a.state), age $($a.ageSeconds)s)" } else { '' })))
     }
     [IO.File]::WriteAllText((Join-Path $tmp 'environment.txt'), $env.ToString(), [Text.Encoding]::UTF8)
-    $zip = Join-Path $diagDir "prtg-mover-diagnostics-$stamp.zip"
+    $zip = Join-Path $diagDir "prtg-manager-diagnostics-$stamp.zip"
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($tmp, $zip)
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -783,8 +1284,8 @@ function Test-PmElevated {
 
 function Invoke-PmLocalTestFlow {
     <#
-        Connection method 'local': PRTG Mover is installed on the server itself. Nothing is
-        connected; the check runs in this process. It passes when PRTG Mover has administrator
+        Connection method 'local': PRTG Manager is installed on the server itself. Nothing is
+        connected; the check runs in this process. It passes when PRTG Manager has administrator
         rights, because backup (snapshot, registry) and restore (services) need them.
     #>
     param([Parameter(Mandatory)]$Server, $Job)
@@ -795,15 +1296,15 @@ function Invoke-PmLocalTestFlow {
         $s = New-PmSession -Server $Server -Job $Job
         $info = Invoke-PmRemote -Session $s -Function 'Get-PmSystemInfo' -Job $Job
         $ok = [bool]$info.IsAdmin -or $env:PRTGMOVER_TEST -eq '1'
-        $detail = if ($ok) { 'this computer, administrator rights OK' } else { 'PRTG Mover is NOT running as administrator. Close it and start it with "Run as administrator" (the installer option -Local sets this up).' }
+        $detail = if ($ok) { 'this computer, administrator rights OK' } else { 'PRTG Manager is NOT running as administrator. Close it and start it with "Run as administrator" (the installer option -Local sets this up).' }
     } catch {
         $detail = Format-PmManagerError $_
         Add-PmJobError -Job $Job -ErrorRecord $_ -Context 'Local system check: '
     }
     Add-PmJobLog -Job $Job -Level $(if ($ok) { 'OK' } else { 'ERROR' }) -Message "Local test: $(if ($ok) { 'PASS' } else { 'FAIL' }) - $detail"
     if ($info) {
-        Add-PmJobLog -Job $Job -Level OK -Computer $info.Computer -Message ("{0}: {1} | admin={2} | PRTG={3} {4} ({5} GB data, core {6}) | VPN={7}" -f $info.Computer, $info.OS, $info.IsAdmin,
-                $(if ($info.Prtg.Installed) { 'yes' } else { 'no' }), $info.Prtg.Version, $info.PrtgDataGB, $info.Prtg.CoreStatus, @($info.VpnAllUsers).Count)
+        Add-PmJobLog -Job $Job -Level OK -Computer $info.Computer -Message ("{0}: {1} | admin={2} | PRTG={3} {4} ({5} GB data, core {6})" -f $info.Computer, $info.OS, $info.IsAdmin,
+                $(if ($info.Prtg.Installed) { 'yes' } else { 'no' }), $info.Prtg.Version, $info.PrtgDataGB, $info.Prtg.CoreStatus)
         foreach ($d in @($info.Disks)) { Add-PmJobLog -Job $Job -Message ("Disk {0} {1} GB free of {2} GB" -f $d.Drive, $d.FreeGB, $d.SizeGB) -Computer $info.Computer }
         if ($info.Prtg.Installed -and $info.PrtgConfigStats) { Add-PmJobLog -Job $Job -Message "PRTG configuration: $($info.PrtgConfigStats)" -Computer $info.Computer }
     }
@@ -877,8 +1378,8 @@ function Invoke-PmTestFlow {
 
     if ($info) {
         $r = $info
-        Add-PmJobLog -Job $Job -Level OK -Message ("{0}: {1} | admin={2} | PRTG={3} {4} ({5} GB data, core {6}) | VPN={7} | RDP port on server={8}" -f $r.Computer, $r.OS, $r.IsAdmin,
-                $(if ($r.Prtg.Installed) { 'yes' } else { 'no' }), $r.Prtg.Version, $r.PrtgDataGB, $r.Prtg.CoreStatus, @($r.VpnAllUsers).Count, $r.RdpPort) -Computer $r.Computer
+        Add-PmJobLog -Job $Job -Level OK -Message ("{0}: {1} | admin={2} | PRTG={3} {4} ({5} GB data, core {6}) | RDP port on server={7}" -f $r.Computer, $r.OS, $r.IsAdmin,
+                $(if ($r.Prtg.Installed) { 'yes' } else { 'no' }), $r.Prtg.Version, $r.PrtgDataGB, $r.Prtg.CoreStatus, $r.RdpPort) -Computer $r.Computer
         foreach ($d in @($r.Disks)) { Add-PmJobLog -Job $Job -Message ("Disk {0} {1} GB free of {2} GB" -f $d.Drive, $d.FreeGB, $d.SizeGB) -Computer $r.Computer }
         if ($r.Prtg.Installed -and $r.PrtgConfigStats) { Add-PmJobLog -Job $Job -Message "PRTG configuration: $($r.PrtgConfigStats)" -Computer $r.Computer }
         if ($r.Prtg.Installed -and $r.PrtgLicense) {
@@ -952,7 +1453,7 @@ function Invoke-PmPreflight {
             $i = Invoke-PmRemote -Session $s -Function 'Initialize-PmRemoteWorkRoot' -Job $Job
             $info[$srv.id] = $i
             if (-not $i.IsAdmin -and $env:PRTGMOVER_TEST -ne '1') {
-                $problems += if ($method -eq 'local') { "$($srv.name): PRTG Mover is not running as administrator. Close it and start it with 'Run as administrator'." } else { "$($srv.name): remote session is not elevated (administrator required)." }
+                $problems += if ($method -eq 'local') { "$($srv.name): PRTG Manager is not running as administrator. Close it and start it with 'Run as administrator'." } else { "$($srv.name): remote session is not elevated (administrator required)." }
             }
             Add-PmJobLog -Job $Job -Level OK -Computer $i.Computer -Message ("{0}: reachable via {1}, admin={2}, PRTG={3}, {4:N1} GB free" -f $srv.name, $method.ToUpper(), $i.IsAdmin,
                     $(if ($i.Prtg.Installed) { "$($i.Prtg.Version) ($($i.Prtg.CoreStatus))" } else { 'not installed' }), ($i.FreeBytes / 1GB))
@@ -1066,22 +1567,29 @@ function Find-PmResumeStage {
 }
 
 function New-PmPackageFromStage {
-    <# Builds backups\PRTG_<computer>_<ts>.zip (VPN_... for a backup of VPN connections and routes only) and its .meta.json from a complete staging folder on the manager. #>
-    param([Parameter(Mandatory)][string]$StageDir, $Job, [string]$SourceName)
-    $manifest = Get-Content -LiteralPath (Join-Path $StageDir 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    $prefix = switch (Get-PmBackupKind -Manifest $manifest) { 'vpn' { 'VPN' } 'files' { 'FILES' } default { 'PRTG' } }
+    <#
+        Builds backups\PRTG-FULL_<computer>_<ts>.zip (PRTG-GRAPHS_ for history only, FILES_ without PRTG) and its
+        .meta.json from a complete staging folder on the manager; with a password it is encrypted into .pmenc.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param([Parameter(Mandatory)][string]$StageDir, $Job, [string]$SourceName, [string]$Password)
+    $mf = Join-Path $StageDir 'manifest.json'
+    $manifest = Get-Content -LiteralPath $mf -Raw -Encoding UTF8 | ConvertFrom-Json
+    # metadata the server does not know: this manager's version and the server's name in the inventory
+    foreach ($kv in @(@('appVersion', (Get-PmAppVersion)), @('sourceServer', $SourceName))) { $manifest | Add-Member -NotePropertyName $kv[0] -NotePropertyValue $kv[1] -Force }
+    if (-not $manifest.PSObject.Properties['type']) { $manifest | Add-Member -NotePropertyName type -NotePropertyValue (Get-PmBackupType -Manifest $manifest) -Force }
+    if (-not $manifest.PSObject.Properties['encryption']) { $manifest | Add-Member -NotePropertyName encryption -NotePropertyValue ([pscustomobject]@{ package = [bool]$Password; secrets = $false }) -Force }
+    [IO.File]::WriteAllText($mf, (ConvertTo-Json -InputObject $manifest -Depth 10), (New-Object Text.UTF8Encoding($false)))
+    $prefix = switch (Get-PmBackupType -Manifest $manifest) { 'graphs' { 'PRTG-GRAPHS' } 'files' { 'FILES' } 'vpn' { 'VPN' } default { 'PRTG-FULL' } }
     $zipName = '{0}_{1}_{2}.zip' -f $prefix, $manifest.source.computer, (Get-Date -Format 'yyyyMMdd-HHmmss')
     $local = Join-Path (Get-PmPath Backups) $zipName
     Add-PmJobLog -Job $Job -Level STEP -Message ("Compressing the staged copy ({0:N2} GB) into {1} on the manager..." -f ($manifest.stagingBytes / 1GB), $zipName)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [IO.Compression.ZipFile]::CreateFromDirectory($StageDir, $local, [IO.Compression.CompressionLevel]::Optimal, $false)
-    $hash = (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash
-    Add-PmJobLog -Job $Job -Level OK -Message ("Package ready: {0} ({1:N1} MB, SHA-256 {2}, {3:N0} s)" -f $zipName, ((Get-Item -LiteralPath $local).Length / 1MB), $hash, $sw.Elapsed.TotalSeconds)
+    Add-PmJobLog -Job $Job -Level DEBUG -Message ("Zip written in {0:N0} s" -f $sw.Elapsed.TotalSeconds)
     if (-not $SourceName) { $SourceName = $manifest.source.computer }
-    [pscustomobject]@{ source = $SourceName; sha256 = $hash; manifest = $manifest } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath "$local.meta.json" -Encoding UTF8
-    Write-PmAudit -Action 'backup.created' -Data @{ job = $(if ($Job) { $Job.id }); package = $zipName; sha256 = $hash }
-    return $local
+    return (Complete-PmPackage -ZipPath $local -Manifest $manifest -Source $SourceName -Password $Password -Job $Job)
 }
 
 function Use-PmCompletedStage {
@@ -1090,13 +1598,14 @@ function Use-PmCompletedStage {
         source (staging with manifest.json), adopt it - the source is not contacted again.
         Returns @{ Zip; StageDir } or $null.
     #>
-    param($Job, [string]$SourceName)
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
+    param($Job, [string]$SourceName, [string]$Password)
     $rs = Find-PmResumeStage -Job $Job
     if (-not $rs -or -not $rs.Complete) { return $null }
     $dest = Join-Path (Get-PmPath Data) "staging\$($Job.id)"
     Move-Item -LiteralPath $rs.Path -Destination $dest
     Add-PmJobLog -Job $Job -Level OK -Message "RESUME: the copy made by job $($rs.JobId) is complete - adopting it, the source is not contacted again."
-    $zip = New-PmPackageFromStage -StageDir $dest -Job $Job -SourceName $SourceName
+    $zip = New-PmPackageFromStage -StageDir $dest -Job $Job -SourceName $SourceName -Password $Password
     return [pscustomobject]@{ Zip = $zip; StageDir = $dest }
 }
 
@@ -1305,7 +1814,7 @@ function Invoke-PmTransferFiles {
         try {
             for ($i = 1; $i -le $n; $i++) {
                 $ps = [powershell]::Create(); $ps.RunspacePool = $pool
-                [void]$ps.AddScript($script:PmTransferWorker.ToString()).AddArgument((Join-Path $PSScriptRoot 'PrtgMover.psm1')).AddArgument((Get-PmPath Root)).AddArgument($Server).AddArgument($Credential).AddArgument($Job).AddArgument($Direction).AddArgument($RemoteRoot).AddArgument($LocalRoot).AddArgument($queue).AddArgument($state).AddArgument($i).AddArgument($batches.Count)
+                [void]$ps.AddScript($script:PmTransferWorker.ToString()).AddArgument((Join-Path $PSScriptRoot 'PrtgManager.psm1')).AddArgument((Get-PmPath Root)).AddArgument($Server).AddArgument($Credential).AddArgument($Job).AddArgument($Direction).AddArgument($RemoteRoot).AddArgument($LocalRoot).AddArgument($queue).AddArgument($state).AddArgument($i).AddArgument($batches.Count)
                 $workers += @{ PS = $ps; Async = $ps.BeginInvoke() }
             }
             $lastLog = [Diagnostics.Stopwatch]::StartNew(); $lastBatches = 0
@@ -1352,9 +1861,10 @@ function Invoke-PmBackupFlow {
           WinRM       : the manager pulls the files from the VSS snapshot over WinRM, file by file (resumable).
         In both cases the source needs no free disk space and the manager builds the zip.
     #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingPlainTextForPassword', '', Justification = 'Backup password from the dashboard; never stored.')]
     param(
         [Parameter(Mandatory)]$Server, [pscredential]$Credential, [hashtable]$Options = @{}, $Job,
-        [int]$ProgressBase = 0, [double]$ProgressSpan = 100
+        [int]$ProgressBase = 0, [double]$ProgressSpan = 100, [string]$Password
     )
     $jobId = if ($Job -and $Job.id) { $Job.id } else { Get-Date -Format 'yyyyMMdd-HHmmss' }
     Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to source $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
@@ -1391,7 +1901,7 @@ function Invoke-PmBackupFlow {
             try {
                 # small items staged on the source (registry, services, VPN, desktops, extra, manifest)
                 $small = Invoke-PmRemote -Session $s -Function 'Get-PmPullList' -Parameters @{ Source = $r.StageDir } -Job $Job
-                Invoke-PmTransferFiles -Session $s -Direction Pull -RemoteRoot $r.StageDir -LocalRoot $stageLocal -Files @($small.Files) -Job $Job -Label 'registry/VPN/desktop/manifest'
+                Invoke-PmTransferFiles -Session $s -Direction Pull -RemoteRoot $r.StageDir -LocalRoot $stageLocal -Files @($small.Files) -Job $Job -Label 'registry/desktop/manifest'
                 $span = $ProgressSpan * 0.6; $i = 0; $items = @($r.PullItems)
                 foreach ($pi in $items) {
                     $lst = Invoke-PmRemote -Session $s -Function 'Get-PmPullList' -Parameters @{ Source = $pi.Source; ExcludeDirs = [string[]]@($pi.ExcludeDirs); ExcludeFiles = [string[]]@($pi.ExcludeFiles) } -Job $Job
@@ -1419,7 +1929,7 @@ function Invoke-PmBackupFlow {
         }
         Set-PmStageComplete -StageDir $stageLocal
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]($ProgressSpan * 0.75)) -Step 'Building the package on the manager'
-        $local = New-PmPackageFromStage -StageDir $stageLocal -Job $Job -SourceName $Server.name
+        $local = New-PmPackageFromStage -StageDir $stageLocal -Job $Job -SourceName $Server.name -Password $Password
         Set-PmJobProgress -Job $Job -Percent ($ProgressBase + [int]$ProgressSpan) -Step 'Backup complete'
         $result = [pscustomobject]@{ Zip = $local; StageDir = $stageLocal }
         if ($r.SourceHealth -and -not $r.SourceHealth.Healthy) {
@@ -1762,6 +2272,9 @@ function Invoke-PmJob {
     param([Parameter(Mandatory)]$Job, [Parameter(Mandatory)][string]$Type, [hashtable]$Params = @{})
     $Job.status = 'running'; $Job.started = (Get-Date).ToString('o')
     $creds = $Params.Credentials
+    # passwords / license keys typed in the dashboard: used by this run only, never written to the job record or the log
+    $secrets = if ($Params.Secrets) { $Params.Secrets } else { @{} }
+    $pw = [string]$secrets.Password
     $options = if ($Params.Options) { ConvertTo-PmHashtable -InputObject $Params.Options } else { @{} }
     # The source is never touched unless the caller explicitly allows it.
     if (-not $options.ContainsKey('NoTouch')) { $options.NoTouch = $true }
@@ -1805,18 +2318,75 @@ function Invoke-PmJob {
             'backup' {
                 $srv = Get-PmJobServer -Server (Get-PmServer -Id $Params.SourceId) -Options $options
                 if (-not $options.ContainsKey('SourceAfter')) { $options.SourceAfter = 'Restart' }
+                if ([string]$options.Scope -eq 'graphs') {
+                    # history only: never stops PRTG, no program / registry / license / desktop
+                    $options.NoTouch = $true; $options.IncludePrtg = $true; $options.IncludeDesktop = $false; $options.ExtraPaths = [string[]]@()
+                    Add-PmJobLog -Job $Job -Level STEP -Message ("History backup (graph data) of {0}: {1}. PRTG keeps running." -f $srv.name, $(if ([int]$options.HistoryDays -gt 0) { "the last $([int]$options.HistoryDays) day(s)" } else { 'all days' }))
+                }
+                if ($pw) { Assert-PmBackupPassword $pw }
                 [void](Invoke-PmPreflight -Source $srv -Credentials $creds -Options $options -Job $Job)
-                $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name
-                if (-not $b) { $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job }
+                $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name -Password $pw
+                if (-not $b) { $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job -Password $pw }
                 Set-PmCheckpoint -Job $Job -Backup (Split-Path $b.Zip -Leaf)
                 if ($b.StageDir) { Remove-Item -LiteralPath $b.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
                 $Job.result = [pscustomobject]@{ backup = (Split-Path $b.Zip -Leaf) }
             }
+            'section-backup' {
+                # one part of PRTG: devices / notifications / triggers / license (nothing is written on the server)
+                $srv = Get-PmServer -Id $Params.SourceId
+                $r = Invoke-PmSectionBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Type ([string]$Params.SectionType) -Password $pw -Job $Job
+                $Job.result = $r
+            }
             'restore' {
                 $file = Get-PmBackupFile -Name $Params.BackupName
+                $meta = Read-PmBackupMeta -Path $file
+                $ptype = Get-PmBackupType -Manifest $(if ($meta) { $meta.manifest } else { Read-PmBackupManifest -ZipPath $file }) -Name $Params.BackupName
                 $targets = @($Params.TargetIds | Where-Object { -not ($resume -and @($resume.targetsDone) -contains $_) })
                 if ($resume) { Add-PmJobLog -Job $Job -Level STEP -Message "Resuming: $(@($resume.targetsDone).Count) target(s) already done, $($targets.Count) remaining." }
-                $Job.result = Invoke-PmMultiRestore -File $file -TargetIds $targets -Options $options -Credentials $creds -Job $Job -Base 0 -Span 100
+                if ($ptype -in 'devices', 'notifications', 'triggers', 'license') {
+                    $results = @(); $failed = 0
+                    foreach ($id in $targets) {
+                        $srv = Get-PmServer -Id $id
+                        try {
+                            $r = Invoke-PmSectionRestoreFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Path $file -Options $options -Password $pw -Job $Job
+                            $results += $r
+                            # a license restore that leaves PRTG unhealthy reports ok = $false without throwing
+                            if ($r.ok) { Set-PmCheckpoint -Job $Job -TargetDone $id }
+                            else { $failed++; Add-PmJobLog -Job $Job -Level ERROR -Message "$($srv.name): the $($r.type) was restored, but PRTG did not come back healthy$(if ($r.hint) { " - $($r.hint)" })" }
+                        } catch { $failed++; Add-PmJobError -Job $Job -ErrorRecord $_ -Context "$($srv.name): "; $results += [pscustomobject]@{ target = $srv.name; ok = $false; error = "$_" } }
+                    }
+                    $Job.result = $results
+                    if ($failed) { throw "$failed of $($targets.Count) target(s) reported errors." }
+                } else {
+                    $plain = Get-PmPlainPackage -Path $file -Password $pw -Job $Job
+                    try { $Job.result = Invoke-PmMultiRestore -File $plain.Path -TargetIds $targets -Options $options -Credentials $creds -Job $Job -Base 0 -Span 100 }
+                    finally { Remove-PmPlainPackage $plain }
+                }
+            }
+            'restore-preview' {
+                $file = Get-PmBackupFile -Name $Params.BackupName
+                $results = @()
+                foreach ($id in @($Params.TargetIds)) {
+                    $srv = Get-PmServer -Id $id
+                    $results += Invoke-PmRestorePreviewFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Path $file -Options $options -Password $pw -Job $Job
+                }
+                $Job.result = $results
+            }
+            'license' {
+                $results = @()
+                foreach ($id in @($Params.ServerIds)) {
+                    $srv = Get-PmServer -Id $id
+                    $results += Invoke-PmLicenseFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Action ([string]$Params.Action) -Options $options -Secrets $secrets -Job $Job
+                    if ([string]$Params.Action -ne 'status') {
+                        try { [void](Invoke-PmTestFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Job $Job -Mode $(if ((Get-PmTransport $srv) -eq 'winrm') { 'winrm' } else { 'auto' })) } catch { Add-PmJobLog -Job $Job -Level WARN -Message "Status refresh failed: $($_.Exception.Message)" }
+                    }
+                }
+                $Job.result = $results
+            }
+            'validate' {
+                $r = Test-PmBackupPackage -Name ([string]$Params.BackupName) -Password $pw -Job $Job
+                $Job.result = $r
+                if (-not $r.valid) { throw "The package is not valid: $(@($r.errors) -join '; ')" }
             }
             'migrate' {
                 if (-not $options.ContainsKey('SourceAfter')) { $options.SourceAfter = 'KeepStopped' }
@@ -1842,11 +2412,17 @@ function Invoke-PmJob {
                     } else {
                         $b = Use-PmCompletedStage -Job $Job -SourceName $srv.name
                         if (-not $b) { $b = Invoke-PmBackupFlow -Server $srv -Credential (Resolve-PmCredential $srv $creds) -Options $options -Job $Job -ProgressBase 0 -ProgressSpan 40 }
+                        if ($pw) {
+                            # the migration restores from the plain staging copy; the package kept on the manager is encrypted
+                            $enc = Complete-PmPackage -ZipPath $b.Zip -Manifest ((Read-PmBackupMeta -Path $b.Zip).manifest) -Source $srv.name -Password $pw -Job $Job
+                            $b = [pscustomobject]@{ Zip = $enc; StageDir = $b.StageDir }
+                        }
                         $file = $b.Zip; $stage = $b.StageDir
                         Set-PmCheckpoint -Job $Job -Backup (Split-Path $file -Leaf) -StageDir $stage
                     }
                 }
                 if ([string]$options.Transfer -notin 'wireguard', 'ipip') {
+                    if ($file -like '*.pmenc' -and -not $stage) { throw 'The package of this migration is encrypted and its staging copy is gone - restore it from the Backups page with its password.' }
                     $reports = Invoke-PmMultiRestore -File $file -StageDir $stage -TargetIds $targetIds -Options $options -Credentials $creds -Job $Job -Base 40 -Span 60
                     $Job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf); targets = $reports }
                     if ($stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue; Add-PmJobLog -Job $Job -Level DEBUG -Message "Staging copy removed: $stage" }
@@ -1875,6 +2451,7 @@ function Invoke-PmMultiRestore {
     foreach ($id in $TargetIds) {
         $srv = Get-PmJobServer -Server (Get-PmServer -Id $id) -Options $Options
         try {
+            Assert-PmNotSource -Server $srv -What 'restore into'
             $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Resolve-PmCredential $srv $Credentials) -BackupPath $File -StageDir $StageDir -Options $Options -Job $Job `
                 -ProgressBase ($Base + [int]($i * $slice)) -ProgressSpan $slice
             $ok = (@($rep.Errors).Count -eq 0)
@@ -1894,6 +2471,11 @@ function Invoke-PmMultiRestore {
 function Start-PmJob {
     <# Queues a job on the background runspace pool (used by the dashboard). #>
     param([Parameter(Mandatory)][string]$Type, [hashtable]$Params = @{}, [string]$Summary)
+    # one restore / preview per package at a time: both would decrypt into and clean up the same staging copy
+    if ($Type -in 'restore', 'restore-preview' -and $Params.BackupName) {
+        $busy = Get-PmPackageUser -Name ([string]$Params.BackupName)
+        if ($busy) { throw "The package $($Params.BackupName) is used by job $busy right now - wait until it has finished." }
+    }
     if (-not $script:PmPool) {
         $script:PmPool = [runspacefactory]::CreateRunspacePool(1, 4)
         $script:PmPool.Open()
@@ -1901,7 +2483,7 @@ function Start-PmJob {
     $job = New-PmJobObject -Type $Type -Summary $Summary
     # Keep the parameters (without one-time credentials) so the job can be resumed/retried later.
     $saved = @{}
-    foreach ($k in $Params.Keys) { if ($k -notin 'Credentials', 'Resume') { $saved[$k] = $Params[$k] } }
+    foreach ($k in $Params.Keys) { if ($k -notin 'Credentials', 'Resume', 'Secrets') { $saved[$k] = $Params[$k] } }
     $job.params = $saved
     if ($Params.ResumedFrom) { $job.resumedFrom = $Params.ResumedFrom }
     $script:PmJobs[$job.id] = $job
@@ -1914,7 +2496,7 @@ function Start-PmJob {
             Import-Module $ModulePath -Force -DisableNameChecking
             Set-PmRoot -Path $Root
             Invoke-PmJob -Job $Job -Type $Type -Params $Params
-        }).AddArgument((Join-Path $PSScriptRoot 'PrtgMover.psm1')).AddArgument($script:PmRoot).AddArgument($job).AddArgument($Type).AddArgument($Params)
+        }).AddArgument((Join-Path $PSScriptRoot 'PrtgManager.psm1')).AddArgument($script:PmRoot).AddArgument($job).AddArgument($Type).AddArgument($Params)
     $script:PmJobHandles[$job.id] = @{ PowerShell = $ps; Async = $ps.BeginInvoke() }
     return $job
 }
@@ -1999,7 +2581,7 @@ function Get-PmJob {
         id = $j.id; type = $j.type; summary = $j.summary; status = $j.status; progress = $j.progress; step = $j.step
         created = $j.created; started = $j.started; finished = $j.finished; error = $j.error; result = $j.result
         checkpoint = $j.checkpoint; resumedFrom = $j.resumedFrom
-        resumable = [bool]($j.params -and $j.status -in 'failed', 'cancelled', 'interrupted')
+        resumable = [bool]($j.params -and $j.status -in 'failed', 'cancelled', 'interrupted' -and $j.type -in 'backup', 'restore', 'migrate', 'section-backup', 'validate')
         logCount = $logs.Count; logs = @($logs | Select-Object -Skip $Since)
     }
 }
@@ -2010,6 +2592,6 @@ function Get-PmInstallers {
 }
 
 # Pure tunnel helpers live in the remote script and are also used on the manager to plan addresses.
-. (Join-Path $PSScriptRoot 'Remote\PrtgMover.Remote.ps1')
+. (Join-Path $PSScriptRoot 'Remote\PrtgManager.Remote.ps1')
 
 Export-ModuleMember -Function *-Pm*

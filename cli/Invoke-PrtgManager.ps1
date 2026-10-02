@@ -1,0 +1,207 @@
+<#
+.SYNOPSIS
+    Command-line front end of PRTG Manager (same engine as the dashboard).
+
+.DESCRIPTION
+    Runs a test, backup, restore or full migration directly in the console - useful
+    for scheduled backups (Task Scheduler) or when no browser is available.
+    Servers are addressed either by inventory name/id (config\servers.json, managed in
+    the dashboard) or ad hoc by host name.
+
+.EXAMPLE
+    # Connectivity test with an interactive credential prompt
+    .\cli\Invoke-PrtgManager.ps1 -Action Test -Source 10.0.0.10 -Credential (Get-Credential)
+
+.EXAMPLE
+    # Nightly backup of an inventory server (saved credential), source keeps running
+    .\cli\Invoke-PrtgManager.ps1 -Action Backup -Source PRTG-OLD
+
+.EXAMPLE
+    # Full migration to two new servers, old server stopped and disabled
+    .\cli\Invoke-PrtgManager.ps1 -Action Migrate -Source PRTG-OLD -Target PRTG-NEW1,PRTG-NEW2 -SourceAfter Disable
+
+.EXAMPLE
+    # Restore an existing package
+    .\cli\Invoke-PrtgManager.ps1 -Action Restore -BackupName PRTG_OLDSRV_20260928-221500.zip -Target PRTG-NEW1
+
+.EXAMPLE
+    # History only (graph data) of the last 30 days, PRTG keeps running
+    .\cli\Invoke-PrtgManager.ps1 -Action Backup -Source PRTG-OLD -Scope Graphs -HistoryDays 30
+
+.EXAMPLE
+    # One part of the configuration (Devices / Notifications / Triggers / License); License needs -BackupPassword
+    .\cli\Invoke-PrtgManager.ps1 -Action BackupPart -Part Devices -Source PRTG-OLD
+
+.EXAMPLE
+    # A migrated PRTG only answers on 127.0.0.1: bind its web server to the server's own address
+    .\cli\Invoke-PrtgManager.ps1 -Action FixBinding -Target PRTG-NEW1
+
+.EXAMPLE
+    # Remove the PRTG license data from a migrated server (never from a source server)
+    .\cli\Invoke-PrtgManager.ps1 -Action RemoveLicense -Target PRTG-NEW1
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][ValidateSet('Test', 'Backup', 'BackupPart', 'Restore', 'Migrate', 'FixBinding', 'RemoveLicense')][string]$Action,
+    [string]$Source,
+    [string[]]$Target = @(),
+    [string]$BackupName,
+    [pscredential]$Credential,
+    [switch]$NoPrtg,
+    [switch]$NoHistory,
+    [switch]$NoDesktop,
+    [string[]]$ExtraPaths = @(),
+    [ValidateSet('Restart', 'KeepStopped', 'Disable')][string]$SourceAfter,
+    [string]$InstallerFile,
+    [switch]$NoStart,
+    [int]$HealthTimeoutMinutes = 15,
+    [ValidateRange(1, 8)][int]$Streams = 4,
+    [switch]$AllowDowngrade,
+    [switch]$AllowSourceStop,
+    [switch]$NoProgramClone,
+    [switch]$NoLicense,
+    [switch]$NoFirewall,
+    [switch]$SkipPreflight,
+    [int]$KeepLast = 0,
+    [ValidateSet('rdp', 'winrm', 'wireguard', 'ipip')][string]$Transfer,
+    # Backup: Full (default) or Graphs (history only, PRTG keeps running)
+    [ValidateSet('Full', 'Graphs')][string]$Scope = 'Full',
+    [int]$HistoryDays = 0,
+    # BackupPart: which part of PRTG
+    [ValidateSet('Devices', 'Notifications', 'Triggers', 'License')][string]$Part = 'Devices',
+    # encrypts the package (required for License); needed again to restore it
+    [securestring]$BackupPassword
+)
+
+$ErrorActionPreference = 'Stop'
+$root = Split-Path $PSScriptRoot -Parent
+Import-Module (Join-Path $root 'src\PrtgManager.psm1') -Force -DisableNameChecking
+Set-PmRoot -Path $root
+
+function Resolve-CliServer {
+    param([string]$Ref)
+    $s = Get-PmServers | Where-Object { $_.id -eq $Ref -or $_.name -eq $Ref -or $_.host -eq $Ref } | Select-Object -First 1
+    if ($s) { return $s }
+    # ad-hoc server (not in inventory) - default WinRM settings
+    return [pscustomobject]@{ id = "adhoc-$Ref"; name = $Ref; host = $Ref; transport = 'winrm'; port = 0; useSsl = $false; skipCaCheck = $false; authentication = 'Default' }
+}
+
+function Get-CliCredential { param($Server) if ($Credential) { return $Credential } return Get-PmCredential -ServerId $Server.id }
+
+$options = @{
+    IncludePrtg = -not $NoPrtg; IncludeHistory = -not $NoHistory; IncludeDesktop = -not $NoDesktop; Scope = $Scope.ToLowerInvariant(); HistoryDays = $HistoryDays
+    ExtraPaths = $ExtraPaths; StartServices = -not $NoStart; HealthTimeoutMinutes = $HealthTimeoutMinutes; TransferStreams = $Streams
+    AllowDowngrade = [bool]$AllowDowngrade; AutoRollback = $true
+    RestorePrtg = -not $NoPrtg; RestoreDesktop = -not $NoDesktop; RestoreExtra = $true
+    NoTouch = -not $AllowSourceStop; IncludeProgram = -not $NoProgramClone; CopyLicense = -not $NoLicense; OpenFirewall = -not $NoFirewall
+}
+if ($Transfer) { $options.Transfer = $Transfer }
+if ($InstallerFile) { $options.InstallerFile = $InstallerFile }
+if ($Scope -eq 'Graphs') { $options.NoTouch = $true; $options.IncludeDesktop = $false; $options.ExtraPaths = [string[]]@() }
+$pw = $null
+if ($BackupPassword) { $pw = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($BackupPassword)) }
+
+$job = New-PmJobObject -Type $Action.ToLower() -Summary "CLI $Action" -Console
+$job.status = 'running'; $job.started = (Get-Date).ToString('o')
+$exit = 0
+try {
+    switch ($Action) {
+        'Test' {
+            foreach ($ref in @($Source) + $Target | Where-Object { $_ }) {
+                $srv = Resolve-CliServer $ref
+                [void](Invoke-PmTestFlow -Server $srv -Credential (Get-CliCredential $srv) -Job $job)
+            }
+        }
+        'Backup' {
+            if (-not $Source) { throw '-Source is required.' }
+            $srv = Resolve-CliServer $Source
+            $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'Restart' }
+            $creds = @{}; if ($Credential) { $creds[$srv.id] = $Credential }
+            if (-not $SkipPreflight) { [void](Invoke-PmPreflight -Source $srv -Credentials $creds -Options $options -Job $job) }
+            $bk = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job -Password $pw
+            $file = $bk.Zip
+            if ($bk.StageDir) { Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
+            $job.result = [pscustomobject]@{ backup = (Split-Path $file -Leaf) }
+            if ($KeepLast -gt 0) {
+                # Retention only touches packages of the same type and source computer (PRTG-FULL_<COMPUTER>_<timestamp>.zip / .pmenc).
+                $prefix = (Split-Path $file -Leaf) -replace '_\d{8}-\d{6}\.(zip|pmenc)$', '_'
+                Get-ChildItem (Get-PmPath Backups) -File | Where-Object { $_.Extension -in '.zip', '.pmenc' -and $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+                    Sort-Object LastWriteTime -Descending | Select-Object -Skip $KeepLast | ForEach-Object {
+                        Remove-PmBackup -Name $_.Name; Add-PmJobLog -Job $job -Level INFO -Message "Retention: removed $($_.Name)"
+                    }
+            }
+        }
+        'BackupPart' {
+            if (-not $Source) { throw '-Source is required.' }
+            $srv = Resolve-CliServer $Source
+            $job.result = Invoke-PmSectionBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Type $Part.ToLowerInvariant() -Password $pw -Job $job
+        }
+        'Restore' {
+            if (-not $BackupName -or -not $Target) { throw '-BackupName and -Target are required.' }
+            $file = Get-PmBackupFile -Name $BackupName
+            $meta = Read-PmBackupMeta -Path $file
+            $ptype = Get-PmBackupType -Manifest $(if ($meta) { $meta.manifest } else { Read-PmBackupManifest -ZipPath $file }) -Name $BackupName
+            $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
+            # the engine never restores into a server marked as source - checked before anything is decrypted or sent
+            foreach ($srv in $targets) { Assert-PmNotSource -Server $srv -What 'restore into' }
+            if ($ptype -in 'devices', 'notifications', 'triggers', 'license') {
+                $job.result = @(foreach ($srv in $targets) {
+                        $r = Invoke-PmSectionRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -Path $file -Options $options -Password $pw -Job $job
+                        # a license restore that leaves PRTG unhealthy reports ok = $false without throwing
+                        if (-not $r.ok) { $exit = 2; Add-PmJobLog -Job $job -Level ERROR -Message "$($srv.name): the $($r.type) was restored, but PRTG did not come back healthy$(if ($r.hint) { " - $($r.hint)" })" }
+                        $r
+                    })
+            } else {
+                $plain = Get-PmPlainPackage -Path $file -Password $pw -Job $job
+                try {
+                    foreach ($srv in $targets) {
+                        $rep = Invoke-PmRestoreFlow -Server $srv -Credential (Get-CliCredential $srv) -BackupPath $plain.Path -Options $options -Job $job
+                        if (@($rep.Errors).Count) { $exit = 2 }
+                    }
+                } finally { Remove-PmPlainPackage $plain }   # the decrypted zip and the folder it was extracted into
+            }
+        }
+        'RemoveLicense' {
+            if (-not $Target) { throw '-Target is required.' }
+            $job.result = @(foreach ($ref in $Target) { $srv = Resolve-CliServer $ref; Invoke-PmUnlicenseFlow -Server $srv -Credential (Get-CliCredential $srv) -Job $job -Options $options })
+        }
+        'FixBinding' {
+            if (-not $Target) { throw '-Target is required.' }
+            $job.result = @(foreach ($ref in $Target) { $srv = Resolve-CliServer $ref; Invoke-PmRebindFlow -Server $srv -Credential (Get-CliCredential $srv) -Job $job })
+        }
+        'Migrate' {
+            if (-not $Source -or -not $Target) { throw '-Source and -Target are required.' }
+            $srv = Resolve-CliServer $Source
+            $options.SourceAfter = if ($SourceAfter) { $SourceAfter } else { 'KeepStopped' }
+            $targets = @($Target | ForEach-Object { Resolve-CliServer $_ })
+            foreach ($x in $targets) { Assert-PmNotSource -Server $x -What 'migrate into' }
+            $creds = @{}; if ($Credential) { foreach ($x in @($srv) + $targets) { $creds[$x.id] = $Credential } }
+            if (-not $Transfer) { $Transfer = Resolve-PmTunnelFromServers -Servers (@($srv) + $targets); if ($Transfer) { $options.Transfer = $Transfer } }
+            if ($Transfer -in 'rdp', 'winrm') {
+                $srv = Copy-PmServerTransport -Server $srv -Transport $Transfer
+                $targets = @($targets | ForEach-Object { Copy-PmServerTransport -Server $_ -Transport $Transfer })
+            }
+            if (-not $SkipPreflight) { [void](Invoke-PmPreflight -Source $srv -Targets $targets -Credentials $creds -Options $options -Job $job) }
+            if ($Transfer -in 'wireguard', 'ipip') {
+                [void](Invoke-PmDirectTunnelMigrate -Source $srv -Targets $targets -Options $options -Credentials $creds -Job $job)
+                break
+            }
+            $bk = Invoke-PmBackupFlow -Server $srv -Credential (Get-CliCredential $srv) -Options $options -Job $job
+            $file = $bk.Zip
+            foreach ($t in $targets) {
+                $rep = Invoke-PmRestoreFlow -Server $t -Credential (Get-CliCredential $t) -BackupPath $file -StageDir $bk.StageDir -Options $options -Job $job
+                if (@($rep.Errors).Count) { $exit = 2 }
+            }
+            if ($bk.StageDir) { Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    $job.status = if ($exit) { 'failed' } else { 'succeeded' }
+} catch {
+    $job.status = 'failed'; $job.error = "$_"
+    Add-PmJobLog -Job $job -Level ERROR -Message "$_"
+    $exit = 1
+} finally {
+    $job.finished = (Get-Date).ToString('o')
+    Save-PmJobRecord -Job $job
+}
+exit $exit

@@ -3,59 +3,17 @@
 
 BeforeAll {
     $script:Root = Split-Path $PSScriptRoot -Parent
-    . (Join-Path $Root 'src\Remote\PrtgMover.Remote.ps1')
-    Import-Module (Join-Path $Root 'src\PrtgMover.psm1') -Force -DisableNameChecking
+    . (Join-Path $Root 'src\Remote\PrtgManager.Remote.ps1')
+    Import-Module (Join-Path $Root 'src\PrtgManager.psm1') -Force -DisableNameChecking
     $script:Work = Join-Path ([IO.Path]::GetTempPath()) ("pm-tests-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $Work | Out-Null
+    # data (config, backups, jobs, logs, audit) of the tests lives in the test folder, never in the real manager folder
+    New-Item -ItemType Directory -Path (Join-Path $Work 'manager') | Out-Null
+    Set-PmRoot -Path (Join-Path $Work 'manager')
 }
 
 AfterAll {
     Remove-Item -LiteralPath $script:Work -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-Describe 'RAS phonebook handling' {
-    BeforeEach {
-        $src = Join-Path $Work 'src.pbk'
-        $dst = Join-Path $Work 'dst.pbk'
-        Remove-Item $src, $dst -ErrorAction SilentlyContinue
-        "[Office VPN]`r`nType=2`r`nPhoneNumber=vpn.example.com`r`n`r`n[Backup Site]`r`nType=2`r`nPhoneNumber=10.0.0.1" | Set-Content $src -Encoding Default
-    }
-
-    It 'parses entry names' {
-        $names = @(Get-PmPbkEntries -Path $src | ForEach-Object { $_.Name })
-        $names | Should -Be @('Office VPN', 'Backup Site')
-    }
-
-    It 'returns an empty list for a missing file' {
-        # The function returns the list itself (comma operator), so count the list, not a wrapper array.
-        (Get-PmPbkEntries -Path (Join-Path $Work 'missing.pbk')).Count | Should -Be 0
-    }
-
-    It 'creates the target phonebook when it does not exist' {
-        $added = @(Merge-PmPbk -SourcePath $src -TargetPath $dst)
-        $added.Count | Should -Be 2
-        (Get-Content $dst -Raw) | Should -Match 'PhoneNumber=vpn.example.com'
-    }
-
-    It 'only appends entries that are missing and keeps existing ones untouched' {
-        "[Backup Site]`r`nType=2`r`nPhoneNumber=KEEP-ME" | Set-Content $dst -Encoding Default
-        $added = @(Merge-PmPbk -SourcePath $src -TargetPath $dst)
-        $added | Should -Be @('Office VPN')
-        $content = Get-Content $dst -Raw
-        $content | Should -Match 'KEEP-ME'
-        $content | Should -Not -Match 'PhoneNumber=10.0.0.1'
-    }
-
-    It 'is idempotent' {
-        [void](Merge-PmPbk -SourcePath $src -TargetPath $dst)
-        @(Merge-PmPbk -SourcePath $src -TargetPath $dst).Count | Should -Be 0
-    }
-
-    It 'keeps a pre-restore copy of an existing phonebook' {
-        "[Other]`r`nType=2" | Set-Content $dst -Encoding Default
-        [void](Merge-PmPbk -SourcePath $src -TargetPath $dst)
-        @(Get-ChildItem $Work -Filter 'dst.pbk.pre-restore-*').Count | Should -BeGreaterThan 0
-    }
 }
 
 Describe 'PRTG web server binding after a migration' {
@@ -107,18 +65,19 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         'hello' | Set-Content (Join-Path $extra 'sub\a.txt')
         $wr = Join-Path $Work 'wr'
 
-        $out = @(Invoke-PmRemoteBackup -JobId 'rt1' -WorkRoot $wr -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false -ExtraPaths @($extra))
+        $out = @(Invoke-PmRemoteBackup -JobId 'rt1' -WorkRoot $wr -IncludePrtg $false -IncludeDesktop $false -ExtraPaths @($extra))
         $res = $out | Where-Object PmType -eq 'result'
         $res | Should -Not -BeNullOrEmpty
         Test-Path $res.ZipPath | Should -BeTrue
         $res.Sha256 | Should -Be (Get-FileHash $res.ZipPath -Algorithm SHA256).Hash
 
         $manifest = Read-PmBackupManifest -ZipPath $res.ZipPath
-        $manifest.tool | Should -Be 'prtg-mover'
+        $manifest.tool | Should -Be 'prtg-manager'
+        $manifest.formatVersion | Should -Be 2
         @($manifest.extra).Count | Should -Be 1
 
         Remove-Item $extra -Recurse -Force
-        $out2 = @(Invoke-PmRemoteRestore -JobId 'rt2' -ZipPath $res.ZipPath -WorkRoot $wr -RestorePrtg $false -RestoreVpn $false -RestoreDesktop $false -RemovePackage $true)
+        $out2 = @(Invoke-PmRemoteRestore -JobId 'rt2' -ZipPath $res.ZipPath -WorkRoot $wr -RestorePrtg $false -RestoreDesktop $false -RemovePackage $true)
         ($out2 | Where-Object PmType -eq 'result').Report.Extra | Should -Be 'ok'
         Get-Content (Join-Path $extra 'sub\a.txt') | Should -Be 'hello'
         Test-Path $res.ZipPath | Should -BeFalse
@@ -126,7 +85,7 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
 
     It 'rejects a package whose checksum does not match' {
         $wr = Join-Path $Work 'wr-bad'
-        $out = @(Invoke-PmRemoteBackup -JobId 'rt4' -WorkRoot $wr -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false)
+        $out = @(Invoke-PmRemoteBackup -JobId 'rt4' -WorkRoot $wr -IncludePrtg $false -IncludeDesktop $false)
         $zip = ($out | Where-Object PmType -eq 'result').ZipPath
         { Invoke-PmRemoteRestore -JobId 'rt5' -ZipPath $zip -WorkRoot $wr -ExpectedSha256 'BAD' } | Should -Throw '*checksum mismatch*'
     }
@@ -136,7 +95,7 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         $x = Join-Path $Work 'pull-extra'
         New-Item -ItemType Directory -Force -Path (Join-Path $x 'Logs'), (Join-Path $x 'keep') | Out-Null
         'a' | Set-Content (Join-Path $x 'keep\a.txt'); 'b' | Set-Content (Join-Path $x 'Logs\b.log'); 'c' | Set-Content (Join-Path $x 'cache.tmp')
-        $out = @(Invoke-PmRemoteBackup -JobId 'pull1' -WorkRoot $wr -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false -PullMode $true)
+        $out = @(Invoke-PmRemoteBackup -JobId 'pull1' -WorkRoot $wr -IncludePrtg $false -IncludeDesktop $false -PullMode $true)
         $res = $out | Where-Object PmType -eq 'result'
         Test-Path (Join-Path $res.StageDir 'manifest.json') | Should -BeTrue
         $res.ZipPath | Should -BeNullOrEmpty
@@ -153,10 +112,10 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
         $x = Join-Path $Work 'move-extra'
         New-Item -ItemType Directory -Force -Path $x | Out-Null
         'moved' | Set-Content (Join-Path $x 'm.txt')
-        $out = @(Invoke-PmRemoteBackup -JobId 'mv1' -WorkRoot $wr -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false -ExtraPaths @($x) -PullMode $true)
+        $out = @(Invoke-PmRemoteBackup -JobId 'mv1' -WorkRoot $wr -IncludePrtg $false -IncludeDesktop $false -ExtraPaths @($x) -PullMode $true)
         $stage = ($out | Where-Object PmType -eq 'result').StageDir
         Remove-Item $x -Recurse -Force
-        $r = @(Invoke-PmRemoteRestore -JobId 'mv2' -StageDir $stage -WorkRoot $wr -RestorePrtg $false -RestoreVpn $false -RestoreDesktop $false -MoveFromStage $true -CleanupStage $true) | Where-Object PmType -eq 'result'
+        $r = @(Invoke-PmRemoteRestore -JobId 'mv2' -StageDir $stage -WorkRoot $wr -RestorePrtg $false -RestoreDesktop $false -MoveFromStage $true -CleanupStage $true) | Where-Object PmType -eq 'result'
         $r.Report.Extra | Should -Be 'ok'
         Get-Content (Join-Path $x 'm.txt') | Should -Be 'moved'
         Test-Path $stage | Should -BeFalse
@@ -182,7 +141,7 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
     }
 
     It 'emits only log / progress / result records' {
-        $out = @(Invoke-PmRemoteBackup -JobId 'rt3' -WorkRoot (Join-Path $Work 'wr3') -IncludePrtg $false -IncludeVpn $false -IncludeDesktop $false)
+        $out = @(Invoke-PmRemoteBackup -JobId 'rt3' -WorkRoot (Join-Path $Work 'wr3') -IncludePrtg $false -IncludeDesktop $false)
         @($out | Where-Object { $_.PmType -notin 'log', 'progress', 'result' }).Count | Should -Be 0
     }
 }
@@ -190,13 +149,18 @@ Describe 'Backup / restore round trip (local, no PRTG)' {
 Describe 'RDP agent transport (end to end, local)' {
     BeforeAll {
         $env:PRTGMOVER_TEST = '1'
-        $env:PRTGMOVER_TSCLIENT_ROOT = $Root   # the local "agent" reaches the manager folder directly, not via \\tsclient
-        Set-PmRoot -Path $Root   # the agent resolves the manager folder from its own location
+        # The agent resolves the manager folder from its own location. It runs from a copy of the program in the
+        # test folder, so the test never adds a server to, or writes packages / logs into, the real manager folder.
+        $script:AgentRoot = Join-Path $Work 'agent-manager'
+        New-Item -ItemType Directory -Force -Path $AgentRoot | Out-Null
+        foreach ($part in 'src', 'agent', 'VERSION') { Copy-Item -LiteralPath (Join-Path $Root $part) -Destination $AgentRoot -Recurse -Force }
+        $env:PRTGMOVER_TSCLIENT_ROOT = $AgentRoot   # the local "agent" reaches the manager folder directly, not via \\tsclient
+        Set-PmRoot -Path $AgentRoot
         $script:AgentSrv = Set-PmServer -Name 'PESTER-AGENT' -HostName '127.0.0.1' -Transport rdp
         $agentStart = @{
             FilePath = (Get-Process -Id $PID).Path
             PassThru = $true
-            ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'agent\PrtgMover-Agent.ps1'), '-ServerId', $script:AgentSrv.id, '-AllowNonAdmin')
+            ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $AgentRoot 'agent\PrtgManager-Agent.ps1'), '-ServerId', $script:AgentSrv.id, '-AllowNonAdmin')
         }
         # -WindowStyle is Windows PowerShell 5.1 only. PowerShell 7 rejects the parameter.
         if ($PSVersionTable.PSEdition -eq 'Desktop') { $agentStart.WindowStyle = 'Hidden' }
@@ -205,7 +169,7 @@ Describe 'RDP agent transport (end to end, local)' {
     AfterAll {
         if ($script:AgentProc) { Stop-Process -Id $AgentProc.Id -Force -ErrorAction SilentlyContinue }
         Remove-PmServer -Id $AgentSrv.id
-        Remove-Item -LiteralPath (Join-Path $Root "data\agent\$($AgentSrv.id)") -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $AgentRoot "data\agent\$($AgentSrv.id)") -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item Env:\PRTGMOVER_TEST, Env:\PRTGMOVER_TSCLIENT_ROOT -ErrorAction SilentlyContinue
     }
 
@@ -214,18 +178,18 @@ Describe 'RDP agent transport (end to end, local)' {
         New-Item -ItemType Directory -Force -Path $src | Out-Null
         'via-agent' | Set-Content (Join-Path $src 'f.txt')
         $job = New-PmJobObject -Type 'backup' -Summary 'pester'
-        $bk = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src); NoTouch = $true } -Job $job
+        $bk = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src); NoTouch = $true } -Job $job
         $file = $bk.Zip
         try {
             Test-Path -LiteralPath $file | Should -BeTrue
             # RDP mode stages directly on the manager
             Test-Path -LiteralPath (Join-Path $bk.StageDir 'manifest.json') | Should -BeTrue
             Remove-Item -LiteralPath $src -Recurse -Force
-            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $file -StageDir $bk.StageDir -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
+            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $file -StageDir $bk.StageDir -Options @{ RestorePrtg = $false; RestoreDesktop = $false } -Job $job
             $rep.Extra | Should -Be 'ok'
             Get-Content (Join-Path $src 'f.txt') | Should -Be 'via-agent'
             @($job.logs | Where-Object { $_.message -like '*direct staging on the manager*' }).Count | Should -BeGreaterThan 0
-            Test-Path -LiteralPath (Join-Path $Root "data\agent\$($AgentSrv.id)\agent.log") | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $AgentRoot "data\agent\$($AgentSrv.id)\agent.log") | Should -BeTrue
         } finally {
             Remove-PmBackup -Name (Split-Path $file -Leaf)
             Remove-Item -LiteralPath $bk.StageDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -237,16 +201,16 @@ Describe 'RDP agent transport (end to end, local)' {
         New-Item -ItemType Directory -Force -Path $src | Out-Null
         'from-zip' | Set-Content (Join-Path $src 'g.txt')
         $job = New-PmJobObject -Type 'restore' -Summary 'pester'
-        $bk = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src) } -Job $job
+        $bk = Invoke-PmBackupFlow -Server $AgentSrv -Options @{ IncludePrtg = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($src) } -Job $job
         Remove-Item -LiteralPath $bk.StageDir -Recurse -Force
         Remove-Item -LiteralPath $src -Recurse -Force
         try {
-            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $bk.Zip -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
+            $rep = Invoke-PmRestoreFlow -Server $AgentSrv -BackupPath $bk.Zip -Options @{ RestorePrtg = $false; RestoreDesktop = $false } -Job $job
             $rep.Extra | Should -Be 'ok'
             Get-Content (Join-Path $src 'g.txt') | Should -Be 'from-zip'
         } finally {
             Remove-PmBackup -Name (Split-Path $bk.Zip -Leaf)
-            Remove-Item -LiteralPath (Join-Path $Root ("data\staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($bk.Zip))) -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $AgentRoot ("data\staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($bk.Zip))) -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -319,12 +283,12 @@ Describe 'Parallel chunked transfer (local transport, same code path as WinRM)' 
         New-Item -ItemType Directory -Force -Path (Join-Path $x 'sub') | Out-Null
         'flow' | Set-Content (Join-Path $x 'sub\f.txt')
         $job = New-PmJobObject -Type 'migrate' -Summary 'flow'
-        $opt = @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($x); NoTouch = $true }
+        $opt = @{ IncludePrtg = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($x); NoTouch = $true }
         $bk = Invoke-PmBackupFlow -Server $Local -Options $opt -Job $job
         Test-Path $bk.Zip | Should -BeTrue
         Test-PmStageComplete -StageDir $bk.StageDir | Should -BeTrue
         Remove-Item $x -Recurse -Force
-        $rep = Invoke-PmRestoreFlow -Server $Local -BackupPath $bk.Zip -StageDir $bk.StageDir -Options @{ RestorePrtg = $false; RestoreVpn = $false; RestoreDesktop = $false } -Job $job
+        $rep = Invoke-PmRestoreFlow -Server $Local -BackupPath $bk.Zip -StageDir $bk.StageDir -Options @{ RestorePrtg = $false; RestoreDesktop = $false } -Job $job
         $rep.Extra | Should -Be 'ok'
         @($rep.Errors).Count | Should -Be 0
         Get-Content (Join-Path $x 'sub\f.txt') | Should -Be 'flow'
@@ -362,7 +326,7 @@ Describe 'Connectivity tests keep each method separately' {
     }
 }
 
-Describe 'Connection method "local": PRTG Mover on the server itself' {
+Describe 'Connection method "local": PRTG Manager on the server itself' {
     BeforeAll {
         $script:LocalRoot = Join-Path $Work 'manager-local'
         New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
@@ -388,7 +352,7 @@ Describe 'Connection method "local": PRTG Mover on the server itself' {
         $saved.methods.local.ok | Should -BeTrue
     }
 
-    It 'fails with a clear message when PRTG Mover has no administrator rights' -Skip:([bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    It 'fails with a clear message when PRTG Manager has no administrator rights' -Skip:([bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         $env:PRTGMOVER_TEST = $null
         { Invoke-PmTestFlow -Server (Get-PmServer -Id $Me.id) } | Should -Throw '*Run as administrator*'
         $saved = Get-Content (Join-Path $LocalRoot "data\status\$($Me.id).json") -Raw | ConvertFrom-Json
@@ -401,7 +365,7 @@ Describe 'Connection method "local": PRTG Mover on the server itself' {
         New-Item -ItemType Directory -Force -Path $x | Out-Null
         'local' | Set-Content (Join-Path $x 'l.txt')
         $job = New-PmJobObject -Type 'backup' -Summary 'local backup test'
-        $r = Invoke-PmBackupFlow -Server (Get-PmServer -Id $Me.id) -Options @{ IncludePrtg = $false; IncludeVpn = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($x); NoTouch = $true } -Job $job
+        $r = Invoke-PmBackupFlow -Server (Get-PmServer -Id $Me.id) -Options @{ IncludePrtg = $false; IncludeDesktop = $false; ExtraPaths = [string[]]@($x); NoTouch = $true } -Job $job
         Test-Path -LiteralPath $r.Zip | Should -BeTrue
         $r.Zip | Should -BeLike "$LocalRoot\backups\*"
         Test-PmStageComplete -StageDir $r.StageDir | Should -BeTrue
@@ -506,7 +470,8 @@ Describe 'Removing the PRTG license from a migrated server' -Skip:($env:OS -ne '
         @($r.Removed) | Should -Contain 'LicenseKey'
         @($r.Removed) | Should -Contain 'LicenseName'
         @($r.Removed) | Should -Contain 'PRTG License.dat'
-        (Get-Item "$($script:LicKey)\Server").GetValueNames() | Should -BeNullOrEmpty
+        @((Get-Item "$($script:LicKey)\Server").GetValueNames()) | Should -Be @('SensorCountPausedByLicenseMax') -Because "PRTG's own bookkeeping is not part of the license"
+        @($r.Removed) | Should -Not -Contain 'SensorCountPausedByLicenseMax'
         (Get-ItemProperty "$($script:LicKey)\Server\Core").SystemId | Should -Be '{1}'
         (Get-ItemProperty "$($script:LicKey)\Server\Core").Datapath | Should -Be $script:LicData
         Test-Path (Join-Path $script:LicData 'PRTG License.dat') | Should -BeFalse
@@ -547,7 +512,7 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         'old-token-of-an-earlier-version' | Set-Content (Join-Path $DashData 'data\token.txt')
         $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $script:DashPort = $l.LocalEndpoint.Port; $l.Stop()
         $script:DashProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-            (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $DashPort, '-NoBrowser', '-Quiet', '-DataRoot', $DashData
+            (Join-Path $Root 'Start-PrtgManager.ps1'), '-Port', $DashPort, '-NoBrowser', '-Quiet', '-DataRoot', $DashData
         $script:Dash = "http://localhost:$DashPort"
         $deadline = (Get-Date).AddSeconds(40)
         $script:DashPage = $null
@@ -602,7 +567,7 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
     It 'a second start on the same port ends without an error and leaves the dashboard running' {
         $out = Join-Path $Work 'second-start.txt'
         $second = Start-Process powershell -PassThru -WindowStyle Hidden -RedirectStandardOutput $out -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-            (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $DashPort, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work 'dash-data-2')
+            (Join-Path $Root 'Start-PrtgManager.ps1'), '-Port', $DashPort, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work 'dash-data-2')
         $null = $second.Handle   # without the handle Windows PowerShell does not report the exit code
         $second.WaitForExit(30000) | Should -BeTrue
         $second.ExitCode | Should -Be 0
@@ -615,7 +580,7 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $port = $l.LocalEndpoint.Port; $l.Stop()
         $both = foreach ($n in 1, 2) {
             Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $port, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work "dash-race-$n")
+                (Join-Path $Root 'Start-PrtgManager.ps1'), '-Port', $port, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work "dash-race-$n")
         }
         try {
             $both | ForEach-Object { $null = $_.Handle }
@@ -632,7 +597,7 @@ Describe 'Dashboard access (running dashboard)' -Skip:($env:OS -ne 'Windows_NT')
         $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start()
         try {
             $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                (Join-Path $Root 'Start-PrtgMover.ps1'), '-Port', $l.LocalEndpoint.Port, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work 'dash-data-3')
+                (Join-Path $Root 'Start-PrtgManager.ps1'), '-Port', $l.LocalEndpoint.Port, '-NoBrowser', '-Quiet', '-DataRoot', (Join-Path $Work 'dash-data-3')
             $null = $p.Handle
             $p.WaitForExit(30000) | Should -BeTrue
             $p.ExitCode | Should -Be 1
@@ -788,46 +753,7 @@ Describe 'WireGuard tunnel config' {
     }
 }
 
-Describe 'Routes of a VPN connection (format vpn-routes/1)' {
-    It 'converts prefix lengths and masks' {
-        ConvertTo-PmIPv4Mask 24 | Should -Be '255.255.255.0'
-        ConvertTo-PmIPv4Mask 32 | Should -Be '255.255.255.255'
-        ConvertTo-PmIPv4Mask 0 | Should -Be '0.0.0.0'
-        ConvertTo-PmPrefixLength '255.255.255.0' | Should -Be 24
-        ConvertTo-PmPrefixLength '255.255.255.255' | Should -Be 32
-    }
-
-    It 'knows whether a gateway lies inside a network' {
-        Test-PmAddressInPrefix -Address '192.168.25.1' -Prefix '192.168.25.0/24' | Should -BeTrue
-        Test-PmAddressInPrefix -Address '192.168.26.1' -Prefix '192.168.25.0/24' | Should -BeFalse
-        Test-PmAddressInPrefix -Address '10.0.0.2' -Prefix '10.0.0.2/32' | Should -BeTrue
-        Test-PmAddressInPrefix -Address 'not-an-address' -Prefix '10.0.0.0/8' | Should -BeFalse
-    }
-
-    It 'writes a backup in the shared format, also for a VPN that does not exist or is not connected' {
-        $b = Get-PmVpnRouteBackup -Name 'no-such-vpn-for-the-test'
-        $b.format | Should -Be 'vpn-routes/1'
-        $b.vpn | Should -Be 'no-such-vpn-for-the-test'
-        $b.computer | Should -Be $env:COMPUTERNAME
-        $b.tunnelIp | Should -BeNullOrEmpty
-        @($b.liveRoutes).Count | Should -Be 0
-        $json = ConvertTo-Json -InputObject $b -Depth 5 | ConvertFrom-Json
-        foreach ($k in 'format', 'computer', 'vpn', 'created', 'tunnelIp', 'connectionRoutes', 'liveRoutes', 'persistentRoutes') { $json.PSObject.Properties.Name | Should -Contain $k }
-        [datetimeoffset]::Parse($json.created) | Should -Not -BeNullOrEmpty
-    }
-
-    It 'keeps persistent routes that wait for a VPN when the VPN is not connected, marked as assumed' {
-        Mock Get-PmPersistentRoutes { @(
-                [ordered]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '203.0.113.77'; metric = 1 },   # no connected network reaches this gateway
-                [ordered]@{ prefix = '10.99.0.0/16'; mask = '255.255.0.0'; gateway = '198.51.100.5'; metric = 1 }) }   # reachable over a connected network: not a VPN route
-        Mock Get-NetRoute { @([pscustomobject]@{ NextHop = '0.0.0.0'; DestinationPrefix = '127.0.0.0/8' }, [pscustomobject]@{ NextHop = '0.0.0.0'; DestinationPrefix = '198.51.100.0/24' }) }
-        $b = Get-PmVpnRouteBackup -Name 'no-such-vpn-for-the-test'
-        $b.scope | Should -Be 'AllUsers'
-        @($b.persistentRoutes).Count | Should -Be 1
-        $b.persistentRoutes[0].prefix | Should -Be '192.168.91.0/24'
-        $b.persistentRoutes[0].assumed | Should -BeTrue
-    }
-
+Describe 'Credentials of the manager' {
     It 'reads a credential of another Windows account as a clear error, not as a missing password' {
         $root = Join-Path $Work 'manager-foreign-credential'
         New-Item -ItemType Directory -Force -Path $root | Out-Null
@@ -840,45 +766,477 @@ Describe 'Routes of a VPN connection (format vpn-routes/1)' {
         [IO.File]::WriteAllText((Join-Path (Get-PmPath Credentials) "$($srv.id).cred.xml"), $xml)
         { Get-PmCredential -ServerId $srv.id } | Should -Throw '*another Windows account*'
     }
+}
 
-    It 'leaves routes alone that are already there and reports a connection that does not exist' {
-        Mock Get-PmPersistentRoutes { @([ordered]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '10.0.0.2'; metric = 1 }) }
-        Mock Write-PmLog { }
-        $backup = [pscustomobject]@{ vpn = 'no-such-vpn-for-the-test'; connectionRoutes = @([pscustomobject]@{ prefix = '8.8.8.8/32'; metric = 1 })
-            persistentRoutes = @([pscustomobject]@{ prefix = '192.168.91.0/24'; mask = '255.255.255.0'; gateway = '10.0.0.2'; metric = 1 }) }
-        $r = Restore-PmVpnRoutes -Backup $backup
-        $r.kept | Should -Be 1
-        $r.added | Should -Be 0
-        $r.failed | Should -Be 1
+Describe 'Backup password encryption' {
+    It 'round-trips bytes and says clearly when the password is wrong or the data was changed' {
+        $data = [Text.Encoding]::UTF8.GetBytes('license key and friends ' * 20)
+        $env1 = Protect-PmBytes -Data $data -Password 'correct horse'
+        [Text.Encoding]::ASCII.GetString($env1, 0, 6) | Should -Be 'PMENC1'
+        [Text.Encoding]::UTF8.GetString((Unprotect-PmBytes -Envelope $env1 -Password 'correct horse')) | Should -Be ([Text.Encoding]::UTF8.GetString($data))
+        { Unprotect-PmBytes -Envelope $env1 -Password 'wrong password' } | Should -Throw '*password is wrong or the file was changed*'
+        $env1[50] = $env1[50] -bxor 1
+        { Unprotect-PmBytes -Envelope $env1 -Password 'correct horse' } | Should -Throw '*HMAC mismatch*'
+    }
+    It 'refuses a password shorter than 8 characters' {
+        { Protect-PmBytes -Data ([byte[]](1, 2, 3)) -Password 'short' } | Should -Throw '*at least 8 characters*'
+    }
+    It 'encrypts and decrypts files of any size and writes nothing with a wrong password' {
+        $f = Join-Path $Work 'enc.bin'; $b = New-Object byte[] (2MB + 77); (New-Object Random 7).NextBytes($b); [IO.File]::WriteAllBytes($f, $b)
+        Protect-PmFile -Source $f -Destination "$f.pmenc" -Password 'correct horse'
+        [void](Test-PmEncryptedFile -Path "$f.pmenc" -Password 'correct horse')
+        Unprotect-PmFile -Source "$f.pmenc" -Destination "$f.out" -Password 'correct horse'
+        (Get-FileHash "$f.out").Hash | Should -Be (Get-FileHash $f).Hash
+        { Unprotect-PmFile -Source "$f.pmenc" -Destination "$f.bad" -Password 'wrong password' } | Should -Throw '*HMAC mismatch*'
+        Test-Path "$f.bad" | Should -BeFalse
+    }
+    It 'packs large XML into a small object for WinRM and back' {
+        $x = '<a>' + ('<b id="1">text</b>' * 5000) + '</a>'
+        $p = ConvertTo-PmPackedText $x
+        $p.Length | Should -BeLessThan ($x.Length / 10)
+        ConvertFrom-PmPackedText $p | Should -Be $x
     }
 }
 
-Describe 'Backups are listed as PRTG or VPN' {
-    It 'tells the kind of a backup from its contents' {
-        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $true }; vpn = [pscustomobject]@{ included = $true } }) | Should -Be 'prtg'
-        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $false }; vpn = [pscustomobject]@{ included = $true } }) | Should -Be 'vpn'
-        Get-PmBackupKind -Manifest ([pscustomobject]@{ prtg = [pscustomobject]@{ included = $false }; vpn = [pscustomobject]@{ included = $false } }) | Should -Be 'files'
-        Get-PmBackupKind -Manifest $null -Name 'VPN_SERVER_20260101-000000.zip' | Should -Be 'vpn'
-        Get-PmBackupKind -Manifest $null -Name 'PRTG_SERVER_20260101-000000.zip' | Should -Be 'prtg'
+Describe 'PRTG configuration parts (devices, notifications, triggers)' {
+    BeforeAll {
+        $script:CfgXml = @'
+<?xml version="1.0" encoding="UTF-8"?>
+<root version="30" oct="PRTG Network Monitor 25.4.114.1032 x64" max="700" guid="{11111111-2222-3333-4444-555555555555}">
+  <basenode id="-99"><data><name>root</name></data><nodes>
+    <group id="0"><data><name>Root</name></data><trigger><state id="1"><data><onnotificationid>300</onnotificationid><latency>60</latency></data></state></trigger><nodes>
+      <probenode id="1"><data><name>Local Probe</name></data><nodes>
+        <group id="10"><data><name>Servers</name></data><nodes>
+          <device id="40"><data><name>Web</name><schedule>-1</schedule><dependency></dependency><interval>60</interval><windowsloginpassword><flags/><cell crypt="PRTGv2">AAAAencrypted1111</cell></windowsloginpassword></data><nodes>
+            <sensor id="41"><data><name>Ping</name></data><channels><channel id="0"/></channels><trigger><threshold id="1"><data><onnotificationid>301</onnotificationid></data></threshold></trigger></sensor>
+            <sensor id="42"><data><name>HTTP</name><dependency>41</dependency></data></sensor>
+          </nodes></device>
+          <device id="50"><data><name>DB</name><dependency>41</dependency></data><nodes><sensor id="51"><data><name>Ping</name></data></sensor></nodes></device>
+        </nodes></group>
+      </nodes></probenode>
+    </nodes></group>
+    <basenode id="-3"><data><name>Notifications</name></data><nodes>
+      <notification id="300"><data><name>Mail admin</name><schedule>600</schedule></data><notifies><email id="0"/></notifies></notification>
+      <notification id="301"><data><name>Push</name><schedule>-1</schedule></data></notification>
+    </nodes></basenode>
+    <basenode id="-7"><data><name>Schedules</name></data><nodes><schedule id="600"><data><name>Weekdays</name></data></schedule></nodes></basenode>
+  </nodes></basenode>
+</root>
+'@
+        $script:NewTarget = { Read-PmXmlText $script:CfgXml }
+        $script:Part = { param([string]$Type) Read-PmXmlText (ConvertTo-PmXmlText (Export-PmConfigSection -Doc (& $script:NewTarget) -Type $Type)) }
+        $script:Drop = { param($Doc, [string]$XPath) $n = $Doc.SelectSingleNode($XPath); [void]$n.ParentNode.RemoveChild($n) }
+        $script:DupIds = { param($Doc) $seen = @{}; $d = 0; foreach ($e in $Doc.SelectNodes('//nodes/*[@id]')) { $i = $e.GetAttribute('id'); if ($seen.ContainsKey($i)) { $d++ } else { $seen[$i] = 1 } }; $d }
     }
 
-    It 'makes a VPN backup of this computer with the routes of every connection' {
-        $root = Join-Path $Work 'manager-vpn-backup'
-        New-Item -ItemType Directory -Force -Path $root | Out-Null
-        Set-PmRoot -Path $root
-        $me = Set-PmServer -Name 'THIS' -HostName 'localhost' -Transport local -Role both
-        $old = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'
-        try {
-            $job = New-PmJobObject -Type 'backup' -Summary 'vpn backup test'
-            $r = Invoke-PmBackupFlow -Server (Get-PmServer -Id $me.id) -Options @{ IncludePrtg = $false; IncludeVpn = $true; IncludeDesktop = $false; NoTouch = $true } -Job $job
-        } finally { $env:PRTGMOVER_TEST = $old }
-        (Split-Path $r.Zip -Leaf) | Should -BeLike 'VPN_*'
-        $b = @(Get-PmBackups | ForEach-Object { $_ }) | Where-Object { $_.name -eq (Split-Path $r.Zip -Leaf) }
-        $b.kind | Should -Be 'vpn'
-        $b.manifest.vpn.included | Should -BeTrue
-        foreach ($route in @($b.manifest.vpn.routes | Where-Object { $_ })) {
-            Test-Path -LiteralPath (Join-Path $r.StageDir "vpn\routes\$($route.file)") | Should -BeTrue
-            (Get-Content -LiteralPath (Join-Path $r.StageDir "vpn\routes\$($route.file)") -Raw | ConvertFrom-Json).format | Should -Be 'vpn-routes/1'
+    It 'exports each part with its counts, format and PRTG version' {
+        $d = Get-PmSectionSummary (& $Part 'devices')
+        $d.probenode | Should -Be 1; $d.group | Should -Be 2; $d.device | Should -Be 2; $d.sensor | Should -Be 3; $d.triggers | Should -Be 2
+        $d.prtgVersion | Should -Be '25.4.114.1032'; $d.configVersion | Should -Be '30'
+        $n = Get-PmSectionSummary (& $Part 'notifications'); $n.notifications | Should -Be 2; $n.schedules | Should -Be 1
+        $t = Get-PmSectionSummary (& $Part 'triggers'); $t.objects | Should -Be 2; $t.triggers | Should -Be 2; $t.kinds | Should -Be 'state=1, threshold=1'
+    }
+
+    It 'plans nothing for a target that already has everything' {
+        foreach ($type in 'devices', 'notifications', 'triggers') {
+            $p = Get-PmSectionRestorePlan -Target (& $NewTarget) -Section (& $Part $type)
+            $p.Counts.create + $p.Counts.update + $p.Counts.conflict | Should -Be 0
+            @($p.Blockers).Count | Should -Be 0
         }
+    }
+
+    It 'creates a missing device with its sensors under the same group and the same ids' {
+        $t = & $NewTarget; & $Drop $t "//device[@id='40']"
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices')
+        $p.Counts.create | Should -Be 3
+        @($p.MissingDependencies).Count | Should -Be 0   # 42 and 50 depend on 41, which this restore creates
+        $r = Invoke-PmSectionMerge -Target $t -Section (& $Part 'devices') -Plan $p
+        $r.Counts.created | Should -Be 3
+        $dev = $t.SelectSingleNode("//group[@id='10']/nodes/device[@id='40']")
+        $dev | Should -Not -BeNullOrEmpty
+        @($dev.SelectNodes('nodes/sensor')).Count | Should -Be 2
+        (Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices')).Counts.create | Should -Be 0
+    }
+
+    It 'reports a dependency that is neither on the target nor in the backup' {
+        $sec = & $Part 'devices'
+        $sec.SelectSingleNode("//device[@id='50']/data/dependency").InnerText = '999'
+        $t = & $NewTarget; & $Drop $t "//device[@id='50']"
+        $p = Get-PmSectionRestorePlan -Target $t -Section $sec
+        @($p.MissingDependencies) -join ' ' | Should -Match 'Object 999'
+    }
+
+    It 'treats an id used by another object as a conflict, and re-ids the object with its children on request' {
+        $t = & $NewTarget
+        $t.SelectSingleNode("//device[@id='40']/data/name").InnerText = 'Something else'
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices') -Mode merge
+        $p.Counts.conflict | Should -Be 1
+        (@($p.Items | Where-Object { $_.Id -eq 41 })[0]).Action | Should -Be 'skip'
+        $p2 = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices') -Mode merge -ReIdConflicts $true
+        @($p2.Items | Where-Object Action -eq 'create-new-id').Count | Should -Be 3
+        $r = Invoke-PmSectionMerge -Target $t -Section (& $Part 'devices') -Plan $p2
+        $r.Counts.reIded | Should -Be 3
+        & $DupIds $t | Should -Be 0
+        [int]$t.DocumentElement.GetAttribute('max') | Should -Be 703
+        # the dependency inside the moved subtree follows the new ids
+        $new41 = $r.IdMap[41]; $new42 = $r.IdMap[42]
+        $t.SelectSingleNode("//sensor[@id='$new42']/data/dependency").InnerText | Should -Be ([string]$new41)
+    }
+
+    It 'keeps existing objects in merge mode and updates their settings in overwrite mode' {
+        $t = & $NewTarget
+        $t.SelectSingleNode("//device[@id='40']/data/interval").InnerText = '300'
+        (Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices') -Mode merge).Counts.update | Should -Be 0
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices') -Mode overwrite
+        $p.Counts.update | Should -Be 1
+        [void](Invoke-PmSectionMerge -Target $t -Section (& $Part 'devices') -Plan $p)
+        $t.SelectSingleNode("//device[@id='40']/data/interval").InnerText | Should -Be '60'
+        @($t.SelectNodes("//device[@id='40']/nodes/sensor")).Count | Should -Be 2
+    }
+
+    It 'does not count values PRTG re-encrypted on a save as a change' {
+        $t = & $NewTarget
+        $t.SelectSingleNode("//device[@id='40']/data/windowsloginpassword/cell").InnerText = 'BBBBreencrypted222'
+        # a timestamp PRTG keeps up to date by itself is no setting either
+        $ts = $t.CreateElement('location_last_updated'); $ts.InnerText = '46294.5'; [void]$t.SelectSingleNode("//device[@id='40']/data").AppendChild($ts)
+        (Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices') -Mode overwrite).Counts.update | Should -Be 0
+    }
+
+    It 'warns that encrypted values may not be readable when the backup comes from another PRTG installation' {
+        $t = & $NewTarget; $t.DocumentElement.SetAttribute('guid', '{99999999-0000-0000-0000-000000000000}')
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'devices')
+        (@($p.Warnings) -join ' ') | Should -Match 'another PRTG installation'
+        @((Get-PmSectionRestorePlan -Target (& $NewTarget) -Section (& $Part 'devices')).Warnings).Count | Should -Be 0
+    }
+
+    It 'blocks a backup made with a newer configuration format' {
+        $sec = & $Part 'devices'; $sec.DocumentElement.SetAttribute('configversion', '31')
+        $p = Get-PmSectionRestorePlan -Target (& $NewTarget) -Section $sec
+        @($p.Blockers).Count | Should -Be 1
+        $p.Blockers[0] | Should -Match 'newer PRTG'
+    }
+
+    It 'restores a notification together with the schedule it uses' {
+        $t = & $NewTarget; & $Drop $t "//notification[@id='300']"; & $Drop $t "//schedule[@id='600']"
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'notifications')
+        @($p.Items | Where-Object Action -eq 'create' | ForEach-Object { "$($_.Type) $($_.Id)" }) | Sort-Object | Should -Be @('notification 300', 'schedule 600')
+        [void](Invoke-PmSectionMerge -Target $t -Section (& $Part 'notifications') -Plan $p)
+        $t.SelectSingleNode("//basenode[@id='-3']/nodes/notification[@id='300']") | Should -Not -BeNullOrEmpty
+        $t.SelectSingleNode("//basenode[@id='-7']/nodes/schedule[@id='600']") | Should -Not -BeNullOrEmpty
+    }
+
+    It 'adds missing triggers, treats a changed one as a conflict in merge and updates it in overwrite' {
+        $t = & $NewTarget; & $Drop $t "//sensor[@id='41']/trigger/threshold"
+        $t.SelectSingleNode("//group[@id='0']/trigger/state/data/latency").InnerText = '999'
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'triggers') -Mode merge
+        $p.Counts.create | Should -Be 1; $p.Counts.conflict | Should -Be 1
+        $p2 = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'triggers') -Mode overwrite
+        [void](Invoke-PmSectionMerge -Target $t -Section (& $Part 'triggers') -Plan $p2)
+        $t.SelectSingleNode("//sensor[@id='41']/trigger/threshold") | Should -Not -BeNullOrEmpty
+        $t.SelectSingleNode("//group[@id='0']/trigger/state/data/latency").InnerText | Should -Be '60'
+    }
+
+    It 'names a notification a restored trigger needs when the target does not have it' {
+        $t = & $NewTarget; & $Drop $t "//notification[@id='301']"; & $Drop $t "//sensor[@id='41']/trigger/threshold"
+        $p = Get-PmSectionRestorePlan -Target $t -Section (& $Part 'triggers')
+        @($p.MissingDependencies) -join ' ' | Should -Match 'Notification template 301'
+    }
+
+    It 'writes the configuration with its byte order mark, via a file that must parse' {
+        $f = Join-Path $Work 'PRTG Configuration.dat'
+        [IO.File]::WriteAllText($f, $CfgXml, (New-Object Text.UTF8Encoding($true)))
+        $d = Read-PmPrtgConfig -Path $f
+        $d.SelectSingleNode("//device[@id='40']/data/name").InnerText = 'Web 2'
+        Save-PmPrtgConfig -Doc $d -Path $f
+        ([IO.File]::ReadAllBytes($f))[0..2] | Should -Be @(0xEF, 0xBB, 0xBF)
+        (Read-PmPrtgConfig -Path $f).SelectSingleNode("//device[@id='40']/data/name").InnerText | Should -Be 'Web 2'
+        Test-Path "$f.pm-new" | Should -BeFalse
+    }
+}
+
+Describe 'History (graph data)' {
+    It 'lists history files by day and device and leaves out old days on request' {
+        $root = Join-Path $Work 'mdb'
+        $today = (Get-Date).ToString('yyyyMMdd')
+        foreach ($d in '20000101', $today) { New-Item -ItemType Directory -Force -Path (Join-Path $root $d) | Out-Null; 'x' | Set-Content (Join-Path $root "$d\Device 40.prd"); 'y' | Set-Content (Join-Path $root "$d\Device 99.prd") }
+        @(Get-PmGraphFiles -Root $root).Count | Should -Be 4
+        $recent = @(Get-PmGraphFiles -Root $root -Days 7)
+        $recent.Count | Should -Be 2
+        @($recent | ForEach-Object { $_.Device } | Sort-Object) | Should -Be @(40, 99)
+        @(Get-PmGraphDayFolders -Root $root -Days 7) | Should -Be @((Join-Path $root '20000101'))
+    }
+    It 'plans new and existing files and warns about devices the target does not have' {
+        $files = @([pscustomobject]@{ Rel = '20260101\Device 40.prd'; Device = 40; Size = 10 }, [pscustomobject]@{ Rel = '20260101\Device 99.prd'; Device = 99; Size = 20 })
+        $m = Get-PmGraphRestorePlan -Files $files -TargetFiles @('20260101\device 40.prd') -TargetDevices @(40) -Mode merge
+        $m.New | Should -Be 1; $m.Existing | Should -Be 1; $m.Keep | Should -Be 1; $m.Replace | Should -Be 0; $m.NewBytes | Should -Be 20
+        @($m.UnknownDevices) | Should -Be @(99)
+        $m.Warnings[0] | Should -Match 'not in the target configuration'
+        (Get-PmGraphRestorePlan -Files $files -TargetFiles @('20260101\Device 40.prd') -TargetDevices @(40, 99) -Mode overwrite).Replace | Should -Be 1
+    }
+}
+
+Describe 'Backup catalogue (types, versions, encryption, validation)' {
+    BeforeAll {
+        $script:Cat = Join-Path $Work 'catalogue'
+        New-Item -ItemType Directory -Force -Path $Cat | Out-Null
+        Set-PmRoot -Path $Cat
+        $script:NewPart = {
+            param([string]$Type = 'devices', [string]$Password)
+            $m = New-PmManifestV2 -Type $Type -Computer 'SRC1' -Os 'Windows Server' -Server 'Prtg-Old' -PrtgVersion '25.4.114.1032' -JobId 'test'
+            $m.sections = @($Type); $m.counts = [ordered]@{ device = 2; sensor = 3 }
+            $zip = Join-Path (Get-PmPath Backups) ("PRTG-{0}_SRC1_{1}.zip" -f $Type.ToUpperInvariant(), [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-PmZipFromFiles -ZipPath $zip -Manifest $m -Files @{ "$Type.xml" = [Text.Encoding]::UTF8.GetBytes('<prtgmanagersection type="devices" configversion="30" prtgversion="25.4.114.1032"><tree/></prtgmanagersection>') }
+            Complete-PmPackage -ZipPath $zip -Manifest $m -Source 'Prtg-Old' -Password $Password
+        }
+    }
+
+    It 'lists a part package with its type, format version, versions and checksum, and validates it' {
+        $f = & $NewPart 'devices'
+        $b = @(Get-PmBackups) | Where-Object { $_.name -eq (Split-Path $f -Leaf) }
+        $b.type | Should -Be 'devices'; $b.formatVersion | Should -Be 2; $b.prtgVersion | Should -Be '25.4.114.1032'; $b.encrypted | Should -BeFalse
+        $b.sha256 | Should -Be (Get-FileHash $f).Hash
+        $v = Test-PmBackupPackage -Name (Split-Path $f -Leaf)
+        $v.valid | Should -BeTrue
+        @($v.checks | Where-Object { $_.check -like 'File devices.xml' -and $_.ok }).Count | Should -Be 1
+        (@(Get-PmBackups) | Where-Object { $_.name -eq (Split-Path $f -Leaf) }).valid | Should -BeTrue
+    }
+
+    It 'finds a changed file inside a package' {
+        $f = & $NewPart 'triggers'
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $z = [IO.Compression.ZipFile]::Open($f, [IO.Compression.ZipArchiveMode]::Update)
+        try { $e = $z.GetEntry('triggers.xml'); $s = $e.Open(); $s.SetLength(0); $b = [Text.Encoding]::UTF8.GetBytes('<changed/>'); $s.Write($b, 0, $b.Length); $s.Dispose() } finally { $z.Dispose() }
+        $v = Test-PmBackupPackage -Name (Split-Path $f -Leaf)
+        $v.valid | Should -BeFalse
+        ($v.errors -join ' ') | Should -Match 'checksum does not match|changed since'
+    }
+
+    It 'encrypts a package on request and checks the password during validation' {
+        $f = & $NewPart 'notifications' 'backup-pass-1'
+        $f | Should -BeLike '*.pmenc'
+        Test-Path ([IO.Path]::ChangeExtension($f, '.zip')) | Should -BeFalse
+        $b = @(Get-PmBackups) | Where-Object { $_.name -eq (Split-Path $f -Leaf) }
+        $b.encrypted | Should -BeTrue; $b.type | Should -Be 'notifications'
+        (Test-PmBackupPackage -Name (Split-Path $f -Leaf)).valid | Should -BeTrue
+        (Test-PmBackupPackage -Name (Split-Path $f -Leaf) -Password 'backup-pass-1').valid | Should -BeTrue
+        $bad = Test-PmBackupPackage -Name (Split-Path $f -Leaf) -Password 'not the password'
+        $bad.valid | Should -BeFalse
+        ($bad.errors -join ' ') | Should -Match 'password is wrong'
+        $pkg = Read-PmSectionPackage -Path $f -Password 'backup-pass-1'
+        $pkg.Type | Should -Be 'notifications'
+        ConvertFrom-PmPackedText $pkg.Packed | Should -Match 'prtgmanagersection'
+        @(Get-ChildItem (Join-Path $Cat 'data\staging') -Filter 'decrypted-*' -ErrorAction SilentlyContinue).Count | Should -Be 0
+        { Read-PmSectionPackage -Path $f } | Should -Throw '*encrypted*password*'
+    }
+
+    It 'inspects a package without any secret and knows old package names and formats' {
+        $f = & $NewPart 'devices'
+        $d = Get-PmBackupDetails -Name (Split-Path $f -Leaf)
+        $d.type | Should -Be 'devices'; $d.manifest.formatVersion | Should -Be 2; $d.entries | Should -Be 2
+        @($d.files | ForEach-Object { $_.path }) | Should -Contain 'devices.xml'
+        Get-PmBackupType -Manifest ([pscustomobject]@{ tool = 'prtg-mover'; formatVersion = 1; prtg = [pscustomobject]@{ included = $true } }) | Should -Be 'full'
+        Get-PmBackupType -Manifest $null -Name 'PRTG-GRAPHS_S_20260101-000000.zip' | Should -Be 'graphs'
+        Get-PmBackupType -Manifest $null -Name 'VPN_S_20260101-000000.zip' | Should -Be 'vpn'
+    }
+
+    It 'does not list VPN-only packages of PRTG Mover (they belong to VPN Manager)' {
+        $zip = Join-Path (Get-PmPath Backups) 'VPN_SRC1_20260101-000000.zip'
+        $m = [ordered]@{ tool = 'prtg-mover'; formatVersion = 1; source = @{ computer = 'SRC1' }; prtg = @{ included = $false }; vpn = @{ included = $true } }
+        New-PmZipFromFiles -ZipPath $zip -Manifest $m -Files @{ 'vpn/x.txt' = [byte[]](1) }
+        Register-PmBackup -ZipPath $zip
+        @(Get-PmBackups | Where-Object { $_.name -eq 'VPN_SRC1_20260101-000000.zip' }).Count | Should -Be 0
+        @(Get-PmBackups -IncludeVpn | Where-Object { $_.name -eq 'VPN_SRC1_20260101-000000.zip' }).Count | Should -Be 1
+    }
+
+    It 'moves a deleted package to the Recycle Bin instead of deleting it' {
+        $f = & $NewPart 'devices'
+        $bin = Join-Path $Work 'recycle'; New-Item -ItemType Directory -Force -Path $bin | Out-Null
+        $old = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'; $env:PRTGMANAGER_RECYCLE = $bin
+        try { Remove-PmBackup -Name (Split-Path $f -Leaf) } finally { $env:PRTGMOVER_TEST = $old; Remove-Item Env:\PRTGMANAGER_RECYCLE }
+        Test-Path $f | Should -BeFalse
+        Test-Path (Join-Path $bin (Split-Path $f -Leaf)) | Should -BeTrue
+        Test-Path (Join-Path $bin ((Split-Path $f -Leaf) + '.meta.json')) | Should -BeTrue
+    }
+
+    It 'keeps passwords out of job records, job logs and the audit trail' {
+        $f = & $NewPart 'devices' 'Very-Secret-Pw-42'
+        $job = Start-PmJob -Type 'validate' -Params @{ BackupName = (Split-Path $f -Leaf); Secrets = @{ Password = 'Very-Secret-Pw-42' } } -Summary 'validate test'
+        $deadline = (Get-Date).AddSeconds(60)
+        do { Start-Sleep -Milliseconds 300; $j = Get-PmJob -Id $job.id } while ($j.status -in 'queued', 'running' -and (Get-Date) -lt $deadline)
+        $j.status | Should -Be 'succeeded'
+        $j.result.valid | Should -BeTrue
+        $j.result.passwordChecked | Should -BeTrue
+        foreach ($file in @(Get-ChildItem (Get-PmPath Jobs) -File) + @(Get-ChildItem (Join-Path (Get-PmPath Data) 'logs') -File -Recurse)) {
+            [IO.File]::ReadAllText($file.FullName) | Should -Not -Match 'Very-Secret-Pw-42'
+        }
+        $j.resumable | Should -BeFalse
+    }
+}
+
+Describe 'Restore preview of a full package' {
+    BeforeAll {
+        $script:Man = [pscustomobject]@{ stagingBytes = 5GB; prtg = [pscustomobject]@{ included = $true; version = '25.4.114.1032'; configStats = 'devices=27'; includeHistory = $true; programCloned = $true; programFolders = @('cert'); netFrameworkRelease = 528049 } }
+        $script:Facts = { param([string]$Version = '25.4.114.1032', [bool]$Installed = $true, [int64]$Free = 100GB) [pscustomobject]@{ Computer = 'NEW'; IsAdmin = $true; Prtg = [pscustomobject]@{ Installed = $Installed; Version = $Version }; ConfigStats = 'devices=3'; DataBytes = 1GB; FreeBytes = $Free; NetRelease = 528049; License = $null } }
+    }
+    It 'shows what is replaced and how it is rolled back' {
+        $p = Get-PmFullRestorePreview -Manifest $Man -Facts (& $Facts)
+        @($p.Blockers).Count | Should -Be 0
+        @($p.Items | ForEach-Object { $_.Item }) | Should -Contain 'PRTG configuration'
+        $p.Rollback | Should -Match 'automatic'
+    }
+    It 'blocks an older target, too little disk space and a target without PRTG and without program clone' {
+        (Get-PmFullRestorePreview -Manifest $Man -Facts (& $Facts '24.1.0.1')).Blockers[0] | Should -Match 'older than the backup'
+        (Get-PmFullRestorePreview -Manifest $Man -Facts (& $Facts '24.1.0.1') -Options @{ AllowDowngrade = $true }).Warnings[0] | Should -Match 'older'
+        (Get-PmFullRestorePreview -Manifest $Man -Facts (& $Facts -Free 1GB)).Blockers[0] | Should -Match 'Not enough free space'
+        $noClone = [pscustomobject]@{ stagingBytes = 1; prtg = [pscustomobject]@{ included = $true; version = '25.4.114.1032'; programCloned = $false; programFolders = @() } }
+        (Get-PmFullRestorePreview -Manifest $noClone -Facts (& $Facts -Installed $false)).Blockers[0] | Should -Match 'not installed on the target'
+    }
+    It 'never restores into a server marked as source' {
+        { Assert-PmNotSource -Server ([pscustomobject]@{ name = 'OLD'; role = 'source' }) -What 'restore into' } | Should -Throw '*marked as a source*'
+        { Assert-PmNotSource -Server ([pscustomobject]@{ name = 'NEW'; role = 'target' }) } | Should -Not -Throw
+        { Invoke-PmSectionRestoreFlow -Server ([pscustomobject]@{ id = 's'; name = 'OLD'; role = 'source'; transport = 'winrm'; host = '192.0.2.1' }) -Path 'x.zip' } | Should -Throw '*marked as a source*'
+    }
+}
+
+Describe 'PRTG license: install, backup, restore' -Skip:($env:OS -ne 'Windows_NT') {
+    BeforeAll {
+        $script:LicKey2 = "HKCU:\Software\PrtgManagerLicTest-$([guid]::NewGuid().ToString('N'))"
+        $script:LicData2 = Join-Path $Work 'lic2-data'
+        $env:PRTGMOVER_WORKROOT = Join-Path $Work 'lic2-workroot'
+    }
+    AfterAll {
+        Remove-Item -LiteralPath $script:LicKey2 -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item Env:\PRTGMOVER_WORKROOT -ErrorAction SilentlyContinue
+    }
+    BeforeEach {
+        Remove-Item -LiteralPath $script:LicKey2 -Recurse -Force -ErrorAction SilentlyContinue
+        New-Item -Path "$($script:LicKey2)\Server\Core" -Force | Out-Null
+        Set-ItemProperty -Path "$($script:LicKey2)\Server" -Name LicenseHash -Value 'old-activation'
+        Set-ItemProperty -Path "$($script:LicKey2)\Server" -Name LicenseInstalled -Value ([byte[]](1, 2, 3)) -Type Binary
+        New-Item -ItemType Directory -Force -Path $script:LicData2 | Out-Null
+        Mock Test-PmIsAdmin { $true }
+        Mock Get-PmPrtgInfo { [pscustomobject]@{ Installed = $true; DataPath = $script:LicData2; RegistryKeys = @($script:LicKey2); ListenPorts = @(); CoreStatus = 'Running'; Version = '25.4.114.1032' } }
+        Mock Get-PmLicenseValues {
+            $keys = @(Get-Item -LiteralPath $script:LicKey2) + @(Get-ChildItem -LiteralPath $script:LicKey2 -Recurse)
+            foreach ($k in $keys) { foreach ($n in $k.GetValueNames()) { if ($n -match 'licen') { [pscustomobject]@{ Path = $k.PSPath; Name = $n; Kind = $k.GetValueKind($n); Value = $k.GetValue($n) } } } }
+        }
+        Mock Stop-PmPrtgServices { }
+        Mock Invoke-PmReg { 'saved' | Set-Content -LiteralPath $File; 0 }
+        Mock Invoke-PmHealthCheck { $Box.Health = [pscustomobject]@{ Healthy = $true; Url = 'https://localhost/ (HTTP 200)'; Message = '' } }
+        Mock Get-PmPrtgLicenseState { [pscustomobject]@{ Known = $true; Edition = 'No License (Invalid)'; Name = ''; MaxSensors = 0; NeedsActivation = $true } }
+        Mock Get-PmCoreLogMark { @{} }
+        Mock Wait-PmLicenseLine { [pscustomobject]@{ Known = $true; Edition = 'Trial'; Name = 'Test Org'; MaxSensors = 1000; NeedsActivation = $false; LastError = $null; Fresh = $true } }
+        Mock Get-PmPrtgLicenseReport { [pscustomobject]@{ Values = @(); SystemId = ''; AutoActivation = 1; LogLines = @() } }
+    }
+
+    It 'explains what to do for the usual activation results' {
+        Get-PmLicenseHint ([pscustomobject]@{ Known = $true; NeedsActivation = $true; Name = 'x'; LastError = 'HTTP/1.1 403 Forbidden' }) | Should -Match 'refused this activation'
+        Get-PmLicenseHint ([pscustomobject]@{ Known = $true; NeedsActivation = $true; Name = ''; LastError = $null }) | Should -Match 'No license is installed'
+        Get-PmLicenseHint ([pscustomobject]@{ Known = $true; NeedsActivation = $true; Name = 'x'; LastError = 'could not connect to host' }) | Should -Match 'offline'
+        Get-PmLicenseHint ([pscustomobject]@{ Known = $true; NeedsActivation = $false; Edition = 'Site License'; MaxSensors = 9 }) | Should -Match 'Licensed'
+    }
+
+    It 'writes name and key like the PRTG Administration Tool, drops the old activation and keeps a copy' {
+        $r = @(Install-PmPrtgLicense -LicenseName 'Test Org' -LicenseKey 'AAAAAA-BBBBBB-CCCCCC-DDDDDD-EEEEEE' -Kind trial -LicenseKeyPath "$($script:LicKey2)\Server") | Where-Object PmType -eq 'result'
+        $p = Get-ItemProperty "$($script:LicKey2)\Server"
+        $p.LicenseName | Should -Be 'Test Org'
+        $p.LicenseKey | Should -Be 'AAAAAA-BBBBBB-CCCCCC-DDDDDD-EEEEEE'
+        $p.PSObject.Properties.Name | Should -Not -Contain 'LicenseHash'
+        $r.Activated | Should -BeTrue
+        Test-Path $r.Rollback | Should -BeTrue
+        ($r | ConvertTo-Json -Depth 6) | Should -Not -Match 'BBBBBB-CCCCCC'
+        Should -Invoke Stop-PmPrtgServices -Times 1 -Exactly
+    }
+
+    It 'refuses a key that cannot be one, an active license without confirmation, and a non-administrator - before changing anything' {
+        { Install-PmPrtgLicense -LicenseName 'x' -LicenseKey 'short' } | Should -Throw '*does not look like a PRTG license key*'
+        Mock Get-PmPrtgLicenseState { [pscustomobject]@{ Known = $true; Edition = 'Site License'; Name = 'x'; MaxSensors = 500; NeedsActivation = $false } }
+        { Install-PmPrtgLicense -LicenseName 'x' -LicenseKey 'AAAAAA-BBBBBB-CCCCCC-DDDDDD' } | Should -Throw '*already runs with an active license*'
+        Mock Test-PmIsAdmin { $false }
+        { Install-PmPrtgLicense -LicenseName 'x' -LicenseKey 'AAAAAA-BBBBBB-CCCCCC-DDDDDD' } | Should -Throw '*administrator rights*'
+        Should -Invoke Stop-PmPrtgServices -Times 0 -Exactly
+        (Get-ItemProperty "$($script:LicKey2)\Server").LicenseHash | Should -Be 'old-activation'
+    }
+
+    It 'backs the license up encrypted on the server and restores every value from it' {
+        Set-ItemProperty -Path "$($script:LicKey2)\Server" -Name LicenseName -Value 'Site Org'
+        Set-ItemProperty -Path "$($script:LicKey2)\Server" -Name LicenseKey -Value 'KEYKEY-KEYKEY-KEYKEY-KEYKEY'
+        $b = @(Backup-PmPrtgLicense -Password 'lic-backup-pw') | Where-Object PmType -eq 'result'
+        ($b | ConvertTo-Json -Depth 6) | Should -Not -Match 'KEYKEY'
+        @($b.ValueNames) | Should -Contain 'LicenseKey'
+        Remove-ItemProperty -Path "$($script:LicKey2)\Server" -Name LicenseName, LicenseKey, LicenseHash
+        { Install-PmPrtgLicense -Envelope $b.Envelope -Password 'wrong-password' } | Should -Throw '*password is wrong*'
+        $r = @(Install-PmPrtgLicense -Envelope $b.Envelope -Password 'lic-backup-pw') | Where-Object PmType -eq 'result'
+        $r.Kind | Should -Be 'restore'
+        $p = Get-ItemProperty "$($script:LicKey2)\Server"
+        $p.LicenseKey | Should -Be 'KEYKEY-KEYKEY-KEYKEY-KEYKEY'
+        $p.LicenseHash | Should -Be 'old-activation'
+        [byte[]]$p.LicenseInstalled | Should -Be @(1, 2, 3)
+    }
+}
+
+Describe 'Dashboard API for backups (running dashboard)' -Skip:($env:OS -ne 'Windows_NT') {
+    BeforeAll {
+        $script:ApiData = Join-Path $Work 'api-data'
+        New-Item -ItemType Directory -Force -Path $ApiData | Out-Null
+        Set-PmRoot -Path $ApiData
+        $m = New-PmManifestV2 -Type 'devices' -Computer 'SRC9' -Server 'S9' -PrtgVersion '25.4.114.1032' -JobId 'api'
+        $script:ApiZip = Join-Path (Get-PmPath Backups) 'PRTG-DEVICES_SRC9_20260101-000000.zip'
+        New-PmZipFromFiles -ZipPath $ApiZip -Manifest $m -Files @{ 'devices.xml' = [Text.Encoding]::UTF8.GetBytes('<prtgmanagersection type="devices"/>') }
+        [void](Complete-PmPackage -ZipPath $ApiZip -Manifest $m -Source 'S9')
+        $script:ApiBin = Join-Path $Work 'api-recycle'; New-Item -ItemType Directory -Force -Path $ApiBin | Out-Null
+        $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $script:ApiPort = $l.LocalEndpoint.Port; $l.Stop()
+        $oldT = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'; $env:PRTGMANAGER_RECYCLE = $ApiBin
+        try {
+            $script:ApiProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                (Join-Path $Root 'Start-PrtgManager.ps1'), '-Port', $ApiPort, '-NoBrowser', '-Quiet', '-DataRoot', $ApiData
+        } finally { $env:PRTGMOVER_TEST = $oldT; Remove-Item Env:\PRTGMANAGER_RECYCLE }
+        $script:Api = "http://localhost:$ApiPort"
+        $deadline = (Get-Date).AddSeconds(40); $ok = $false
+        while (-not $ok -and (Get-Date) -lt $deadline) { try { [void](Invoke-RestMethod "$Api/api/info" -TimeoutSec 3); $ok = $true } catch { Start-Sleep -Milliseconds 500 } }
+        $script:ErrorOf = {
+            param([string]$Method, [string]$Url, [string]$Body)
+            $req = [Net.HttpWebRequest]::Create($Url); $req.Method = $Method; $req.Timeout = 15000
+            if ($Body) { $req.ContentType = 'application/json'; $b = [Text.Encoding]::UTF8.GetBytes($Body); $req.ContentLength = $b.Length; $s = $req.GetRequestStream(); $s.Write($b, 0, $b.Length); $s.Dispose() }
+            try { $r = $req.GetResponse() } catch [Net.WebException] { $r = $_.Exception.Response }
+            $sr = New-Object IO.StreamReader($r.GetResponseStream()); $txt = $sr.ReadToEnd(); $r.Close()
+            [pscustomobject]@{ Status = [int]$r.StatusCode; Body = ($txt | ConvertFrom-Json) }
+        }
+    }
+    AfterAll { if ($script:ApiProc) { Stop-Process -Id $script:ApiProc.Id -Force -ErrorAction SilentlyContinue } }
+
+    It 'lists packages with type and version and inspects one' {
+        $i = Invoke-RestMethod "$Api/api/info"
+        $i.product | Should -Be 'PRTG Manager'; $i.formatVersion | Should -Be 2
+        $list = @(Invoke-RestMethod "$Api/api/backups" | ForEach-Object { $_ })
+        $b = $list | Where-Object name -eq 'PRTG-DEVICES_SRC9_20260101-000000.zip'
+        $b.type | Should -Be 'devices'; $b.formatVersion | Should -Be 2
+        (Invoke-RestMethod "$Api/api/backups/PRTG-DEVICES_SRC9_20260101-000000.zip/inspect").entries | Should -Be 2
+    }
+
+    It 'answers errors with operation, component, reason and a hint' {
+        $e = & $ErrorOf GET "$Api/api/backups/NOPE.zip/inspect"
+        $e.Status | Should -Be 404
+        $e.Body.operation | Should -Be 'Inspect backup'
+        $e.Body.component | Should -Be 'NOPE.zip'
+        $e.Body.reason | Should -Match 'not found'
+        $e.Body.hint | Should -Not -BeNullOrEmpty
+        $e.Body.error | Should -Match '^Inspect backup failed on NOPE.zip: '
+        $e2 = & $ErrorOf POST "$Api/api/jobs" '{"type":"section-backup","sourceId":"x","sectionType":"license"}'
+        $e2.Status | Should -Be 400
+        $e2.Body.reason | Should -Match 'backup password'
+        $e3 = & $ErrorOf POST "$Api/api/jobs" '{"type":"no-such-job"}'
+        $e3.Body.reason | Should -Match "unknown job type"
+    }
+
+    It 'validates a package as a job and deletes it into the Recycle Bin' {
+        $j = Invoke-RestMethod -Method Post -Uri "$Api/api/jobs" -ContentType 'application/json' -Body '{"type":"validate","backupName":"PRTG-DEVICES_SRC9_20260101-000000.zip"}'
+        $deadline = (Get-Date).AddSeconds(60)
+        do { Start-Sleep -Milliseconds 400; $st = Invoke-RestMethod "$Api/api/jobs/$($j.id)" } while ($st.status -in 'queued', 'running' -and (Get-Date) -lt $deadline)
+        $st.status | Should -Be 'succeeded'
+        $st.result.valid | Should -BeTrue
+        (Invoke-RestMethod -Method Delete -Uri "$Api/api/backups/PRTG-DEVICES_SRC9_20260101-000000.zip").recycled | Should -BeTrue
+        Test-Path $ApiZip | Should -BeFalse
+        Test-Path (Join-Path $ApiBin 'PRTG-DEVICES_SRC9_20260101-000000.zip') | Should -BeTrue
     }
 }
