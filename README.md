@@ -133,7 +133,7 @@ The installer copies the program to `C:\PrtgManager` (an existing PRTG Mover ins
 | `-InstallPath <folder>` | Install into another folder. |
 | `-Source <folder or zip>` | Install from there instead of the installer's own folder. |
 | `-Local` | PRTG Manager on the PRTG server itself (elevated): this computer is added with the connection method *Local* and the dashboard starts with the computer. A watchdog starts it again within 5 minutes if it stops. |
-| `-Role both|source|target` | With `-Local`: role of this computer in the server list (default *both*). A *source* is never restored into. |
+| `-Role both\|source\|target` | With `-Local`: role of this computer in the server list (default *both*). A *source* is never restored into. |
 | `-Autostart` / `-NoAutostart` | Start with Windows on / off. |
 | `-TrustedHosts a,b` | Prepare plain WinRM (HTTP) to these servers. |
 | `-Port`, `-NoShortcut`, `-NoStart`, `-Uninstall` | Self-explanatory. |
