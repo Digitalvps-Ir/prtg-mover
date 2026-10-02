@@ -574,6 +574,26 @@
   // ------------------------------------------------------------ backups
   async function loadBackups() { state.backups = arr(await api('GET', '/api/backups')); renderBackups(); renderOverview(); }
   $('#refreshBackups').addEventListener('click', (e) => busy(e.currentTarget, () => loadBackups().catch(fail)));
+
+  // ---------------------------------------------------------------- leftovers (temporary copies, rollback data, snapshots)
+  async function loadLeftovers() {
+    state.leftovers = arr(await api('GET', '/api/leftovers'));
+    const total = state.leftovers.reduce((s, x) => s + (x.bytes || 0), 0);
+    $('#leftoversTable tbody').innerHTML = state.leftovers.length ? state.leftovers.map((x, i) => `<tr>
+      <td><span class="badge ${x.kind === 'previous PRTG data' || x.kind === 'rollback copy' ? 'warn' : 'info'}">${esc(x.kind)}</span><div class="muted small">${esc(x.note || '')}</div></td>
+      <td class="mono small">${esc(x.path)}</td><td>${fmtSize(x.bytes)}</td><td>${esc(fmtDate(x.changed))}</td>
+      <td class="row-actions"><button class="btn small danger" data-i="${i}">Remove</button></td></tr>`).join('')
+      + `<tr><td colspan="2"><strong>Total</strong></td><td><strong>${fmtSize(total)}</strong></td><td colspan="2"></td></tr>`
+      : '<tr><td colspan="5" class="empty">Nothing left behind.</td></tr>';
+  }
+  $('#refreshLeftovers').addEventListener('click', (e) => busy(e.currentTarget, () => loadLeftovers().catch(fail)));
+  $('#leftoversTable').addEventListener('click', async (e) => {
+    const b = e.target.closest('button[data-i]'); if (!b) return;
+    const x = (state.leftovers || [])[+b.dataset.i]; if (!x) return;
+    const warn = x.kind === 'previous PRTG data' ? '\n\nThis is the PRTG data folder from before a restore - the rollback of that restore needs it. Remove it only when the restored PRTG works.' : '';
+    if (!(await ask(`Remove ${x.path} (${fmtSize(x.bytes)}) for good?${warn}`, { ok: 'Remove for good', danger: true }))) return;
+    await busy(b, async () => { try { await api('POST', '/api/leftovers/remove', { path: x.path }); toast('Removed'); await loadLeftovers(); } catch (err) { fail(err); } });
+  });
   $('#backupFilter').addEventListener('change', renderBackups);
 
   function contentBadges(b) {
@@ -623,8 +643,13 @@
     const name = b.dataset.name; const bk = state.backups.find((x) => x.name === name);
     if (!bk) return fail(new Error('This backup is no longer there - press Refresh.'));
     if (b.dataset.act === 'del') {
-      if (!(await ask(`Delete backup ${name}?\n\nIt is moved to the Recycle Bin of this computer (you can restore it from there).`, { ok: 'Move to Recycle Bin', danger: true }))) return;
-      await busy(b, async () => { try { await api('DELETE', `/api/backups/${encodeURIComponent(name)}`); toast('Backup moved to the Recycle Bin'); await loadBackups(); } catch (err) { fail(err); } });
+      // the dashboard that runs as SYSTEM (start with the computer) deletes for good: SYSTEM's Recycle Bin is not visible to you
+      const permanent = state.info && state.info.deleteMode === 'permanent';
+      const msg = permanent
+        ? `Delete backup ${name}?\n\nIt is deleted PERMANENTLY: this dashboard runs as SYSTEM, whose Recycle Bin you cannot open. Download it first if you may need it.`
+        : `Delete backup ${name}?\n\nIt is moved to the Recycle Bin of this computer (you can restore it from there).`;
+      if (!(await ask(msg, { ok: permanent ? 'Delete permanently' : 'Move to Recycle Bin', danger: true }))) return;
+      await busy(b, async () => { try { const r = await api('DELETE', `/api/backups/${encodeURIComponent(name)}`); toast(r && r.mode === 'permanent' ? 'Backup deleted' : 'Backup moved to the Recycle Bin'); await loadBackups(); } catch (err) { fail(err); } });
     }
     if (b.dataset.act === 'restore') openRestore(bk);
     if (b.dataset.act === 'validate') openValidate(bk);

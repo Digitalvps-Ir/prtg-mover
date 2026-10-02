@@ -100,6 +100,8 @@ function Get-PmLogicalDisk {
 
 function Write-PmLog {
     param([string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'OK', 'STEP', 'DEBUG')][string]$Level = 'INFO')
+    # A cancelled job drops everything it outputs: work done after the cancel (rollback) also goes to this file.
+    if ($script:PmLogMirror) { try { [IO.File]::AppendAllText($script:PmLogMirror, ('{0} [{1}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message) + "`r`n") } catch { } }
     [pscustomobject]@{ PmType = 'log'; Level = $Level; Message = $Message; Time = (Get-Date).ToString('o'); Computer = (Get-PmComputerName) }
 }
 
@@ -204,7 +206,8 @@ function Test-PmRobocopyOk { param([int]$Code) return ($Code -ge 0 -and $Code -l
 
 function Get-PmDirectorySize {
     param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return 0 }
+    # a folder this account may not read counts as empty instead of failing the caller
+    try { if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) { return 0 } } catch { return 0 }
     $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
     if ($sum) { return [int64]$sum } else { return 0 }
 }
@@ -1658,11 +1661,12 @@ function Invoke-PmSectionRestore {
     $wasRunning = ($prtg.CoreStatus -eq 'Running')
     Write-PmLog "Stopping PRTG (the configuration can only be changed while the core is stopped)..." 'STEP'
     Write-PmProgress 25 'Stopping PRTG'
-    Stop-PmPrtgServices
-    Copy-Item -LiteralPath $cfg -Destination (Join-Path $rb 'PRTG Configuration.dat') -Force
-    Write-PmLog "Rollback copy: $rb\PRTG Configuration.dat" 'OK'
-    $applied = $null; $health = $null; $rolledBack = $false; $err = $null
+    $applied = $null; $health = $null; $rolledBack = $false; $err = $null; $settled = $false; $copied = $false
     try {
+        Stop-PmPrtgServices
+        Copy-Item -LiteralPath $cfg -Destination (Join-Path $rb 'PRTG Configuration.dat') -Force
+        $copied = $true
+        Write-PmLog "Rollback copy: $rb\PRTG Configuration.dat" 'OK'
         Write-PmProgress 40 'Merging'
         $target = Read-PmPrtgConfig -Path $cfg
         $plan = Get-PmSectionRestorePlan -Target $target -Section $section -Mode $Mode -ReIdConflicts $ReIdConflicts
@@ -1679,18 +1683,32 @@ function Invoke-PmSectionRestore {
             if (-not $health.Healthy) { throw "PRTG did not come up completely with the restored configuration ($($health.Message))." }
             Write-PmLog "PRTG is up with the restored configuration: $($health.Url)" 'OK'
         }
+        $settled = $true
     } catch {
         $err = "$($_.Exception.Message)"
         Write-PmLog "Restore failed: $err - putting the rollback copy back." 'ERROR'
         try {
             Stop-PmPrtgServices
-            Copy-Item -LiteralPath (Join-Path $rb 'PRTG Configuration.dat') -Destination $cfg -Force
-            $rolledBack = $true
+            if ($copied) { Copy-Item -LiteralPath (Join-Path $rb 'PRTG Configuration.dat') -Destination $cfg -Force; $rolledBack = $true }
             if ($wasRunning) {
                 $box = @{}; Invoke-PmHealthCheck -Box $box -TimeoutMinutes $HealthTimeoutMinutes -PreferredPorts @($prtg.ListenPorts); $health = $box.Health
                 Write-PmLog "Rolled back. PRTG is $(if ($health.Healthy) { "up again with the previous configuration: $($health.Url)" } else { "NOT up ($($health.Message)) - check the core log" })." $(if ($health.Healthy) { 'WARN' } else { 'ERROR' })
             } else { Write-PmLog 'Rolled back (PRTG was stopped before and stays stopped).' 'WARN' }
         } catch { Write-PmLog "Rollback failed too: $($_.Exception.Message). The previous configuration is in $rb." 'ERROR' }
+        $settled = $true
+    } finally {
+        if (-not $settled) {
+            # cancelled while PRTG was stopped: the previous configuration goes back and PRTG is started again
+            $script:PmLogMirror = Join-Path $rb 'cancelled.log'
+            try {
+                Write-PmLog 'The restore was cancelled while PRTG was stopped - putting the previous configuration back.' 'WARN' | Out-Null
+                Stop-PmPrtgServices
+                if ($copied) { Copy-Item -LiteralPath (Join-Path $rb 'PRTG Configuration.dat') -Destination $cfg -Force }
+                if ($wasRunning) { Start-PmPrtgServices }
+                Write-PmLog "Previous configuration is back$(if ($wasRunning) { ', PRTG started' })." 'OK' | Out-Null
+            } catch { Write-PmLog "Putting the previous configuration back failed: $($_.Exception.Message). It is in $rb." 'ERROR' | Out-Null }
+            finally { $script:PmLogMirror = $null }
+        }
     }
     Write-PmProgress 100 'Done'
     New-PmResult @{ Plan = $plan; Applied = $(if ($applied) { $applied.Counts }); Rollback = $rb; Healthy = $(if ($health) { [bool]$health.Healthy }); WebUrl = $(if ($health) { $health.Url }); RolledBack = $rolledBack; Error = $err; Changed = (-not $rolledBack -and -not $err) }
@@ -1762,7 +1780,9 @@ function Restore-PmGraphData {
         merge keeps files that exist, overwrite replaces them. The graph cache is moved aside so PRTG
         recalculates the graphs from the data. Nothing is deleted.
     #>
-    param([Parameter(Mandatory)][string]$StageGraphs, [ValidateSet('merge', 'overwrite')][string]$Mode = 'merge', [bool]$StartServices = $true, [int]$HealthTimeoutMinutes = 15)
+    param([Parameter(Mandatory)][string]$StageGraphs, [ValidateSet('merge', 'overwrite')][string]$Mode = 'merge', [bool]$StartServices = $true, [int]$HealthTimeoutMinutes = 15,
+        # the stage is a disposable local copy: move the files (no extra disk space) instead of copying them
+        [bool]$Move = $false)
     $prtg = Get-PmPrtgInfo
     if (-not $prtg.Installed) { throw 'PRTG is not installed on this server (service PRTGCoreService not found).' }
     $dest = Join-Path $prtg.DataPath 'Monitoring Database'
@@ -1786,7 +1806,8 @@ function Restore-PmGraphData {
             try {
                 $dir = Split-Path $to -Parent
                 if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-                Copy-Item -LiteralPath (Join-Path $StageGraphs $f.Rel) -Destination $to -Force
+                if ($Move) { if ($exists) { Remove-Item -LiteralPath $to -Force }; Move-Item -LiteralPath (Join-Path $StageGraphs $f.Rel) -Destination $to }
+                else { Copy-Item -LiteralPath (Join-Path $StageGraphs $f.Rel) -Destination $to -Force }
                 if ($exists) { $replaced++ } else { $copied++ }
             } catch { $failed++; if ($failed -le 5) { Write-PmLog "Could not copy $($f.Rel): $($_.Exception.Message)" 'WARN' } }
         }
@@ -2142,6 +2163,9 @@ function Invoke-PmRemoteBackup {
             Clear-PmStaleSnapshots
             $shadow = $null
             $dataSource = $prtg.DataPath
+            $prtgOk = $false   # the snapshot is only kept for the manager's pull when this part succeeded
+            # the stop is inside the try: a stop that fails half-way still ends in the restart of the finally
+            try {
             if ($NoTouch) {
                 Write-PmLog 'NO-TOUCH mode: PRTG keeps running on the source, nothing is stopped, changed or deleted.' 'STEP'
                 try {
@@ -2167,7 +2191,6 @@ function Invoke-PmRemoteBackup {
                 }
             }
 
-            try {
                 Write-PmProgress 20 'PRTG: copying data folder'
                 # Only what PRTG needs: no log files, caches, temp files or old automatic config copies (unless asked).
                 $exclude = @()
@@ -2261,9 +2284,14 @@ function Invoke-PmRemoteBackup {
                     programCloned = $programCloned; services = $services; netFrameworkRelease = $netRelease
                     consistency = $(if ($NoTouch) { if ($shadow) { 'vss-snapshot' } else { 'live-copy' } } else { 'services-stopped' })
                 }
+                $prtgOk = $true
             } finally {
-                if ($shadow -and $PullMode) { Write-PmLog 'VSS snapshot kept until the manager has pulled the data (removed afterwards).' 'DEBUG' }
-                elseif ($shadow) { Remove-PmShadowCopy -Shadow $shadow; Write-PmLog 'VSS snapshot removed.' }
+                if ($shadow -and $PullMode -and $prtgOk) { Write-PmLog 'VSS snapshot kept until the manager has pulled the data (removed afterwards).' 'DEBUG' }
+                elseif ($shadow) {
+                    # also after a failure: a snapshot left behind keeps growing on the system drive
+                    try { Remove-PmShadowCopy -Shadow $shadow; Write-PmLog 'VSS snapshot removed.' } catch { Write-PmLog "VSS snapshot could not be removed: $($_.Exception.Message)" 'WARN' }
+                    $shadow = $null
+                }
                 if ($NoTouch) {
                     Write-PmLog 'Source untouched - PRTG kept running the whole time.' 'OK'
                 } else {
@@ -2377,8 +2405,14 @@ function Undo-PmPrtgRestore {
         back) and the PRTG registry keys (cleared and imported from the copy taken before the restore).
         The restored data folder is kept as <data>.failed-restore-<time>. Nothing is deleted.
     #>
-    param([Parameter(Mandatory)][string]$DataPath, [Parameter(Mandatory)][string]$OldPath, [Parameter(Mandatory)][string]$RegBackup, [string]$Stamp, [int]$HealthTimeoutMinutes = 15, [int[]]$Ports = @())
+    param([Parameter(Mandatory)][string]$DataPath, [Parameter(Mandatory)][string]$OldPath, [Parameter(Mandatory)][string]$RegBackup, [string]$Stamp, [int]$HealthTimeoutMinutes = 15, [int[]]$Ports = @(),
+        # firewall rule the restore created (it did not exist before) - removed again
+        [string]$FirewallRule)
     Write-PmLog 'ROLLBACK: putting the previous PRTG data folder and registry back...' 'STEP'
+    if ($FirewallRule -and (Get-Command Remove-NetFirewallRule -ErrorAction SilentlyContinue)) {
+        Get-NetFirewallRule -DisplayName $FirewallRule -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        Write-PmLog "Firewall rule '$FirewallRule' that the restore had added was removed again." 'OK'
+    }
     Stop-PmPrtgServices
     if (-not (Test-Path -LiteralPath $OldPath)) { throw "The previous data folder $OldPath is gone - cannot roll back." }
     if (Test-Path -LiteralPath $DataPath) { Rename-Item -LiteralPath $DataPath -NewName ('{0}.failed-restore-{1}' -f (Split-Path $DataPath -Leaf), $Stamp) }
@@ -2493,7 +2527,7 @@ function Invoke-PmRemoteRestore {
             }
             Write-PmProgress 30 'History: copying'
             $gbox = @{}
-            Restore-PmGraphData -StageGraphs (Join-Path $stage 'prtg\graphs') -Mode $GraphMode -StartServices $StartServices -HealthTimeoutMinutes $HealthTimeoutMinutes | ForEach-Object { if ($_.PmType -eq 'graphs') { $gbox.R = $_ } else { $_ } }
+            Restore-PmGraphData -StageGraphs (Join-Path $stage 'prtg\graphs') -Mode $GraphMode -StartServices $StartServices -HealthTimeoutMinutes $HealthTimeoutMinutes -Move $MoveFromStage | ForEach-Object { if ($_.PmType -eq 'graphs') { $gbox.R = $_ } else { $_ } }
             $g = $gbox.R
             $report.History = "restored ($($g.Copied) new, $($g.Replaced) replaced, $($g.Failed) failed)"
             $report.Prtg = if ($null -eq $g.Healthy) { 'not-started' } elseif ($g.Healthy) { 'ok' } else { 'unhealthy' }
@@ -2508,7 +2542,9 @@ function Invoke-PmRemoteRestore {
 
     # ---- PRTG
     if ($RestorePrtg -and $manifest.prtg.included) {
-        $undo = $null
+        # $settled: the restore reached an end state (done, rolled back or failed and handled). A cancelled job is
+        # stopped without running catch blocks - the finally below then puts the previous state back.
+        $undo = $null; $stopped = $false; $settled = $false; $prtgWasRunning = $false
         try {
             Write-PmProgress 15 'PRTG: checking installation'
             $prtg = Get-PmPrtgInfo
@@ -2582,6 +2618,8 @@ function Invoke-PmRemoteRestore {
             }
 
             Write-PmProgress 25 'PRTG: stopping target services'
+            $prtgWasRunning = ([string]$prtg.CoreStatus -eq 'Running')
+            $stopped = $true   # set before the stop: a stop that fails half-way still has to be undone
             Stop-PmPrtgServices
             Write-PmLog 'Target PRTG services stopped.' 'OK'
 
@@ -2613,14 +2651,21 @@ function Invoke-PmRemoteRestore {
                 [void](Invoke-PmReg -Verb export -Key $native -File (Join-Path $regBackup (($native -replace '[\\: ]', '_') + '.reg')))
             }
             $old = $null
+            $fwRule = 'PRTG Manager - PRTG Core (web + probes)'
+            $fwExisted = [bool](Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) -and [bool](Get-NetFirewallRule -DisplayName $fwRule -ErrorAction SilentlyContinue)
             if (Test-Path -LiteralPath $dataPath) {
                 $old = "$dataPath.pre-restore-$stamp"
                 try { Rename-Item -LiteralPath $dataPath -NewName (Split-Path $old -Leaf); Write-PmLog "Existing data folder kept as $old" }
-                catch { Invoke-PmRobocopy -Source $dataPath -Destination $old | Out-Null; Write-PmLog "Existing data folder copied to $old" }
+                catch {
+                    # a partial copy must never become the rollback source: then nothing is changed and the restore stops here
+                    $rc = Invoke-PmRobocopy -Source $dataPath -Destination $old
+                    if (-not (Test-PmRobocopyOk $rc)) { throw "The current data folder could not be set aside (rename failed: $($_.Exception.Message); copy failed: robocopy $rc). Nothing was restored." }
+                    Write-PmLog "Existing data folder copied to $old" 'OK'
+                }
             }
             Write-PmLog "Rollback copy of registry: $regBackup" 'OK'
             # from here on a failure can be undone: the previous data folder and registry are kept
-            if ($old -and (Test-Path -LiteralPath $old)) { $undo = @{ DataPath = $dataPath; Old = $old; Reg = $regBackup; Ports = @($prtg.ListenPorts) } }
+            if ($old -and (Test-Path -LiteralPath $old)) { $undo = @{ DataPath = $dataPath; Old = $old; Reg = $regBackup; Ports = @($prtg.ListenPorts); FirewallRule = $(if ($fwExisted) { '' } else { $fwRule }) } }
 
             Write-PmProgress 45 'PRTG: restoring data folder'
             $stageData = Join-Path $stage 'prtg\data'
@@ -2719,26 +2764,50 @@ function Invoke-PmRemoteRestore {
                     $outside = @($ep | Where-Object { $_ -notmatch '^(127\.0\.0\.1|::1):' })
                     if ($outside.Count) { Write-PmLog "PRTG listens on: $($ep -join ', ')" 'OK' }
                     else { Write-PmLog "PRTG only listens on this server itself ($($ep -join ', ')) - it is not reachable from the network. Check the web server IP setting in the PRTG Administration Tool." 'WARN' }
+                    $settled = $true
                 } else {
                     $report.Prtg = 'unhealthy'
                     $report.Errors += "PRTG did not come up completely within $HealthTimeoutMinutes min ($($health.Message))."
                     Write-PmLog "PRTG did NOT come up completely ($($health.Message)). See '$dataPath\Logs\core' on the target. Rollback data: $dataPath.pre-restore-$stamp" 'ERROR'
                     if ($AutoRollback -and $undo) {
                         $ubox = @{}
-                        Undo-PmPrtgRestore -DataPath $undo.DataPath -OldPath $undo.Old -RegBackup $undo.Reg -Stamp $stamp -HealthTimeoutMinutes $HealthTimeoutMinutes -Ports $undo.Ports | ForEach-Object { if ($_.PmType -eq 'undo') { $ubox.R = $_ } else { $_ } }
+                        Undo-PmPrtgRestore -DataPath $undo.DataPath -OldPath $undo.Old -RegBackup $undo.Reg -Stamp $stamp -HealthTimeoutMinutes $HealthTimeoutMinutes -Ports $undo.Ports -FirewallRule $undo.FirewallRule | ForEach-Object { if ($_.PmType -eq 'undo') { $ubox.R = $_ } else { $_ } }
                         $report.RolledBack = $true; $report.Prtg = if ($ubox.R -and $ubox.R.Healthy) { 'rolled-back' } else { 'rolled-back-unhealthy' }
                     }
+                    $settled = $true
                 }
-            } else { $report.Prtg = 'restored-not-started' }
+            } else { $report.Prtg = 'restored-not-started'; $settled = $true }
         } catch {
             $report.Prtg = 'failed'; $report.Errors += "PRTG: $_"
             Write-PmLog "PRTG restore failed: $(Format-PmError $_)" 'ERROR'; Write-PmErrorDetail $_ 'PRTG restore'
             if ($AutoRollback -and $undo) {
                 try {
                     $ubox = @{}
-                    Undo-PmPrtgRestore -DataPath $undo.DataPath -OldPath $undo.Old -RegBackup $undo.Reg -Stamp $stamp -HealthTimeoutMinutes $HealthTimeoutMinutes -Ports $undo.Ports | ForEach-Object { if ($_.PmType -eq 'undo') { $ubox.R = $_ } else { $_ } }
+                    Undo-PmPrtgRestore -DataPath $undo.DataPath -OldPath $undo.Old -RegBackup $undo.Reg -Stamp $stamp -HealthTimeoutMinutes $HealthTimeoutMinutes -Ports $undo.Ports -FirewallRule $undo.FirewallRule | ForEach-Object { if ($_.PmType -eq 'undo') { $ubox.R = $_ } else { $_ } }
                     $report.RolledBack = $true; $report.Prtg = if ($ubox.R -and $ubox.R.Healthy) { 'rolled-back' } else { 'rolled-back-unhealthy' }
                 } catch { Write-PmLog "Rollback failed: $($_.Exception.Message). The previous data is in $($undo.Old), the registry copy in $($undo.Reg)." 'ERROR' }
+            } elseif ($stopped -and -not $undo -and $prtgWasRunning) {
+                # failed before anything of PRTG was changed (e.g. setting the data folder aside): PRTG must not stay down
+                try { Start-PmPrtgServices; Write-PmLog 'Nothing of PRTG had been changed yet - PRTG was started again.' 'WARN' }
+                catch { Write-PmLog "PRTG could not be started again: $($_.Exception.Message). Start the services PRTGCoreService and PRTGProbeService." 'ERROR' }
+            }
+            $settled = $true
+        } finally {
+            if ($stopped -and -not $settled) {
+                # Cancelled after PRTG was stopped (catch blocks do not run on a cancel). Output is dropped now, so the
+                # log goes to a file next to the rollback data as well.
+                $script:PmLogMirror = Join-Path $WorkRoot "rollback\cancelled-restore-$stamp.log"
+                try {
+                    New-Item -ItemType Directory -Force -Path (Split-Path $script:PmLogMirror -Parent) | Out-Null
+                    Write-PmLog 'The restore was cancelled after PRTG had been stopped - putting the previous state back.' 'WARN' | Out-Null
+                    if ($undo) {
+                        Undo-PmPrtgRestore -DataPath $undo.DataPath -OldPath $undo.Old -RegBackup $undo.Reg -Stamp $stamp -HealthTimeoutMinutes $HealthTimeoutMinutes -Ports $undo.Ports -FirewallRule $undo.FirewallRule | Out-Null
+                    } elseif ($prtgWasRunning) {
+                        Start-PmPrtgServices
+                        Write-PmLog 'Nothing of PRTG had been changed yet - PRTG was started again.' 'OK' | Out-Null
+                    }
+                } catch { Write-PmLog "Putting the previous state back failed: $($_.Exception.Message). Previous data: $(if ($undo) { $undo.Old } else { $dataPath }), registry copy: $(if ($undo) { $undo.Reg })." 'ERROR' | Out-Null }
+                finally { $script:PmLogMirror = $null }
             }
         }
     }
@@ -2911,17 +2980,39 @@ function Remove-PmRemoteFile {
     New-PmResult @{ Removed = $Path }
 }
 
+function Get-PmDataBreakdown {
+    <# READ-ONLY. Size of a PRTG data folder in one pass: total and the parts a backup can leave out. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $r = [ordered]@{ Total = [int64]0; History = [int64]0; Logs = [int64]0; AutoBackups = [int64]0 }
+    if (-not (Test-Path -LiteralPath $Path)) { return [pscustomobject]$r }
+    $base = (Get-Item -LiteralPath $Path).FullName.TrimEnd('\') + '\'
+    foreach ($f in (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        $r.Total += $f.Length
+        $top = $f.FullName.Substring($base.Length).Split('\')[0]
+        switch ($top) { 'Monitoring Database' { $r.History += $f.Length } 'Logs' { $r.Logs += $f.Length } 'Configuration Auto-Backups' { $r.AutoBackups += $f.Length } }
+    }
+    [pscustomobject]$r
+}
+
 function Initialize-PmRemoteWorkRoot {
     param([string]$WorkRoot)
     if (-not $WorkRoot) { $WorkRoot = Get-PmWorkRoot }
     New-Item -ItemType Directory -Force -Path (Join-Path $WorkRoot 'in') | Out-Null
     $drive = Get-PmLogicalDisk -Path $WorkRoot
     $prtg = Get-PmPrtgInfo
-    $dataBytes = 0
-    if ($prtg.Installed) { $dataBytes = Get-PmDirectorySize -Path $prtg.DataPath }
+    $parts = [pscustomobject]@{ Total = [int64]0; History = [int64]0; Logs = [int64]0; AutoBackups = [int64]0 }
+    $programBytes = [int64]0; $desktopBytes = [int64]0
+    if ($prtg.Installed) {
+        $parts = Get-PmDataBreakdown -Path $prtg.DataPath
+        if ($prtg.ProgramPath) { $programBytes = [int64](Get-PmDirectorySize -Path $prtg.ProgramPath) }
+    }
+    foreach ($p in @(Get-PmUserProfiles) + @([pscustomobject]@{ Path = $env:PUBLIC })) { if ($p.Path) { $desktopBytes += [int64](Get-PmDirectorySize -Path (Join-Path $p.Path 'Desktop')) } }
     New-PmResult @{
         WorkRoot = $WorkRoot; Inbox = (Join-Path $WorkRoot 'in'); Prtg = $prtg; Computer = $env:COMPUTERNAME
-        FreeBytes = $(if ($drive) { [int64]$drive.FreeSpace } else { [int64]0 }); PrtgDataBytes = [int64]$dataBytes
+        FreeBytes = $(if ($drive) { [int64]$drive.FreeSpace } else { [int64]0 }); PrtgDataBytes = [int64]$parts.Total
+        # parts a backup can leave out or adds: used for the free-space estimate of a backup
+        PrtgHistoryBytes = [int64]$parts.History; PrtgLogsBytes = [int64]$parts.Logs; PrtgAutoBackupBytes = [int64]$parts.AutoBackups
+        PrtgProgramBytes = $programBytes; DesktopBytes = $desktopBytes
         IsAdmin = (Test-PmIsAdmin)
     }
 }

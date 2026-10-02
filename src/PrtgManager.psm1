@@ -708,20 +708,39 @@ function Register-PmBackup {
     Write-PmBackupMeta -Path $ZipPath -Meta ([pscustomobject]@{ source = $Source; sha256 = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash; manifest = $Manifest; encrypted = ($ZipPath -like '*.pmenc'); registered = (Get-Date).ToString('o') })
 }
 
+function Get-PmDeleteMode {
+    <#
+        'recycle' when a person runs the dashboard (their Recycle Bin), 'permanent' when it runs as SYSTEM / without a
+        desktop (the task at system start): SYSTEM's Recycle Bin is invisible to the administrators and frees no space,
+        and an error dialog there has nobody to answer it and would stop the dashboard.
+    #>
+    if ($env:PRTGMANAGER_DELETE_MODE -in 'recycle', 'permanent') { return $env:PRTGMANAGER_DELETE_MODE }
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($id.IsSystem -or -not [Environment]::UserInteractive) { return 'permanent' }
+    return 'recycle'
+}
+
 function Remove-PmBackup {
-    <# Moves a package (and its sidecar) to the Recycle Bin - never deleted for good by PRTG Manager. #>
+    <# Moves a package (and its sidecar) to the Recycle Bin; deletes it for good when the dashboard runs as SYSTEM (see Get-PmDeleteMode). #>
     param([Parameter(Mandatory)][string]$Name)
     $f = Get-PmBackupFile -Name $Name
+    $mode = Get-PmDeleteMode
     Add-Type -AssemblyName Microsoft.VisualBasic
     foreach ($x in @($f, "$f.meta.json")) {
         if (-not (Test-Path -LiteralPath $x)) { continue }
-        if ($env:PRTGMOVER_TEST -eq '1' -and $env:PRTGMANAGER_RECYCLE) {
+        if ($env:PRTGMOVER_TEST -eq '1' -and $env:PRTGMANAGER_RECYCLE -and $mode -eq 'recycle') {
             Move-Item -LiteralPath $x -Destination (Join-Path $env:PRTGMANAGER_RECYCLE (Split-Path $x -Leaf)) -Force
+            continue
+        }
+        if ($mode -eq 'permanent') {
+            try { Remove-Item -LiteralPath $x -Force -ErrorAction Stop }
+            catch { throw "Delete backup '$Name' failed: $($_.Exception.Message). It was left in place." }
             continue
         }
         try { [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($x, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin) }
         catch { throw "Delete backup '$Name' failed: the file could not be moved to the Recycle Bin ($($_.Exception.Message)). It was left in place." }
     }
+    return $mode
 }
 
 function Get-PmZipEntryHash {
@@ -1202,6 +1221,88 @@ function Write-PmAudit {
     } catch { }
 }
 
+function Invoke-PmHousekeeping {
+    <#
+        Keeps the long-running dashboard small: manager and robocopy logs older than $LogDays are deleted, job records
+        older than $JobDays (the newest $KeepJobs always stay), and the audit log is rotated at 10 MB (3 old copies).
+        Backups, credentials and the server list are never touched.
+    #>
+    param([int]$LogDays = 30, [int]$JobDays = 90, [int]$KeepJobs = 200)
+    $removed = 0
+    $logs = Join-Path (Get-PmPath Data) 'logs'
+    $old = (Get-Date).AddDays(-$LogDays)
+    foreach ($f in @(Get-ChildItem -LiteralPath $logs -Filter 'manager-*.log' -File -ErrorAction SilentlyContinue) + @(Get-ChildItem -LiteralPath (Join-Path $logs 'robocopy') -File -ErrorAction SilentlyContinue)) {
+        if ($f.LastWriteTime -lt $old) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+    }
+    $jobs = @(Get-ChildItem -LiteralPath (Get-PmPath Jobs) -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    $jold = (Get-Date).AddDays(-$JobDays)
+    foreach ($f in @($jobs | Select-Object -Skip $KeepJobs)) {
+        if ($f.LastWriteTime -lt $jold -and -not $script:PmJobs.ContainsKey($f.BaseName)) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+    }
+    $audit = Join-Path $logs 'audit.log'
+    if ((Test-Path -LiteralPath $audit) -and (Get-Item -LiteralPath $audit).Length -gt 10MB) {
+        for ($i = 3; $i -ge 1; $i--) {
+            $from = if ($i -eq 1) { $audit } else { "$audit.$($i - 1)" }
+            if (Test-Path -LiteralPath $from) { Move-Item -LiteralPath $from -Destination "$audit.$i" -Force }
+        }
+    }
+    Clear-PmFinishedJobs
+    $script:PmLastHousekeeping = Get-Date
+    if ($removed) { Write-PmManagerLog -Message "Housekeeping: $removed old log / job file(s) removed." -Source 'dashboard' }
+    return $removed
+}
+
+function Get-PmLeftovers {
+    <#
+        READ-ONLY. What restores, backups and cancelled runs left on THIS computer, with sizes:
+        unpacked packages (data\staging), the work folder (temporary restore stages, transfer chunks, rollback copies,
+        kept licenses), the work folder of the earlier name (C:\PrtgMover), previous PRTG data folders kept by a restore
+        (<data>.pre-restore-* / .failed-restore-*) and VSS snapshots left by an interrupted backup (C:\PrtgMoverVss_*).
+    #>
+    $items = New-Object Collections.Generic.List[object]
+    $add = {
+        param([string]$Kind, [string]$Path, [string]$Note)
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        $it = Get-Item -LiteralPath $Path -Force
+        $size = if ($it.PSIsContainer) { [int64](Get-PmDirectorySize -Path $Path) } else { [int64]$it.Length }
+        $items.Add([pscustomobject]@{ kind = $Kind; path = $it.FullName; bytes = $size; changed = $it.LastWriteTime.ToString('o'); note = $Note })
+    }
+    foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path (Get-PmPath Data) 'staging') -Force -ErrorAction SilentlyContinue)) { & $add 'unpacked package' $d.FullName 'Temporary copy for a restore or backup - not needed when no job is running.' }
+    $work = Get-PmWorkRoot
+    $legacy = if ($env:SystemDrive) { Join-Path $env:SystemDrive 'PrtgMover' } else { $null }
+    foreach ($w in @($work, $legacy) | Where-Object { $_ } | Select-Object -Unique) {
+        $isOld = ($w -ne $work) -and -not (Test-Path -LiteralPath (Join-Path $w 'Start-PrtgMover.ps1')) -and -not (Test-Path -LiteralPath (Join-Path $w 'Start-PrtgManager.ps1'))
+        if ($w -ne $work -and -not $isOld) { continue }   # an installation of the earlier name is not a leftover
+        foreach ($sub in 'restore', 'chunks', 'staging', 'out', 'in', 'installer') {
+            foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path $w $sub) -Force -ErrorAction SilentlyContinue)) { & $add 'temporary' $d.FullName 'Temporary restore stage / transfer file.' }
+        }
+        foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path $w 'rollback') -Force -ErrorAction SilentlyContinue)) { & $add 'rollback copy' $d.FullName 'Registry / configuration copy taken before a restore or license change - keep it until the result is confirmed.' }
+        foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path $w 'license-keep') -Force -ErrorAction SilentlyContinue)) { & $add 'rollback copy' $d.FullName 'License files of this server kept during a restore.' }
+    }
+    $prtg = $null; try { $prtg = Get-PmPrtgInfo } catch { }
+    if ($prtg -and $prtg.Installed -and $prtg.DataPath) {
+        $dp = ([string]$prtg.DataPath).TrimEnd('\'); $parent = Split-Path $dp -Parent; $leaf = Split-Path $dp -Leaf
+        foreach ($d in @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "$leaf.pre-restore-*" -or $_.Name -like "$leaf.failed-restore-*" })) {
+            & $add 'previous PRTG data' $d.FullName $(if ($d.Name -like '*.pre-restore-*') { 'The PRTG data folder before a restore - the rollback of that restore needs it. Remove it only when the restored PRTG is fine.' } else { 'Data of a restore that was rolled back.' })
+        }
+    }
+    if ($env:SystemDrive) { foreach ($l in @(Get-ChildItem -LiteralPath ($env:SystemDrive + '\') -Filter 'PrtgMoverVss_*' -Force -ErrorAction SilentlyContinue)) { $items.Add([pscustomobject]@{ kind = 'snapshot'; path = $l.FullName; bytes = [int64]0; changed = $l.LastWriteTime.ToString('o'); note = 'VSS snapshot left by an interrupted backup - it grows on the system drive while it exists.' }) } }
+    return $items.ToArray()
+}
+
+function Remove-PmLeftover {
+    <# Removes ONE item listed by Get-PmLeftovers (for good). Refused while a job is running. #>
+    param([Parameter(Mandatory)][string]$Path)
+    $busy = @($script:PmJobs.Values | Where-Object { $_.status -in 'queued', 'running' })
+    if ($busy.Count) { throw "Job $($busy[0].id) is running - remove leftovers when no job runs." }
+    $item = @(Get-PmLeftovers | Where-Object { $_.path -ieq $Path.TrimEnd('\') })[0]
+    if (-not $item) { throw "'$Path' is not a leftover of PRTG Manager on this computer." }
+    if ($item.kind -eq 'snapshot') { Clear-PmStaleSnapshots | Out-Null }
+    else { Remove-Item -LiteralPath $item.path -Recurse -Force -ErrorAction Stop }
+    Write-PmAudit -Action 'leftover.removed' -Data @{ path = $item.path; kind = $item.kind; bytes = $item.bytes }
+    return $item
+}
+
 function Format-PmManagerError {
     param($ErrorRecord)
     $pos = ''
@@ -1438,6 +1539,27 @@ function Invoke-PmTestFlow {
 
 # ======================================================================= pre-flight
 
+function Get-PmBackupEstimate {
+    <#
+        PURE. Bytes a full backup copies, from the source facts (Initialize-PmRemoteWorkRoot) and the backup
+        options with the defaults of Invoke-PmRemoteBackup: history yes, logs no, automatic config copies no,
+        program clone yes, desktops yes. Older facts without the parts fall back to the whole data folder.
+    #>
+    param([Parameter(Mandatory)]$Facts, [hashtable]$Options = @{})
+    $opt = { param($k, $d) if ($Options.ContainsKey($k)) { [bool]$Options[$k] } else { $d } }
+    $total = [int64]$Facts.PrtgDataBytes
+    if (-not $Facts.PSObject.Properties['PrtgHistoryBytes']) { return $total }
+    if ([string]$Options.Scope -eq 'graphs') { return [int64]$Facts.PrtgHistoryBytes }
+    $b = $total
+    if (-not (& $opt 'IncludeHistory' $true)) { $b -= [int64]$Facts.PrtgHistoryBytes }
+    if (-not (& $opt 'IncludeLogs' $false)) { $b -= [int64]$Facts.PrtgLogsBytes }
+    if (-not (& $opt 'IncludeAutoBackups' $false)) { $b -= [int64]$Facts.PrtgAutoBackupBytes }
+    if (& $opt 'IncludeProgram' $true) { $b += [int64]$Facts.PrtgProgramBytes }
+    if (& $opt 'IncludeDesktop' $true) { $b += [int64]$Facts.DesktopBytes }
+    if ($b -lt 0) { return [int64]0 }
+    return [int64]$b
+}
+
 function Invoke-PmPreflight {
     <#
         Runs BEFORE anything is changed: every server must be reachable with admin rights and
@@ -1476,7 +1598,12 @@ function Invoke-PmPreflight {
         if ($src) {
             $includePrtg = -not ($Options.ContainsKey('IncludePrtg') -and -not $Options.IncludePrtg)
             if ($includePrtg -and -not $src.Prtg.Installed) { $problems += "$($Source.name): PRTG is not installed on the source." }
-            $data = [int64]$src.PrtgDataBytes
+            # what this backup really copies (history, logs, program clone and desktops as selected), not the whole data folder
+            $data = Get-PmBackupEstimate -Facts $src -Options $Options
+            if ($src.PSObject.Properties['PrtgHistoryBytes']) {
+                Add-PmJobLog -Job $Job -Level DEBUG -Message ("{0}: data folder {1:N2} GB (history {2:N2} GB, logs {3:N2} GB, automatic copies {4:N2} GB), program {5:N2} GB, desktops {6:N2} GB -> this backup copies ~{7:N2} GB." -f $Source.name,
+                        ($src.PrtgDataBytes / 1GB), ($src.PrtgHistoryBytes / 1GB), ($src.PrtgLogsBytes / 1GB), ($src.PrtgAutoBackupBytes / 1GB), ($src.PrtgProgramBytes / 1GB), ($src.DesktopBytes / 1GB), ($data / 1GB))
+            }
             $srcVersion = $src.Prtg.Version
             $viaTunnel = [string]$Options.Transfer -in 'wireguard', 'ipip'
             if ($viaTunnel) {
@@ -1494,7 +1621,10 @@ function Invoke-PmPreflight {
         if (-not $viaTunnel) {
             $mgrDrive = Get-PmLogicalDisk -Path (Get-PmPath Root)
             if ($data -gt 0 -and $mgrDrive -and $mgrDrive.FreeSpace -lt ($data * 2.2)) {
-                $problems += ("Manager: needs ~{0:N1} GB free on {1} for staging + package, has {2:N1} GB." -f ($data * 2.2 / 1GB), $mgrDrive.DeviceID, ($mgrDrive.FreeSpace / 1GB))
+                $hint = if ($Source -and $info[$Source.id] -and $info[$Source.id].PSObject.Properties['PrtgHistoryBytes'] -and [int64]$info[$Source.id].PrtgHistoryBytes -gt 1GB -and -not ($Options.ContainsKey('IncludeHistory') -and -not $Options.IncludeHistory)) {
+                    (' The history alone is {0:N1} GB - a backup without history (and a separate History backup of the last days) needs much less.' -f ([int64]$info[$Source.id].PrtgHistoryBytes / 1GB))
+                } else { '' }
+                $problems += ("Manager: needs ~{0:N1} GB free on {1} for staging + package, has {2:N1} GB.{3}" -f ($data * 2.2 / 1GB), $mgrDrive.DeviceID, ($mgrDrive.FreeSpace / 1GB), $hint)
             }
         }
     }
@@ -1952,11 +2082,26 @@ function Get-PmExtractedStage {
     $dir = Join-Path (Get-PmPath Data) ("staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($ZipPath))
     if (Test-PmStageComplete -StageDir $dir) { return $dir }
     if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
-    Add-PmJobLog -Job $Job -Level STEP -Message "Extracting $(Split-Path $ZipPath -Leaf) on the manager..."
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $dir)
+    # enough room for the unpacked package? (a disk that runs full half-way leaves a broken copy behind)
+    $need = [int64]0; $zr = [IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try { foreach ($e in $zr.Entries) { $need += $e.Length } } finally { $zr.Dispose() }
+    $drive = Get-PmLogicalDisk -Path (Get-PmPath Data)
+    if ($drive -and $drive.FreeSpace -lt ($need + 1GB)) {
+        throw ("Not enough free space on {0} to unpack {1}: {2:N1} GB free, {3:N1} GB needed (package {4:N1} GB + 1 GB)." -f $drive.DeviceID, (Split-Path $ZipPath -Leaf), ($drive.FreeSpace / 1GB), (($need + 1GB) / 1GB), ($need / 1GB))
+    }
+    Add-PmJobLog -Job $Job -Level STEP -Message ("Extracting {0} ({1:N2} GB) on the manager..." -f (Split-Path $ZipPath -Leaf), ($need / 1GB))
+    try { [IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $dir) }
+    catch { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue; throw }
     Set-PmStageComplete -StageDir $dir
     return $dir
+}
+
+function Remove-PmExtractedStage {
+    <# Removes the unpacked copy of a package (data\staging\restore-<name>) after the restore that used it. #>
+    param([Parameter(Mandatory)][string]$ZipPath)
+    $dir = Join-Path (Get-PmPath Data) ("staging\restore-" + [IO.Path]::GetFileNameWithoutExtension($ZipPath))
+    if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 function Invoke-PmRestoreFlow {
@@ -1991,7 +2136,16 @@ function Invoke-PmRestoreFlow {
         }
 
         $stageLocal = Get-PmExtractedStage -ZipPath $BackupPath -StageDir $StageDir -Job $Job
-        if ($agent) {
+        # only a copy unpacked for this restore is used up; a staging copy handed in (migration) may serve more targets
+        $isLocal = [bool]$s.PSObject.Properties['PmLocal'] -and ($stageLocal -ne $StageDir)
+        if ($isLocal) {
+            # PRTG is on this computer: the restore reads the unpacked package where it is and MOVES the data into
+            # place - no second copy on the same disk. The unpacked copy is used up and removed afterwards.
+            $params.StageDir = $stageLocal
+            $params.MoveFromStage = $true
+            $params.CleanupStage = $false
+            Add-PmJobLog -Job $Job -Level OK -Message "Local restore: the unpacked package in $stageLocal is moved into place (no second copy on this disk)."
+        } elseif ($agent) {
             $params.StageDir = ConvertTo-PmTsClientPath $stageLocal
             $params.LogDir = ConvertTo-PmTsClientPath (Join-Path (Get-PmPath Data) 'logs\robocopy')
             Add-PmJobLog -Job $Job -Level DEBUG -Message "Direct restore: target reads $($params.StageDir)"
@@ -2013,8 +2167,16 @@ function Invoke-PmRestoreFlow {
             $params.CleanupStage = $true
         }
 
-        $r = Invoke-PmRemote -Session $s -Function 'Invoke-PmRemoteRestore' -Parameters $params -Job $Job `
-            -ProgressBase ($ProgressBase + [int]($ProgressSpan * 0.62)) -ProgressSpan ($ProgressSpan * 0.38)
+        try {
+            $r = Invoke-PmRemote -Session $s -Function 'Invoke-PmRemoteRestore' -Parameters $params -Job $Job `
+                -ProgressBase ($ProgressBase + [int]($ProgressSpan * 0.62)) -ProgressSpan ($ProgressSpan * 0.38)
+        } finally {
+            # a local restore moved the data out of the unpacked copy: it is incomplete now and must never be reused
+            if ($isLocal -and $stageLocal -and (Test-Path -LiteralPath $stageLocal)) {
+                Remove-Item -LiteralPath $stageLocal -Recurse -Force -ErrorAction SilentlyContinue
+                Add-PmJobLog -Job $Job -Level DEBUG -Message "Unpacked copy removed: $stageLocal"
+            }
+        }
         if (-not $r) { throw 'Remote restore returned no result.' }
         Write-PmAudit -Action 'restore.finished' -Data @{ job = $jobId; server = $Server.name; package = (Split-Path $BackupPath -Leaf); prtg = $r.Report.Prtg; errors = @($r.Report.Errors).Count }
         return $r.Report
@@ -2047,6 +2209,7 @@ function Invoke-PmRebindFlow {
         the source's address and only answers on 127.0.0.1), restarts PRTG and verifies it.
     #>
     param([Parameter(Mandatory)]$Server, [pscredential]$Credential, $Job)
+    Assert-PmNotSource -Server $Server -What 'change the web binding of'
     if ((Get-PmTransport $Server) -eq 'rdp') { throw "$($Server.name): this action needs the WinRM connection method." }
     Add-PmJobLog -Job $Job -Level STEP -Message "Connecting to $($Server.name) ($($Server.host)) via $((Get-PmTransport $Server).ToUpper())..."
     $s = New-PmSession -Server $Server -Credential $Credential -Job $Job
@@ -2365,7 +2528,11 @@ function Invoke-PmJob {
                     if ($failed) { throw "$failed of $($targets.Count) target(s) reported errors." }
                 } else {
                     $plain = Get-PmPlainPackage -Path $file -Password $pw -Job $Job
-                    try { $Job.result = Invoke-PmMultiRestore -File $plain.Path -TargetIds $targets -Options $options -Credentials $creds -Job $Job -Base 0 -Span 100 }
+                    try {
+                        $Job.result = Invoke-PmMultiRestore -File $plain.Path -TargetIds $targets -Options $options -Credentials $creds -Job $Job -Base 0 -Span 100
+                        # every target done: the unpacked copy is not needed for a Resume any more (it is kept after a failure)
+                        Remove-PmExtractedStage -ZipPath $plain.Path
+                    }
                     finally { Remove-PmPlainPackage $plain }
                 }
             }
@@ -2474,6 +2641,24 @@ function Invoke-PmMultiRestore {
     return $reports
 }
 
+function Get-PmJobLockIds {
+    <#
+        PURE. Servers whose PRTG a job may stop or change: two such jobs must never run on the same server at once
+        (both would stop/start PRTG and write its configuration and registry). A backup can stop the source.
+    #>
+    param([Parameter(Mandatory)][string]$Type, [hashtable]$Params = @{})
+    $ids = switch ($Type) {
+        'restore' { @($Params.TargetIds) }
+        'migrate' { @($Params.SourceId) + @($Params.TargetIds) }
+        'backup' { @($Params.SourceId) }
+        'license' { if ([string]$Params.Action -ne 'status') { @($Params.ServerIds) } }
+        'unlicense' { @($Params.ServerIds) }
+        'rebind' { @($Params.ServerIds) }
+        default { @() }
+    }
+    return @(@($ids) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Select-Object -Unique)
+}
+
 function Start-PmJob {
     <# Queues a job on the background runspace pool (used by the dashboard). #>
     param([Parameter(Mandatory)][string]$Type, [hashtable]$Params = @{}, [string]$Summary)
@@ -2482,11 +2667,28 @@ function Start-PmJob {
         $busy = Get-PmPackageUser -Name ([string]$Params.BackupName)
         if ($busy) { throw "The package $($Params.BackupName) is used by job $busy right now - wait until it has finished." }
     }
+    # one job that stops / changes PRTG per server at a time
+    $lock = @(Get-PmJobLockIds -Type $Type -Params $Params)
+    if ($lock.Count) {
+        foreach ($other in @($script:PmJobs.Values)) {
+            if (-not $other.lockIds) { continue }
+            # a cancelled restore keeps the lock while its runspace still puts the previous state back
+            $h = $script:PmJobHandles[$other.id]
+            $alive = $other.status -in 'queued', 'running' -or ($h -and $h.Async -and -not $h.Async.IsCompleted)
+            if (-not $alive) { continue }
+            $both = @($lock | Where-Object { @($other.lockIds) -contains $_ })
+            if ($both.Count) {
+                $n = @($both | ForEach-Object { $id = $_; $s = Get-PmServers | Where-Object { $_.id -eq $id } | Select-Object -First 1; if ($s) { $s.name } else { $id } }) -join ', '
+                throw "Job $($other.id) ($($other.summary)) is changing PRTG on $n right now - wait until it has finished."
+            }
+        }
+    }
     if (-not $script:PmPool) {
         $script:PmPool = [runspacefactory]::CreateRunspacePool(1, 4)
         $script:PmPool.Open()
     }
     $job = New-PmJobObject -Type $Type -Summary $Summary
+    $job.lockIds = $lock
     # Keep the parameters (without one-time credentials) so the job can be resumed/retried later.
     $saved = @{}
     foreach ($k in $Params.Keys) { if ($k -notin 'Credentials', 'Resume', 'Secrets') { $saved[$k] = $Params[$k] } }
@@ -2515,6 +2717,9 @@ function Stop-PmJob {
         $job.status = 'cancelled'; $job.finished = (Get-Date).ToString('o')
         Write-PmAudit -Action 'job.cancelled' -Data @{ id = $Id }
         Add-PmJobLog -Job $job -Level WARN -Message 'Job cancelled by user (remote operations already started may still finish on the server).'
+        if ($job.type -in 'restore', 'migrate') {
+            Add-PmJobLog -Job $job -Level WARN -Message 'A restore that had already stopped PRTG puts the previous state back on its own (log: <PRTG Manager work folder>\rollback\cancelled-restore-*.log on the target). The server stays locked for other PRTG jobs until that has finished.'
+        }
         Save-PmJobRecord -Job $job
     }
 }
@@ -2562,11 +2767,37 @@ function Resume-PmJob {
     return Start-PmJob -Type $old.type -Params $p -Summary $summary
 }
 
+function Clear-PmFinishedJobs {
+    <#
+        Frees the memory of jobs that finished more than $Minutes ago: their PowerShell instance is disposed and they are
+        dropped from memory (the job record on disk stays, Get-PmJob reads it from there).
+    #>
+    param([int]$Minutes = 60)
+    $limit = (Get-Date).AddMinutes(-$Minutes)
+    foreach ($id in @($script:PmJobHandles.Keys)) {
+        $h = $script:PmJobHandles[$id]; $j = $script:PmJobs[$id]
+        if (-not $h -or -not $h.Async -or -not $h.Async.IsCompleted) { continue }
+        if ($j -and ($j.status -in 'queued', 'running' -or -not $j.finished -or [datetime]$j.finished -gt $limit)) { continue }
+        try { $h.PowerShell.Dispose() } catch { }
+        $script:PmJobHandles.Remove($id); $script:PmJobs.Remove($id)
+    }
+}
+
 function Get-PmJobs {
     <# In-memory jobs plus finished jobs persisted on disk (newest first, without logs). #>
+    Clear-PmFinishedJobs
     $list = @{}
+    if (-not $script:PmJobListCache) { $script:PmJobListCache = @{} }
     foreach ($f in (Get-ChildItem -LiteralPath (Get-PmPath Jobs) -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Select-Object -First 100)) {
-        try { $j = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json; $list[$j.id] = $j } catch { }
+        # a record is parsed again only when it changed (the dashboard asks for this list every few seconds)
+        $c = $script:PmJobListCache[$f.FullName]
+        if ($c -and $c.Time -eq $f.LastWriteTimeUtc.Ticks -and $c.Size -eq $f.Length) { $list[$c.Job.id] = $c.Job; continue }
+        try {
+            $j = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $s = [pscustomobject]@{ id = $j.id; type = $j.type; summary = $j.summary; status = $j.status; progress = $j.progress; step = $j.step; created = $j.created; finished = $j.finished; error = $j.error }
+            $script:PmJobListCache[$f.FullName] = @{ Time = $f.LastWriteTimeUtc.Ticks; Size = $f.Length; Job = $s }
+            $list[$j.id] = $s
+        } catch { }
     }
     foreach ($j in @($script:PmJobs.Values)) { $list[$j.id] = [pscustomobject]$j }
     $list.Values | Sort-Object { $_.created } -Descending | ForEach-Object {

@@ -261,6 +261,8 @@ function Invoke-PmRoute {
                 servers = @(Get-PmServers).Count; backups = @(Get-PmBackups).Count
                 # jobs on this computer itself (connection method "local") need administrator rights
                 elevated = [bool](New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+                # 'recycle' or 'permanent' (dashboard running as SYSTEM): what Delete does
+                deleteMode = (Get-PmDeleteMode)
             }
             return
         }
@@ -345,8 +347,16 @@ function Invoke-PmRoute {
         }
         '^GET /api/backups/[^/]+/manifest$' { Send-PmJson $Ctx (Read-PmBackupManifest -ZipPath (Get-PmBackupFile -Name $seg[2])); return }
         '^DELETE /api/backups/[^/]+$' {
-            try { Remove-PmBackup -Name $seg[2]; Write-PmAudit -Action 'backup.deleted' -Data @{ name = $seg[2]; to = 'Recycle Bin' }; Send-PmJson $Ctx @{ ok = $true; recycled = $true } }
+            try { $mode = Remove-PmBackup -Name $seg[2]; Write-PmAudit -Action 'backup.deleted' -Data @{ name = $seg[2]; to = $(if ($mode -eq 'permanent') { 'deleted permanently (dashboard runs as SYSTEM)' } else { 'Recycle Bin' }) }; Send-PmJson $Ctx @{ ok = $true; recycled = ($mode -ne 'permanent'); mode = $mode } }
             catch { Send-PmError -Ctx $Ctx -Operation 'Delete backup' -Component $seg[2] -Reason $_.Exception.Message -Status 409 -Hint 'Nothing was deleted. Close programs that use the file and try again.' }
+            return
+        }
+        '^GET /api/leftovers$' { Send-PmJson $Ctx @(Get-PmLeftovers); return }
+        '^POST /api/leftovers/remove$' {
+            $b = Read-PmBody $Ctx
+            if (-not $b.path) { Send-PmJson $Ctx @{ error = 'path is required' } 400; return }
+            try { $r = Remove-PmLeftover -Path ([string]$b.path); Send-PmJson $Ctx @{ ok = $true; removed = $r.path; bytes = $r.bytes } }
+            catch { Send-PmError -Ctx $Ctx -Operation 'Remove leftover' -Component ([string]$b.path) -Reason $_.Exception.Message -Status 409 -Hint 'Nothing was removed.' }
             return
         }
 
@@ -525,8 +535,19 @@ try {
             for ($i = $IoTasks.Count - 1; $i -ge 0; $i--) {
                 if ($IoTasks[$i].Async.IsCompleted) { try { $IoTasks[$i].PS.EndInvoke($IoTasks[$i].Async) } catch { }; $IoTasks[$i].PS.Dispose(); $IoTasks.RemoveAt($i) }
             }
+            # once a day while idle: old logs / job records, finished jobs out of memory
+            if (-not $script:PmLastHousekeeping -or ((Get-Date) - $script:PmLastHousekeeping).TotalHours -ge 24) {
+                $script:PmLastHousekeeping = Get-Date
+                try { [void](Invoke-PmHousekeeping) } catch { Write-PmManagerLog -Level WARN -Message "Housekeeping failed: $($_.Exception.Message)" -Source 'dashboard' }
+            }
         }
-        $ctx = $task.GetAwaiter().GetResult()
+        # a failed request (client gone, listener hiccup) must not end the dashboard
+        try { $ctx = $task.GetAwaiter().GetResult() }
+        catch {
+            Write-PmManagerLog -Level WARN -Message "Request could not be received: $($_.Exception.Message)" -Source 'dashboard'
+            if (-not $listener.IsListening) { break }
+            continue
+        }
         $rsw = [Diagnostics.Stopwatch]::StartNew()
         try {
             Invoke-PmRoute -Ctx $ctx

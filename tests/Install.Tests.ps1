@@ -338,7 +338,7 @@ Describe 'Installer option -Local (PRTG Manager on the PRTG server itself)' -Ski
 
     It 'has the functions for the server entry, the logon task and the shortcut with administrator rights' {
         $text = [IO.File]::ReadAllText((Join-Path $Root 'install.ps1'))
-        $text.Contains("Set-PmServer -Name `$env:COMPUTERNAME -HostName 'localhost' -Role 'both' -Transport 'local'") | Should -BeTrue
+        $text.Contains("Set-PmServer -Name `$env:COMPUTERNAME -HostName 'localhost' -Role `$Role -Transport 'local'") | Should -BeTrue
         $text.Contains('-RunLevel Highest') | Should -BeTrue
         $text.Contains('$bytes[0x15] -bor 0x20') | Should -BeTrue
     }
