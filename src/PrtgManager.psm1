@@ -905,6 +905,35 @@ function Remove-PmPlainPackage {
     if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+function Clear-PmStaleDecrypted {
+    <#
+        Called when the dashboard starts: a restore of an encrypted package that was cut off (process
+        killed, computer restarted) never reached its cleanup, so its decrypted zip and extract stay in
+        data\staging. They are removed - unless a command-line restore (cli\Invoke-PrtgManager.ps1) is
+        running right now and may still use them. Returns the removed paths.
+    #>
+    $dir = Join-Path (Get-PmPath Data) 'staging'
+    if (-not (Test-Path -LiteralPath $dir)) { return @() }
+    $cli = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '(?i)Invoke-Prtg(Manager|Mover)\.ps1' })
+    if ($cli.Count) { Write-PmManagerLog -Level INFO -Message 'Decrypted restore copies are kept: a command-line restore is running.' -Source 'dashboard'; return @() }
+    $gone = New-Object System.Collections.ArrayList
+    foreach ($i in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'decrypted-*.zip' -or ($_.PSIsContainer -and $_.Name -like 'restore-decrypted-*') })) {
+        try { Remove-Item -LiteralPath $i.FullName -Recurse -Force -ErrorAction Stop; [void]$gone.Add($i.FullName) }
+        catch { Write-PmManagerLog -Level WARN -Message "Could not remove the decrypted copy $($i.FullName): $($_.Exception.Message)" -Source 'dashboard' }
+    }
+    if ($gone.Count) { Write-PmManagerLog -Level WARN -Message "Removed $($gone.Count) decrypted package copy/copies left by an interrupted restore: $($gone -join ', ')" -Source 'dashboard' }
+    return @($gone)
+}
+
+function Get-PmPackageUser {
+    <# The id of a running / queued job that restores or previews this package, or '' - two at once would share its decrypted copy. #>
+    param([Parameter(Mandatory)][string]$Name)
+    foreach ($j in @($script:PmJobs.Values)) {
+        if ($j.status -in 'queued', 'running' -and $j.type -in 'restore', 'restore-preview' -and $j.params -and [string]$j.params.BackupName -eq $Name) { return [string]$j.id }
+    }
+    return ''
+}
+
 # ======================================================================= PRTG parts, license, previews (flows)
 
 function Assert-PmNotSource {
@@ -2442,6 +2471,11 @@ function Invoke-PmMultiRestore {
 function Start-PmJob {
     <# Queues a job on the background runspace pool (used by the dashboard). #>
     param([Parameter(Mandatory)][string]$Type, [hashtable]$Params = @{}, [string]$Summary)
+    # one restore / preview per package at a time: both would decrypt into and clean up the same staging copy
+    if ($Type -in 'restore', 'restore-preview' -and $Params.BackupName) {
+        $busy = Get-PmPackageUser -Name ([string]$Params.BackupName)
+        if ($busy) { throw "The package $($Params.BackupName) is used by job $busy right now - wait until it has finished." }
+    }
     if (-not $script:PmPool) {
         $script:PmPool = [runspacefactory]::CreateRunspacePool(1, 4)
         $script:PmPool.Open()

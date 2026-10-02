@@ -442,7 +442,8 @@ function Invoke-PmRoute {
             if ($xfer -eq 'wireguard') { $summary += ' via WireGuard (server to server)' }
             elseif ($xfer -eq 'ipip') { $summary += ' via IPIP (server to server)' }
             elseif ($xfer -in 'rdp', 'winrm') { $summary += " via $($xfer.ToUpper())" }
-            $job = Start-PmJob -Type $b.type -Params $params -Summary $summary
+            try { $job = Start-PmJob -Type $b.type -Params $params -Summary $summary }
+            catch { Send-PmError -Ctx $Ctx -Operation 'Start job' -Component ([string]$params.BackupName) -Reason $_.Exception.Message -Status 409 -Hint 'Open the Jobs page and wait for the running job.'; return }
             Send-PmJson $Ctx @{ id = $job.id }
             return
         }
@@ -511,6 +512,7 @@ Write-Host "  Data  : $DataRootPath"
 Write-Host '  Stop  : Ctrl+C'
 Write-Host "  Logs  : $(Join-Path (Get-PmPath Data) 'logs')  (manager, audit, robocopy) + data\jobs + data\agent\<id>\agent.log"
 Repair-PmInterruptedJobs
+[void](Clear-PmStaleDecrypted)   # decrypted package copies left by a restore that was cut off
 Write-PmManagerLog -Message "Dashboard $Version started on $prefix by $env:USERDOMAIN\$env:USERNAME (PID $PID)" -Source 'dashboard'
 Write-Host ''
 if (-not $NoBrowser) { Start-Process $url }

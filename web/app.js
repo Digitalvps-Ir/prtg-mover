@@ -42,6 +42,8 @@
     ok.className = `btn ${opts.danger ? 'destructive' : 'primary'}`;
     box.hidden = !opts.type; inp.value = '';
     if (opts.type) { $('#cfTypeWord').textContent = opts.type; ok.disabled = true; inp.oninput = () => { ok.disabled = inp.value.trim() !== opts.type; }; } else { ok.disabled = false; inp.oninput = null; }
+    // Enter in the box confirms once the text matches (the form's first button is Cancel)
+    inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); if (!ok.disabled) d.close('ok'); } };
     return new Promise((resolve) => {
       d.returnValue = '';
       d.addEventListener('close', () => resolve(d.returnValue === 'ok' && (!opts.type || inp.value.trim() === opts.type)), { once: true });
@@ -894,6 +896,7 @@
     $('#licRemoveForm').reset(); $('#licRemoveWhich').textContent = `${s.name} (${s.host})`;
     const inp = $('#licRemoveForm').confirmName; $('#licRemoveGo').disabled = true;
     inp.oninput = () => { $('#licRemoveGo').disabled = inp.value.trim() !== s.name; };
+    inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); if (!$('#licRemoveGo').disabled) $('#licRemoveDialog').close('go'); } };
     $('#licRemoveDialog').showModal(); inp.focus();
   });
   $('#licRemoveDialog').addEventListener('close', () => {

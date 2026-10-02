@@ -383,6 +383,23 @@ Describe 'Upgrade path and command line (review findings)' {
         $srv | Should -Match "'\.woff2' = 'font/woff2'"
         $srv | Should -Match 'ReadAllBytes\(\$file\)'
     }
+    It 'runs one restore per package at a time and removes decrypted copies left by an interrupted restore' {
+        Import-Module (Join-Path $Root 'src\PrtgManager.psm1') -Force -DisableNameChecking
+        $mgr = Join-Path $Work 'stale-mgr'; New-Item -ItemType Directory -Force -Path $mgr | Out-Null
+        Set-PmRoot -Path $mgr
+        $stage = Join-Path (Get-PmPath Data) 'staging'
+        New-Item -ItemType Directory -Force -Path (Join-Path $stage 'restore-decrypted-PRTG-FULL_X\PRTG') | Out-Null
+        Set-Content -LiteralPath (Join-Path $stage 'decrypted-PRTG-FULL_X.zip') -Value 'x'
+        New-Item -ItemType Directory -Force -Path (Join-Path $stage 'job-123') | Out-Null
+        @(Clear-PmStaleDecrypted).Count | Should -Be 2
+        Test-Path -LiteralPath (Join-Path $stage 'job-123') | Should -BeTrue -Because 'only decrypted copies are removed'
+        & (Get-Module PrtgManager) { $script:PmJobs['j1'] = @{ id = 'j1'; type = 'restore'; status = 'running'; params = @{ BackupName = 'PRTG-FULL_X.pmenc' } } }
+        try {
+            Get-PmPackageUser -Name 'PRTG-FULL_X.pmenc' | Should -Be 'j1'
+            { Start-PmJob -Type 'restore-preview' -Params @{ BackupName = 'PRTG-FULL_X.pmenc' } -Summary 'test' } | Should -Throw '*used by job j1*'
+        } finally { & (Get-Module PrtgManager) { $script:PmJobs.Remove('j1') } }
+        Get-PmPackageUser -Name 'PRTG-FULL_X.pmenc' | Should -Be ''
+    }
     It 'a part restore that reports ok = false fails the command line and the dashboard job' {
         $cli = [IO.File]::ReadAllText((Join-Path $Root 'cli\Invoke-PrtgManager.ps1'))
         $restore = $cli.Substring($cli.IndexOf("'Restore' {")); $restore = $restore.Substring(0, $restore.IndexOf("'RemoveLicense' {"))
