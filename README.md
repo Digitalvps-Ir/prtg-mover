@@ -80,12 +80,14 @@ Modes for configuration parts:
 
 **Rollback**:
 
-- *Full restore*: the target's data folder is kept as `<data>.pre-restore-<time>` and its registry is exported. If the restore fails or PRTG does not come up, both are **put back automatically** and PRTG is started again (*Roll back automatically* is on by default).
+- *Full restore*: the target's data folder is kept as `<data>.pre-restore-<time>` and its registry is exported. If the restore fails or PRTG does not come up, both are **put back automatically** and PRTG is started again (*Roll back automatically* is on by default). **Cancel** in the middle of a restore does the same: once PRTG has been stopped, the previous data folder, registry and firewall state are put back (log: `<work folder>\rollback\cancelled-restore-<time>.log`). A failure before anything was changed starts PRTG again.
 - *Configuration parts*: `PRTG Configuration.dat` is copied to `C:\PrtgMover\rollback\config-<time>` first; the change is written through a temp file that must parse; if PRTG does not come up, the copy is put back.
 - *License*: the current license data is saved in `C:\PrtgMover\rollback\license-<time>` first.
 - *History*: files that exist are kept (merge) or replaced (overwrite); nothing is deleted; the graph cache is set aside so PRTG recalculates the graphs.
 
-A server with the role **Source** is never restored into.
+A server with the role **Source** is never restored into. Its license and web binding are never changed either. On a PRTG server with PRTG Manager installed locally, set the role of this computer to **Source** (Servers > Edit, or `install.ps1 -Local -Role source`) - the installer adds it as *both*.
+
+Only one job that stops or changes PRTG (restore, migration, backup, license change, web binding) runs per server at a time; a second one is refused with the running job named.
 
 ## License page
 
@@ -130,7 +132,8 @@ The installer copies the program to `C:\PrtgManager` (an existing PRTG Mover ins
 |---|---|
 | `-InstallPath <folder>` | Install into another folder. |
 | `-Source <folder or zip>` | Install from there instead of the installer's own folder. |
-| `-Local` | PRTG Manager on the PRTG server itself (elevated): this computer is added with the connection method *Local* and the dashboard starts with the computer. |
+| `-Local` | PRTG Manager on the PRTG server itself (elevated): this computer is added with the connection method *Local* and the dashboard starts with the computer. A watchdog starts it again within 5 minutes if it stops. |
+| `-Role both|source|target` | With `-Local`: role of this computer in the server list (default *both*). A *source* is never restored into. |
 | `-Autostart` / `-NoAutostart` | Start with Windows on / off. |
 | `-TrustedHosts a,b` | Prepare plain WinRM (HTTP) to these servers. |
 | `-Port`, `-NoShortcut`, `-NoStart`, `-Uninstall` | Self-explanatory. |
@@ -154,7 +157,7 @@ Your data (`config\`, `data\`, `backups\`, `installers\`) is never touched by an
 | **Overview** | Counters and recent jobs. |
 | **Servers** | Inventory, connection method, ports, tests, PRTG version, license badge. |
 | **Backup & Migrate** | Backup type, options, backup password, migration targets, plain-language summary. |
-| **Backups** | Name, type, source, created, size, format and PRTG version, encrypted, valid — **Download, Validate, Inspect, Restore, Delete** (to the Recycle Bin). Upload of `.zip` / `.pmenc`. |
+| **Backups** | Name, type, source, created, size, format and PRTG version, encrypted, valid — **Download, Validate, Inspect, Restore, Delete** (to the Recycle Bin; when the dashboard runs as SYSTEM - the task at system start - it deletes permanently and says so first, because SYSTEM's Recycle Bin is not visible and frees no space). Upload of `.zip` / `.pmenc`. **Leftovers on this computer**: unpacked packages, temporary restore stages, rollback copies, previous PRTG data folders and VSS snapshots of interrupted runs, with sizes and Remove. |
 | **License** | Status, trial / authorized key, backup, restore, removal. |
 | **Jobs** | Progress, live log, per-target results, Resume / Retry, Cancel, log download. |
 | **Logs & Audit** | Audit trail (backups, restores, validations, license changes, deletions) and the manager log. |

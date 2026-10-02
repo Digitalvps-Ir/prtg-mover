@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.1.0 — 2026-10-02
+
+Fixes from a review of PRTG Manager running in local mode on the PRTG servers themselves (as SYSTEM, from the task at system start).
+
+### Fixed
+- **Cancel during a restore left PRTG stopped, possibly without a data folder.** A cancelled job is stopped without running `catch` blocks, so the rollback never ran. The full restore and the part restores (devices, notifications, triggers) now put the previous state back in a `finally` block once PRTG has been stopped. That covers the data folder, the registry, the configuration and the firewall rule the restore added. The log goes to `<work folder>\rollback\cancelled-restore-<time>.log`, because a cancelled job's output is dropped. The server stays locked for other PRTG jobs until this has finished.
+- **A failure before anything was changed left PRTG stopped.** For example, the services did not stop in time, or the data folder could not be set aside. PRTG is now started again. A data folder that could not be renamed is only used as the rollback source when the copy really succeeded; a partial copy now stops the restore before anything is changed.
+- **A backup whose service stop failed left the source PRTG stopped.** The stop now runs inside the block that restarts PRTG.
+- **VSS snapshots of failed backups stayed on the system drive** and kept growing until the next backup. They are removed immediately.
+- **A restore on the PRTG server itself needed two to three times the package size on C:.** The package was unpacked, copied again into the work folder, and the history copied a third time while PRTG was stopped. The unpacked package is now moved into place, with no second copy, and the history files are moved instead of copied. Free space is checked before unpacking, a half-unpacked copy is removed, and the unpacked copy is deleted after a successful restore instead of staying in `data\staging` forever.
+- **Wrong free-space estimate for backups.** The estimate was 2.2 × the whole data folder (history, logs and automatic configuration copies included), while the program clone and the desktops were not counted. It now uses what the backup really copies. When the space is too small and the history is large, the message suggests a backup without history.
+- **Delete did not free space when the dashboard runs as SYSTEM.** Files went to SYSTEM's Recycle Bin, which administrators cannot see, and an error dialog in session 0 could stop the dashboard. The SYSTEM dashboard now deletes permanently and says so before you confirm. A dashboard run by a person still uses the Recycle Bin (`/api/info` `deleteMode`).
+- **Two jobs could stop and change the same PRTG at the same time.** For example, a restore and a license change. Restore, migration, backup, license change, license removal and web binding now take a per-server lock, and a second such job is refused with the running job named.
+- **The web binding could be changed on a Source server.** "Fix web binding" now refuses a server with the role Source, like restore and license changes.
+- **The dashboard could end on a failed request.** An exception while receiving a request ended the process. It is now logged and the dashboard goes on.
+- **The dashboard grew without limit.** Finished jobs are dropped from memory after an hour; their records stay on disk. The job list no longer re-reads every job file every few seconds. Once a day, manager and robocopy logs older than 30 days and job records older than 90 days are deleted (the newest 200 always stay), and the audit log is rotated at 10 MB.
+- **The free-space count could fail on a profile this account may not read.** Such a folder now counts as empty.
+
+### Added
+- **Watchdog:** the task "PRTG Manager Dashboard" gets a second trigger every 5 minutes. A dashboard that stopped comes back within 5 minutes instead of at the next restart; a running one is left alone.
+- **`install.ps1 -Local -Role source|target|both`** sets the role of this computer in the server list. A Source is never restored into, and its license and web binding are never changed.
+- **Leftovers on this computer** (Backups page, `GET /api/leftovers`, `POST /api/leftovers/remove`). It lists, with their sizes, unpacked packages, temporary restore stages, rollback copies, previous PRTG data folders (`.pre-restore-*`, `.failed-restore-*`) and VSS snapshots of interrupted backups. Each item can be removed after a confirmation. Only listed items can be removed, and only while no job runs.
+- Tests: cancel during a restore (a real stopped pipeline), the restart of PRTG when the data folder cannot be set aside, the backup estimate, the per-server lock, the delete mode, leftovers, housekeeping and the watchdog trigger.
+
+
 ## 2.0.2 — 2026-10-02
 
 ### Fixed

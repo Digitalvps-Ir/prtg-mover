@@ -206,6 +206,63 @@ Describe 'Full restore into a server where PRTG is already installed (simulated 
         @(Get-ChildItem $c.Root -Directory | Where-Object Name -like 'target-data.failed-restore-*').Count | Should -Be 1   # the restored data is kept, not deleted
     }
 
+    It 'starts PRTG again and changes nothing when the data folder cannot be set aside' {
+        $c = New-InstalledCase 'noaside'
+        Register-InstalledMocks $c.Target
+        Mock Get-PmPrtgInfo { [pscustomobject]@{ Installed = $true; Version = '25.4.114.1032'; DataPath = $script:InstTarget; ProgramPath = (Join-Path $Work 'no-program'); RegistryKeys = @(); ListenPorts = @(443); ListenEndpoints = @(); CoreStatus = 'Running' } }
+        Mock Rename-Item { throw 'the folder is in use' }
+        Mock Invoke-PmRobocopy { 16 }
+        Mock Start-PmPrtgServices { }
+        Mock Invoke-PmHealthCheck { throw 'no health check may run' }
+        $out = @(Invoke-PmRemoteRestore -JobId 'inst3' -StageDir $c.Stage -WorkRoot $c.WorkRoot -RestoreDesktop $false -RestoreExtra $false -CopyLicense $false)
+        $r = ($out | Where-Object PmType -eq 'result').Report
+        $r.Prtg | Should -Be 'failed'
+        @($r.Errors) -join ' ' | Should -Match 'could not be set aside'
+        Get-Content (Join-Path $c.Target 'PRTG Configuration.dat') | Should -Be 'OLD CONFIG'
+        Should -Invoke Start-PmPrtgServices -Times 1 -Exactly
+    }
+
+    It 'puts the previous data back when the restore is CANCELLED while PRTG is stopped (catch blocks do not run on a cancel)' {
+        $c = New-InstalledCase 'cancel'
+        $flag = Join-Path $c.Root 'flag'
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({
+                param($RemotePath, $Tgt, $Stage, $WorkRoot, $Flag)
+                . $RemotePath
+                # a "PRTG" in the test folder; the health check waits like a slow start
+                function Get-PmPrtgInfo { [pscustomobject]@{ Installed = $true; Version = '25.4.114.1032'; DataPath = $Tgt; ProgramPath = (Join-Path $WorkRoot 'no-program'); RegistryKeys = @(); ListenPorts = @(443); ListenEndpoints = @(); CoreStatus = 'Running' } }
+                function Stop-PmPrtgServices { }
+                function Start-PmPrtgServices { }
+                function Invoke-PmReg { 0 }
+                function Set-PmPrtgWebBinding { }
+                function Set-PmPrtgFirewall { @(443) }
+                function Get-PmLicenseValues { @() }
+                function Get-NetFirewallRule { }
+                function Remove-NetFirewallRule { }
+                function Invoke-PmHealthCheck {
+                    param($Box, $TimeoutMinutes, $PreferredPorts)
+                    if (-not (Test-Path -LiteralPath "$Flag.waiting")) { Set-Content -LiteralPath "$Flag.waiting" 'x'; Start-Sleep -Seconds 120 }
+                    $Box.Health = [pscustomobject]@{ Healthy = $true; Url = 'https://x/'; Version = '25.4.114.1032'; Core = 'Running'; Probe = 'Running'; Message = '' }
+                }
+                Invoke-PmRemoteRestore -JobId 'cancel' -StageDir $Stage -WorkRoot $WorkRoot -RestoreDesktop $false -RestoreExtra $false -CopyLicense $false -MoveFromStage $true
+            }).AddArgument((Join-Path $Root 'src\Remote\PrtgManager.Remote.ps1')).AddArgument($c.Target).AddArgument($c.Stage).AddArgument($c.WorkRoot).AddArgument($flag)
+        $async = $ps.BeginInvoke()
+        try {
+            $until = (Get-Date).AddSeconds(60)
+            while (-not (Test-Path -LiteralPath "$flag.waiting") -and (Get-Date) -lt $until -and -not $async.IsCompleted) { Start-Sleep -Milliseconds 200 }
+            Test-Path -LiteralPath "$flag.waiting" | Should -BeTrue -Because 'the restore must reach the health check (the error stream is not read here: enumerating it would wait for the end)'
+            Get-Content (Join-Path $c.Target 'PRTG Configuration.dat') | Should -Be 'NEW CONFIG FROM THE SOURCE'   # restored, PRTG "starting"
+            $ps.Stop()   # what Cancel does; returns when the pipeline (and its finally blocks) has finished
+        } finally { $ps.Dispose() }
+        Get-Content (Join-Path $c.Target 'PRTG Configuration.dat') | Should -Be 'OLD CONFIG'
+        Test-Path (Join-Path $c.Target 'Monitoring Database\old.dat') | Should -BeTrue
+        @(Get-ChildItem $c.Root -Directory | Where-Object Name -like 'target-data.failed-restore-*').Count | Should -Be 1
+        $log = @(Get-ChildItem (Join-Path $c.WorkRoot 'rollback') -Filter 'cancelled-restore-*.log' -File)
+        $log.Count | Should -Be 1
+        Get-Content $log[0].FullName -Raw | Should -Match 'cancelled after PRTG had been stopped'
+        Get-Content $log[0].FullName -Raw | Should -Match 'Previous data folder is back'
+    }
+
     It 'the preview says nothing is installed, names the data folder and warns when the space is tight' {
         $man = [pscustomobject]@{ stagingBytes = 10GB; prtg = [pscustomobject]@{ version = '25.4.114.1032'; programCloned = $true; configStats = 'devices=27'; dataPath = 'D:\PRTG Data'; programFolders = @() } }
         $facts = [pscustomobject]@{ Computer = 'NEW'; IsAdmin = $true; ConfigStats = 'devices=20'; DataBytes = 5GB; FreeBytes = 15GB; NetRelease = 0; License = $null
@@ -1126,8 +1183,8 @@ Describe 'Backup catalogue (types, versions, encryption, validation)' {
     It 'moves a deleted package to the Recycle Bin instead of deleting it' {
         $f = & $NewPart 'devices'
         $bin = Join-Path $Work 'recycle'; New-Item -ItemType Directory -Force -Path $bin | Out-Null
-        $old = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'; $env:PRTGMANAGER_RECYCLE = $bin
-        try { Remove-PmBackup -Name (Split-Path $f -Leaf) } finally { $env:PRTGMOVER_TEST = $old; Remove-Item Env:\PRTGMANAGER_RECYCLE }
+        $old = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'; $env:PRTGMANAGER_RECYCLE = $bin; $env:PRTGMANAGER_DELETE_MODE = 'recycle'
+        try { Remove-PmBackup -Name (Split-Path $f -Leaf) } finally { $env:PRTGMOVER_TEST = $old; Remove-Item Env:\PRTGMANAGER_RECYCLE; Remove-Item Env:\PRTGMANAGER_DELETE_MODE }
         Test-Path $f | Should -BeFalse
         Test-Path (Join-Path $bin (Split-Path $f -Leaf)) | Should -BeTrue
         Test-Path (Join-Path $bin ((Split-Path $f -Leaf) + '.meta.json')) | Should -BeTrue
@@ -1261,11 +1318,11 @@ Describe 'Dashboard API for backups (running dashboard)' -Skip:($env:OS -ne 'Win
         [void](Complete-PmPackage -ZipPath $ApiZip -Manifest $m -Source 'S9')
         $script:ApiBin = Join-Path $Work 'api-recycle'; New-Item -ItemType Directory -Force -Path $ApiBin | Out-Null
         $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start(); $script:ApiPort = $l.LocalEndpoint.Port; $l.Stop()
-        $oldT = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'; $env:PRTGMANAGER_RECYCLE = $ApiBin
+        $oldT = $env:PRTGMOVER_TEST; $env:PRTGMOVER_TEST = '1'; $env:PRTGMANAGER_RECYCLE = $ApiBin; $env:PRTGMANAGER_DELETE_MODE = 'recycle'
         try {
             $script:ApiProc = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
                 (Join-Path $Root 'Start-PrtgManager.ps1'), '-Port', $ApiPort, '-NoBrowser', '-Quiet', '-DataRoot', $ApiData
-        } finally { $env:PRTGMOVER_TEST = $oldT; Remove-Item Env:\PRTGMANAGER_RECYCLE }
+        } finally { $env:PRTGMOVER_TEST = $oldT; Remove-Item Env:\PRTGMANAGER_RECYCLE; Remove-Item Env:\PRTGMANAGER_DELETE_MODE }
         $script:Api = "http://localhost:$ApiPort"
         $deadline = (Get-Date).AddSeconds(40); $ok = $false
         while (-not $ok -and (Get-Date) -lt $deadline) { try { [void](Invoke-RestMethod "$Api/api/info" -TimeoutSec 3); $ok = $true } catch { Start-Sleep -Milliseconds 500 } }
@@ -1313,5 +1370,91 @@ Describe 'Dashboard API for backups (running dashboard)' -Skip:($env:OS -ne 'Win
         (Invoke-RestMethod -Method Delete -Uri "$Api/api/backups/PRTG-DEVICES_SRC9_20260101-000000.zip").recycled | Should -BeTrue
         Test-Path $ApiZip | Should -BeFalse
         Test-Path (Join-Path $ApiBin 'PRTG-DEVICES_SRC9_20260101-000000.zip') | Should -BeTrue
+    }
+}
+
+Describe '2.1.0: disk estimate, server lock, delete mode, leftovers, housekeeping' {
+    It 'estimates a backup from the parts it really copies, not from the whole data folder' {
+        $f = [pscustomobject]@{ PrtgDataBytes = 50GB; PrtgHistoryBytes = 45GB; PrtgLogsBytes = 2GB; PrtgAutoBackupBytes = 1GB; PrtgProgramBytes = 1GB; DesktopBytes = 100MB }
+        Get-PmBackupEstimate -Facts $f | Should -Be (50GB - 2GB - 1GB + 1GB + 100MB)             # defaults: history, program, desktops; no logs, no automatic copies
+        Get-PmBackupEstimate -Facts $f -Options @{ IncludeHistory = $false } | Should -Be (50GB - 45GB - 2GB - 1GB + 1GB + 100MB)
+        Get-PmBackupEstimate -Facts $f -Options @{ IncludeHistory = $false; IncludeProgram = $false; IncludeDesktop = $false; IncludeLogs = $true } | Should -Be (50GB - 45GB - 1GB)
+        Get-PmBackupEstimate -Facts $f -Options @{ Scope = 'graphs' } | Should -Be 45GB
+        Get-PmBackupEstimate -Facts ([pscustomobject]@{ PrtgDataBytes = 7GB }) | Should -Be 7GB   # facts of an older version
+    }
+
+    It 'knows which jobs stop or change PRTG on which servers' {
+        Get-PmJobLockIds -Type 'restore' -Params @{ TargetIds = @('a', 'b') } | Should -Be @('a', 'b')
+        Get-PmJobLockIds -Type 'migrate' -Params @{ SourceId = 's'; TargetIds = @('t', 's') } | Should -Be @('s', 't')
+        Get-PmJobLockIds -Type 'backup' -Params @{ SourceId = 's' } | Should -Be @('s')
+        @(Get-PmJobLockIds -Type 'license' -Params @{ Action = 'status'; ServerIds = @('a') }).Count | Should -Be 0
+        Get-PmJobLockIds -Type 'license' -Params @{ Action = 'install'; ServerIds = @('a') } | Should -Be @('a')
+        @(Get-PmJobLockIds -Type 'restore-preview' -Params @{ TargetIds = @('a') }).Count | Should -Be 0
+        @(Get-PmJobLockIds -Type 'validate' -Params @{}).Count | Should -Be 0
+    }
+
+    It 'refuses a second job that would change PRTG on a server that a running job is changing' {
+        InModuleScope PrtgManager {
+            $script:PmJobs['lock-test'] = [hashtable]::Synchronized(@{ id = 'lock-test'; status = 'running'; summary = 'Restore: x'; lockIds = @('srv-1') })
+            try {
+                { Start-PmJob -Type 'rebind' -Params @{ ServerIds = [string[]]@('srv-1') } -Summary 'test' } | Should -Throw '*is changing PRTG on*'
+                $script:PmJobs['lock-test'].status = 'failed'
+                $script:PmJobs['lock-test'].Remove('lockIds'); $script:PmJobs['lock-test'].lockIds = $null
+                # a finished job without a live runspace does not lock
+                @(Get-PmJobLockIds -Type 'rebind' -Params @{ ServerIds = @('srv-1') }).Count | Should -Be 1
+            } finally { $script:PmJobs.Remove('lock-test') }
+        }
+    }
+
+    It 'deletes a backup for good when the dashboard runs as SYSTEM (no hidden Recycle Bin, no dialog)' {
+        $f = Join-Path (Get-PmPath Backups) 'PRTG-DEVICES_DELMODE_20260101-000000.zip'
+        Set-Content -LiteralPath $f 'x'; Set-Content -LiteralPath "$f.meta.json" '{}'
+        $env:PRTGMANAGER_DELETE_MODE = 'permanent'
+        try {
+            Get-PmDeleteMode | Should -Be 'permanent'
+            Remove-PmBackup -Name (Split-Path $f -Leaf) | Should -Be 'permanent'
+        } finally { Remove-Item Env:\PRTGMANAGER_DELETE_MODE }
+        Test-Path -LiteralPath $f | Should -BeFalse
+        Test-Path -LiteralPath "$f.meta.json" | Should -BeFalse
+        Get-PmDeleteMode | Should -BeIn 'recycle', 'permanent'
+    }
+
+    It 'lists what restores left behind and removes only items of that list' {
+        $wr = Join-Path $Work 'leftover-work'; $dp = Join-Path $Work 'leftover-prtg\PRTG Network Monitor'
+        New-Item -ItemType Directory -Force -Path (Join-Path $wr 'restore\job1'), (Join-Path $wr 'rollback\20260101-000000'), $dp, "$dp.pre-restore-20260101-000000", (Join-Path (Get-PmPath Data) 'staging\restore-PKG') | Out-Null
+        Set-Content (Join-Path (Get-PmPath Data) 'staging\restore-PKG\big.dat') ('x' * 1000)
+        $old = $env:PRTGMOVER_WORKROOT; $env:PRTGMOVER_WORKROOT = $wr
+        try {
+            Mock -ModuleName PrtgManager Get-PmPrtgInfo { [pscustomobject]@{ Installed = $true; DataPath = (Join-Path $Work 'leftover-prtg\PRTG Network Monitor') } }
+            $l = @(Get-PmLeftovers)
+            ($l | Where-Object kind -eq 'unpacked package').bytes | Should -BeGreaterThan 999
+            @($l | Where-Object { $_.kind -eq 'temporary' -and $_.path -like '*restore\job1' }).Count | Should -Be 1
+            @($l | Where-Object { $_.kind -eq 'rollback copy' }).Count | Should -Be 1
+            @($l | Where-Object { $_.kind -eq 'previous PRTG data' -and $_.path -like '*.pre-restore-20260101-000000' }).Count | Should -Be 1
+            @($l | Where-Object { $_.path -ieq $dp }).Count | Should -Be 0   # the live data folder is never a leftover
+            { Remove-PmLeftover -Path $dp } | Should -Throw '*not a leftover*'
+            Remove-PmLeftover -Path (Join-Path (Get-PmPath Data) 'staging\restore-PKG') | Out-Null
+            Test-Path (Join-Path (Get-PmPath Data) 'staging\restore-PKG') | Should -BeFalse
+            Test-Path $dp | Should -BeTrue
+        } finally { $env:PRTGMOVER_WORKROOT = $old }
+    }
+
+    It 'housekeeping removes old manager logs and keeps recent ones and backups' {
+        $logs = Join-Path (Get-PmPath Data) 'logs'; New-Item -ItemType Directory -Force -Path $logs | Out-Null
+        $oldLog = Join-Path $logs 'manager-20200101.log'; $newLog = Join-Path $logs ('manager-{0}.log' -f (Get-Date -Format 'yyyyMMdd'))
+        Set-Content $oldLog 'old'; Add-Content $newLog 'new'
+        (Get-Item $oldLog).LastWriteTime = (Get-Date).AddDays(-60)
+        $bk = Join-Path (Get-PmPath Backups) 'PRTG-FULL_HK_20200101-000000.zip'; Set-Content $bk 'x'; (Get-Item $bk).LastWriteTime = (Get-Date).AddDays(-400)
+        Invoke-PmHousekeeping | Should -BeGreaterThan 0
+        Test-Path $oldLog | Should -BeFalse
+        Test-Path $newLog | Should -BeTrue
+        Test-Path $bk | Should -BeTrue
+    }
+
+    It 'the installer gives the dashboard task a 5-minute watchdog trigger and a -Role for local mode' {
+        $txt = [IO.File]::ReadAllText((Join-Path $Root 'install.ps1'))
+        $txt | Should -Match 'RepetitionInterval \(New-TimeSpan -Minutes 5\)'
+        ([regex]::Matches($txt, '-Trigger @\(\$trigger, \$watchdog\)')).Count | Should -Be 2
+        $txt | Should -Match "\[ValidateSet\('both', 'source', 'target'\)\]\[string\]\`$Role = 'both'"
     }
 }

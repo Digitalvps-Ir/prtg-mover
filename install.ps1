@@ -60,6 +60,10 @@
     (scheduled task) and makes the shortcut start it with administrator rights. Needs an
     elevated PowerShell.
 
+.PARAMETER Role
+    With -Local: the role of this computer in the server list - both (default), source or target. A source is
+    never restored into and its license is never changed. An existing entry keeps its role unless -Role is given.
+
 .PARAMETER NoStart
     Do not start the dashboard at the end.
 
@@ -90,11 +94,14 @@ param(
     [switch]$NoAutostart,
     [string]$StartupFolder,
     [switch]$Local,
+    # -Local: role of this computer in the server list. 'source' = PRTG Manager never restores into it or changes its license.
+    [ValidateSet('both', 'source', 'target')][string]$Role = 'both',
     [switch]$NoStart,
     [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
+$script:RoleGiven = $PSBoundParameters.ContainsKey('Role')
 $script:StepNo = 0
 $ProgramItems = 'agent', 'cli', 'docs', 'src', 'tools', 'web', 'tests', '.github', 'config\servers.example.json',
     'Start-PrtgManager.ps1', 'Start-PrtgManager.cmd', 'Open-PrtgManager.ps1', 'install.ps1', 'install.cmd', 'VERSION', 'README.md', 'README.fa.md', 'CHANGELOG.md', 'LICENSE', '.gitignore', '.gitattributes',
@@ -283,6 +290,9 @@ function Set-LogonTask {
     $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $action = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $Path -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$(Join-Path $Path 'Start-PrtgManager.ps1')`" -Port $Port -NoBrowser -Quiet"
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    # Watchdog: every 5 minutes the task is started again. While the dashboard runs this is ignored (IgnoreNew);
+    # after it died it comes back within 5 minutes instead of at the next restart. No duration = repeat forever.
+    $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Minutes 5)
     # Credentials that a user saved in this installation can only be read by that user (Windows DPAPI).
     # Then the dashboard has to keep running as that user, which is only possible from the logon on.
     $saved = @(Get-ChildItem -LiteralPath (Join-Path $Path 'data\credentials') -Filter '*.cred.xml' -File -ErrorAction SilentlyContinue)
@@ -296,15 +306,15 @@ function Set-LogonTask {
         $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $me
         $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest
-        Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Manager dashboard with administrator rights at logon (local mode).' -Force | Out-Null
+        Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger @($trigger, $watchdog) -Principal $principal -Settings $settings -Description 'Starts the PRTG Manager dashboard with administrator rights at logon (local mode).' -Force | Out-Null
         Write-Note "$($saved.Count) saved server credential(s) can only be read by $me. So the dashboard starts when $me logs on, not with the computer."
         Write-Note 'For a start with the computer: delete the servers that have a saved credential, run the installation with -Local again and enter the credentials again in the dashboard.'
         return "task '$LogonTask': starts at logon of $me, with administrator rights"
     }
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Starts the PRTG Manager dashboard when the computer starts (local mode).' -Force | Out-Null
-    return "task '$LogonTask': starts with the computer, without logon"
+    Register-ScheduledTask -TaskName $LogonTask -Action $action -Trigger @($trigger, $watchdog) -Principal $principal -Settings $settings -Description 'Starts the PRTG Manager dashboard when the computer starts (local mode) and every 5 minutes if it is not running.' -Force | Out-Null
+    return "task '$LogonTask': starts with the computer, without logon, and again within 5 minutes if the dashboard stops"
 }
 
 function Start-LocalDashboard {
@@ -323,9 +333,17 @@ function Add-LocalServer {
     Import-Module (Join-Path $Path 'src\PrtgManager.psm1') -Force -DisableNameChecking
     Set-PmRoot -Path $Path
     $have = @(Get-PmServers | ForEach-Object { $_ } | Where-Object { $_.transport -eq 'local' })
-    if ($have.Count) { return "this computer is already in the server list ('$($have[0].name)')" }
-    [void](Set-PmServer -Name $env:COMPUTERNAME -HostName 'localhost' -Role 'both' -Transport 'local')
-    return "this computer was added to the server list ('$env:COMPUTERNAME', connection method Local)"
+    if ($have.Count) {
+        $h = $have[0]
+        if ($script:RoleGiven -and [string]$h.role -ne $Role) {
+            # -Role given: only the role of the existing entry changes
+            [void](Set-PmServer -Id $h.id -Name $h.name -HostName $h.host -Port ([int]$h.port) -UseSsl ([bool]$h.useSsl) -SkipCaCheck ([bool]$h.skipCaCheck) -Authentication $(if ($h.authentication) { [string]$h.authentication } else { 'Default' }) -Role $Role -Notes ([string]$h.notes) -RdpPort $(if ([int]$h.rdpPort -gt 0) { [int]$h.rdpPort } else { 3389 }) -Transport 'local')
+            return "this computer is already in the server list ('$($h.name)') - role changed from '$($h.role)' to '$Role'"
+        }
+        return "this computer is already in the server list ('$($h.name)', role '$($h.role)')"
+    }
+    [void](Set-PmServer -Name $env:COMPUTERNAME -HostName 'localhost' -Role $Role -Transport 'local')
+    return "this computer was added to the server list ('$env:COMPUTERNAME', connection method Local, role '$Role')"
 }
 
 function Get-AutostartShortcut {

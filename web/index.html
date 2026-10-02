@@ -222,7 +222,14 @@
         <thead><tr><th>Backup</th><th>Source</th><th>Created · size</th><th>Version</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead>
         <tbody></tbody>
       </table></div></div>
-      <p class="hint">Delete moves a package to the Recycle Bin of this computer. Restore always shows a preview of what changes on the target first.</p>
+      <p class="hint">Delete moves a package to the Recycle Bin of this computer (when the dashboard runs as SYSTEM, it is deleted permanently - you are asked first). Restore always shows a preview of what changes on the target first.</p>
+      <div class="card flush" id="leftoversCard">
+        <div class="card-head"><h2>Leftovers on this computer</h2><button class="btn" id="refreshLeftovers">Check</button></div>
+        <div class="table-wrap"><table class="table" id="leftoversTable">
+          <thead><tr><th>What</th><th>Path</th><th>Size</th><th>Changed</th><th><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody><tr><td colspan="5" class="empty">Press Check to list temporary copies, rollback data and snapshots that restores and backups left here.</td></tr></tbody>
+        </table></div>
+      </div>
     </section>
 
     <!-- ======================= LICENSE -->
